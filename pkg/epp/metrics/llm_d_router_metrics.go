@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +21,12 @@ import (
 	compbasemetrics "k8s.io/component-base/metrics"
 
 	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/toolcalling"
 )
 
 const (
 	// LLMDRouterEndpointPickerSubsystem is the subsystem for llm-d router endpoint picker metrics.
-	LLMDRouterEndpointPickerSubsystem = "llm_d_epp"
+	LLMDRouterEndpointPickerSubsystem = metricsutil.LLMDRouterEndpointPickerSubsystem
 )
 
 var (
@@ -60,7 +61,7 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "request_duration_seconds",
 			Help:      metricsutil.HelpMsgWithStability("End-to-end request latency distribution in seconds.", compbasemetrics.ALPHA),
-			Buckets:   generalLatencyBuckets,
+			Buckets:   metricsutil.GeneralLatencyBuckets,
 		},
 		modelLabelsWithFairnessPriority,
 	)
@@ -70,11 +71,7 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "request_size_bytes",
 			Help:      metricsutil.HelpMsgWithStability("Incoming request body size distribution in bytes.", compbasemetrics.ALPHA),
-			Buckets: []float64{
-				64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-				131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608,
-				16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824,
-			},
+			Buckets:   metricsutil.RequestSizeBuckets,
 		},
 		modelLabelsWithFairnessPriority,
 	)
@@ -84,7 +81,7 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "response_size_bytes",
 			Help:      metricsutil.HelpMsgWithStability("Outgoing response body size distribution in bytes.", compbasemetrics.ALPHA),
-			Buckets:   []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536},
+			Buckets:   []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536},
 		},
 		modelLabelsWithFairnessPriority,
 	)
@@ -94,7 +91,7 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "request_input_tokens",
 			Help:      metricsutil.HelpMsgWithStability("Input token count distribution per request.", compbasemetrics.ALPHA),
-			Buckets:   []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536, 131072, 262144, 524288, 1048576},
+			Buckets:   metricsutil.TokenCountBuckets,
 		},
 		modelLabelsWithFairnessPriority,
 	)
@@ -114,7 +111,7 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "request_cached_tokens",
 			Help:      metricsutil.HelpMsgWithStability("Distribution of prompt tokens read from cache per request, as reported by the model server in the response.", compbasemetrics.ALPHA),
-			Buckets:   []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536, 131072, 262144, 524288, 1048576},
+			Buckets:   metricsutil.TokenCountBuckets,
 		},
 		modelLabelsWithFairnessPriority,
 	)
@@ -153,30 +150,9 @@ var (
 		modelLabelsWithFairnessPriorityStreaming,
 	)
 
-	llmdRequestTPOT = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Subsystem: LLMDRouterEndpointPickerSubsystem,
-			Name:      "request_streaming_tpot_seconds",
-			Help:      metricsutil.HelpMsgWithStability("Average time per output token in seconds for streaming requests, computed as (e2e - TTFT) / (output_tokens - 1).", compbasemetrics.ALPHA),
-			Buckets: []float64{
-				0.0005, 0.00205, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.125, 0.15, 0.2,
-				0.3, 0.4, 0.5, 0.6, 0.8, 1, 2,
-			},
-		},
-		modelLabelsWithFairnessPriority,
-	)
+	llmdRequestTPOT = newRequestTPOTHistogram(DefaultRequestTPOTBuckets)
 
-	llmdInterTokenLatency = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Subsystem: LLMDRouterEndpointPickerSubsystem,
-			Name:      "request_streaming_itl_seconds",
-			Help:      metricsutil.HelpMsgWithStability("Inter-token latency in seconds for streaming requests, measured as the time between consecutive response body chunks.", compbasemetrics.ALPHA),
-			Buckets: []float64{
-				0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1, 2,
-			},
-		},
-		append(append([]string{}, modelLabels...), "fairness_id", "priority"),
-	)
+	llmdInterTokenLatency = newInterTokenLatencyHistogram(DefaultInterTokenLatencyBuckets)
 )
 
 // --- llm-d Inference Pool Metrics ---
@@ -208,6 +184,33 @@ var (
 		poolLabels,
 	)
 
+	llmdInferencePoolStdDevKVCache = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "std_dev_kv_cache_utilization",
+			Help:      metricsutil.HelpMsgWithStability("The standard deviation kv cache utilization for an inference server pool.", compbasemetrics.ALPHA),
+		},
+		poolLabels,
+	)
+
+	llmdInferencePoolStdDevQueueSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "std_dev_queue_size",
+			Help:      metricsutil.HelpMsgWithStability("The standard deviation number of requests pending in the model server queue.", compbasemetrics.ALPHA),
+		},
+		poolLabels,
+	)
+
+	llmdInferencePoolStdDevRunningRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "std_dev_running_requests",
+			Help:      metricsutil.HelpMsgWithStability("The standard deviation number of running requests across model servers in the pool.", compbasemetrics.ALPHA),
+		},
+		poolLabels,
+	)
+
 	llmdInferencePoolReadyEndpoints = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
@@ -226,7 +229,7 @@ var (
 			Name:      "scheduler_e2e_duration_seconds",
 			Help:      metricsutil.HelpMsgWithStability("End-to-end scheduling latency distribution in seconds.", compbasemetrics.ALPHA),
 			Buckets: []float64{
-				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1,
+				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
 			},
 		},
 		[]string{},
@@ -241,6 +244,25 @@ var (
 		append([]string{"status", "target_model_name"}, llmdEndpointLabels...),
 	)
 
+	llmdSchedulerFilterEliminatedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "scheduler_filter_eliminated_total",
+			Help: metricsutil.HelpMsgWithStability("Total number of candidate endpoints removed by scheduling filters, "+
+				"by scheduler profile, plugin type and plugin name.", compbasemetrics.ALPHA),
+		},
+		[]string{"profile", "plugin_type", "plugin_name"},
+	)
+
+	llmdSchedulerFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "scheduler_failures_total",
+			Help:      metricsutil.HelpMsgWithStability("Total number of failed scheduling attempts, by reason.", compbasemetrics.ALPHA),
+		},
+		[]string{"reason"},
+	)
+
 	llmdPluginProcessingLatencies = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
@@ -251,6 +273,43 @@ var (
 			},
 		},
 		[]string{"extension_point", "plugin_type", "plugin_name"},
+	)
+
+	llmdPluginDataScopeViolations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "plugin_data_scope_violations_total",
+			Help: metricsutil.HelpMsgWithStability("Total number of endpoint and per-request attribute accesses "+
+				"rejected because the plugin did not declare the DataKey in Produces() or Consumes(), by extension "+
+				"point, plugin type, plugin name and access kind (read or write). A non-zero value means a plugin's "+
+				"implementation has drifted from its declaration; rejected reads resolve as absent and rejected "+
+				"writes are dropped.", compbasemetrics.ALPHA),
+		},
+		[]string{"extension_point", "plugin_type", "plugin_name", "access"},
+	)
+
+	llmdRequestProcessingLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "request_processing_duration_seconds",
+			Help:      metricsutil.HelpMsgWithStability("EPP request processing latency distribution in seconds, from request receipt until the request body has been handled, including admission control.", compbasemetrics.ALPHA),
+			Buckets: []float64{
+				0.0005, 0.001, 0.002, 0.005, 0.01, 0.015, 0.025, 0.04, 0.06, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+			},
+		},
+		[]string{},
+	)
+
+	llmdResponseProcessingLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "response_processing_duration_seconds",
+			Help:      metricsutil.HelpMsgWithStability("EPP response processing latency distribution in seconds: the sum of per-chunk handler time for a streamed response, or the interval from response headers to completion for a non-streaming response.", compbasemetrics.ALPHA),
+			Buckets: []float64{
+				0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+			},
+		},
+		[]string{},
 	)
 )
 
@@ -324,7 +383,156 @@ var (
 		prometheus.GaugeOpts{
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "flow_control_pool_saturation",
-			Help:      metricsutil.HelpMsgWithStability("Current saturation level of the inference pool (0.0 = empty, 1.0 = fully saturated).", compbasemetrics.ALPHA),
+			Help: metricsutil.HelpMsgWithStability(
+				"Pool saturation signal gating Flow Control dispatch. The stage label partitions by pipeline role: "+
+					"'prefill' and 'decode' are per-stage signals, 'effective' is max(prefill, decode) and is the "+
+					"value used for gating. 1.0 is the gating set point; values above 1.0 indicate the magnitude of "+
+					"oversubscription past it. An empty pool reads as 1.0. With the default utilization detector, "+
+					"endpoints with missing or stale metrics score as fully saturated "+
+					"under stalenessPolicy=saturated; see flow_control_stale_endpoints.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"inference_pool", "stage"},
+	)
+
+	llmdFlowControlStaleEndpoints = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_stale_endpoints",
+			Help: metricsutil.HelpMsgWithStability(
+				"Number of candidate endpoints whose metrics are missing or older than the staleness threshold, as of "+
+					"the most recent saturation evaluation. Recorded by the utilization saturation detector, which scores "+
+					"these endpoints according to stalenessPolicy: saturated by default or excluded under ignore. A nonzero "+
+					"value during a dispatch stall indicates a metrics collection problem rather than genuine overload. "+
+					"Labeled by the pipeline stage ('prefill' or 'decode') whose endpoints were evaluated; the stage "+
+					"label is empty when the detector is evaluated without stage partitioning.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"detector", "stage"},
+	)
+
+	llmdFlowControlDetectorSaturation = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_detector_saturation",
+			Help: metricsutil.HelpMsgWithStability(
+				"Saturation signal reported by an individual saturation detector, labeled by the detector reference "+
+					"name and by the pipeline stage ('prefill' or 'decode') whose endpoints were evaluated. Recorded by "+
+					"the max composite saturation detector for each of its children in scope on every evaluation, so operators "+
+					"can tell which signal (e.g. concurrency vs queue depth) is driving flow_control_pool_saturation "+
+					"in each stage. The stage label is empty when the detector is evaluated without stage partitioning.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"detector", "stage"},
+	)
+
+	llmdFlowControlCapacityUtilizationRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_capacity_utilization_requests",
+			Help: metricsutil.HelpMsgWithStability(
+				"Fraction of a priority band's effective request-count capacity currently occupied, aggregated over "+
+					"every flow in the band (0.0-1.0). The denominator falls back to a default when the band does not "+
+					"configure one, so every configured band reports a series. The all-bands rollup is a separate "+
+					"metric, flow_control_global_capacity_utilization_requests.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"priority", "inference_pool"},
+	)
+
+	llmdFlowControlCapacityUtilizationBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_capacity_utilization_bytes",
+			Help: metricsutil.HelpMsgWithStability(
+				"Fraction of a priority band's effective byte-size capacity currently occupied, aggregated over every "+
+					"flow in the band (0.0-1.0). The denominator falls back to a default when the band does not "+
+					"configure one, so every configured band reports a series. The all-bands rollup is a separate "+
+					"metric, flow_control_global_capacity_utilization_bytes.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"priority", "inference_pool"},
+	)
+
+	llmdFlowControlGlobalCapacityUtilizationRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_global_capacity_utilization_requests",
+			Help: metricsutil.HelpMsgWithStability(
+				"Fraction of the global request-count capacity currently occupied across all priority bands (0.0-1.0). "+
+					"Global capacity is optional and unset by default; this series is emitted only when it is "+
+					"configured. Kept separate from flow_control_capacity_utilization_requests so aggregations over "+
+					"the per-band family do not double count the rollup.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"inference_pool"},
+	)
+
+	llmdFlowControlGlobalCapacityUtilizationBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_global_capacity_utilization_bytes",
+			Help: metricsutil.HelpMsgWithStability(
+				"Fraction of the global byte-size capacity currently occupied across all priority bands (0.0-1.0). "+
+					"Global capacity is optional and unset by default; this series is emitted only when it is "+
+					"configured. Kept separate from flow_control_capacity_utilization_bytes so aggregations over the "+
+					"per-band family do not double count the rollup.",
+				compbasemetrics.ALPHA),
+		},
+		[]string{"inference_pool"},
+	)
+
+	llmdFlowControlRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_requests_total",
+			Help:      metricsutil.HelpMsgWithStability("Total number of requests processed by the Flow Control layer.", compbasemetrics.ALPHA),
+		},
+		[]string{"outcome", "priority", "inference_pool"},
+	)
+
+	llmdFlowControlRevocationsIssuedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_revocations_issued_total",
+			Help:      metricsutil.HelpMsgWithStability("Total number of in-flight eviction revocations issued, labeled by the demand band's priority.", compbasemetrics.ALPHA),
+		},
+		[]string{"priority", "inference_pool"},
+	)
+
+	llmdFlowControlRevocationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_revocations_total",
+			Help:      metricsutil.HelpMsgWithStability("Total number of in-flight eviction revocations by terminal outcome (confirmed, timed_out). Every issued revocation eventually increments exactly one outcome.", compbasemetrics.ALPHA),
+		},
+		[]string{"outcome", "inference_pool"},
+	)
+
+	llmdFlowControlReclaimTarget = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_reclaim_target",
+			Help:      metricsutil.HelpMsgWithStability("Last computed reclamation deficit, in saturation-gauge units.", compbasemetrics.ALPHA),
+		},
+		[]string{"inference_pool"},
+	)
+
+	llmdFlowControlPendingReclaim = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_pending_reclaim",
+			Help:      metricsutil.HelpMsgWithStability("Sum of outstanding and cooling pending-reclaim debits, in saturation-gauge units.", compbasemetrics.ALPHA),
+		},
+		[]string{"inference_pool"},
+	)
+
+	llmdFlowControlRevocationConfirmationDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: LLMDRouterEndpointPickerSubsystem,
+			Name:      "flow_control_revocation_confirmation_seconds",
+			Help:      metricsutil.HelpMsgWithStability("Time from revocation issue to confirmed stream termination.", compbasemetrics.ALPHA),
+			Buckets:   []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		},
 		[]string{"inference_pool"},
 	)
@@ -363,11 +571,52 @@ var (
 	)
 )
 
+// --- Tool-calling request field integrity metric ---
+var llmdToolCallingFieldStatusTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Subsystem: LLMDRouterEndpointPickerSubsystem,
+		Name:      "tool_calling_field_status_total",
+		Help:      metricsutil.HelpMsgWithStability("Tool-calling request field outcomes by component, direction, field, and status.", compbasemetrics.ALPHA),
+	},
+	[]string{
+		toolcalling.MetricLabelComponent,
+		toolcalling.MetricLabelDirection,
+		toolcalling.MetricLabelField,
+		toolcalling.MetricLabelStatus,
+	},
+)
+
 var (
 	// DescInferencePoolPerEndpointQueueSize is the standardized exported prometheus descriptor.
 	DescInferencePoolPerEndpointQueueSize = prometheus.NewDesc(
 		"llm_d_epp_per_endpoint_queue_size",
 		metricsutil.HelpMsgWithStability("The total number of requests pending in the model server queue for each underlying endpoint.", compbasemetrics.ALPHA),
+		[]string{
+			"name",
+			"model_server_endpoint",
+		}, nil,
+	)
+
+	// The NIXL descriptors expose counters the model server reports.
+	DescInferencePoolPerEndpointNixlFailedTransfers = prometheus.NewDesc(
+		"llm_d_epp_per_endpoint_nixl_failed_transfers_total",
+		metricsutil.HelpMsgWithStability("The number of failed NIXL KV cache transfers reported by each underlying endpoint.", compbasemetrics.ALPHA),
+		[]string{
+			"name",
+			"model_server_endpoint",
+		}, nil,
+	)
+	DescInferencePoolPerEndpointNixlFailedNotifications = prometheus.NewDesc(
+		"llm_d_epp_per_endpoint_nixl_failed_notifications_total",
+		metricsutil.HelpMsgWithStability("The number of failed NIXL KV cache notifications reported by each underlying endpoint.", compbasemetrics.ALPHA),
+		[]string{
+			"name",
+			"model_server_endpoint",
+		}, nil,
+	)
+	DescInferencePoolPerEndpointNixlKVExpiredRequests = prometheus.NewDesc(
+		"llm_d_epp_per_endpoint_nixl_kv_expired_requests_total",
+		metricsutil.HelpMsgWithStability("The number of requests whose KV cache expired before it was read, reported by each underlying endpoint.", compbasemetrics.ALPHA),
 		[]string{
 			"name",
 			"model_server_endpoint",

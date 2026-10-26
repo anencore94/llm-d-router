@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -84,23 +85,23 @@ func TestLogger(t *testing.T) {
 
 	logOutput := b.read()
 	assert.Contains(t, logOutput, "Refreshing Prometheus Metrics	{\"ReadyPods\": 2}")
-	assert.Contains(t, logOutput, "Current Pods and metrics gathered	{\"Fresh metrics\": \"[Metadata: {NamespacedName:default/pod1 PodName: Address:1.2.3.4:5678")
+	assert.Contains(t, logOutput, "Current Pods and metrics gathered	{\"Fresh metrics\": \"[Metadata: {ID:default/pod1 Name: Address:1.2.3.4:5678")
 	assert.Contains(t, logOutput, "Metrics: {ActiveModels:map[modelA:1] WaitingModels:map[modelB:2] MaxActiveModels:5")
 	assert.Contains(t, logOutput, "RunningRequestsSize:3 WaitingQueueSize:7 KVCacheUsagePercent:42.5 KvCacheMaxTokenCapacity:2048")
-	assert.Contains(t, logOutput, "Metadata: {NamespacedName:default/pod2 PodName: Address:1.2.3.4:5679")
+	assert.Contains(t, logOutput, "Metadata: {ID:default/pod2 Name: Address:1.2.3.4:5679")
 	assert.Contains(t, logOutput, "\"Stale metrics\": \"[]\"")
 }
 
-func TestCalculateTotals(t *testing.T) {
+func TestCalculateSummary(t *testing.T) {
 	tests := []struct {
 		name      string
 		endpoints []fwkdl.Endpoint
-		want      totals
+		want      summary
 	}{
 		{
 			name:      "empty list",
 			endpoints: []fwkdl.Endpoint{},
-			want:      totals{},
+			want:      summary{},
 		},
 		{
 			name: "single endpoint",
@@ -112,7 +113,11 @@ func TestCalculateTotals(t *testing.T) {
 					UpdateTime:          time.Now(),
 				}),
 			},
-			want: totals{kvCache: 50.0, queueSize: 3, runningRequests: 5},
+			want: summary{
+				kvCache:         stats{mean: 50.0, stdv: 0},
+				queueSize:       stats{mean: 3.0, stdv: 0},
+				runningRequests: stats{mean: 5.0, stdv: 0},
+			},
 		},
 		{
 			name: "multiple endpoints aggregated",
@@ -130,13 +135,17 @@ func TestCalculateTotals(t *testing.T) {
 					UpdateTime:          time.Now(),
 				}),
 			},
-			want: totals{kvCache: 100.0, queueSize: 7, runningRequests: 4},
+			want: summary{
+				kvCache:         stats{mean: 50.0, stdv: 28.28},
+				queueSize:       stats{mean: 3.5, stdv: 2.12},
+				runningRequests: stats{mean: 2.0, stdv: 1.41},
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := calculateTotals(tt.endpoints)
+			got := calculateSummary(tt.endpoints)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -173,8 +182,8 @@ func TestRefreshPrometheusMetricsAvgValues(t *testing.T) {
 		return 0
 	}
 
-	avgRunning := findGauge("inference_pool_average_running_requests")
-	avgQueue := findGauge("inference_pool_average_queue_size")
+	avgRunning := findGauge("llm_d_epp_average_running_requests")
+	avgQueue := findGauge("llm_d_epp_average_queue_size")
 
 	assert.InDelta(t, 0.5, avgRunning, 0.001, "average running requests should be 0.5, not truncated to 0")
 	assert.InDelta(t, 1.5, avgQueue, 0.001, "average queue size should be 1.5, not truncated to 1")
@@ -213,14 +222,14 @@ func (f *FakeOddMetricsDataStore) PodList(predicate func(fwkdl.Endpoint) bool) [
 }
 
 var pod1 = &fwkdl.EndpointMetadata{
-	NamespacedName: types.NamespacedName{
+	ID: types.NamespacedName{
 		Name:      "pod1",
 		Namespace: "default",
 	},
 	Address: "1.2.3.4:5678",
 }
 var pod2 = &fwkdl.EndpointMetadata{
-	NamespacedName: types.NamespacedName{
+	ID: types.NamespacedName{
 		Name:      "pod2",
 		Namespace: "default",
 	},

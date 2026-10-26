@@ -21,35 +21,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents/engineadapter"
-	"go.opentelemetry.io/otel/attribute"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvevents"
+	"github.com/llm-d/llm-d-router/pkg/kvevents/engineadapter"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	rcplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixmetrics"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
 // PluginType is the registered type name of the precise-prefix-cache-producer.
 const PluginType = "precise-prefix-cache-producer"
 
-// PluginConfig configures the precise-prefix-cache-producer. Nested fields
-// mirror the llm-d-kv-cache configuration shape (see that repo's
-// docs/configuration.md for details on TokenProcessorConfig, IndexerConfig,
-// and KVEventsConfig).
+// PluginConfig configures the precise-prefix-cache-producer.
 type PluginConfig struct {
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
 	IndexerConfig        *kvcache.Config               `json:"indexerConfig"`
@@ -64,10 +66,26 @@ type PluginConfig struct {
 	SpeculativeTTL string `json:"speculativeTTL"`
 }
 
-var _ requestcontrol.DataProducer = &Producer{}
+var (
+	_ requestcontrol.DataProducer = &Producer{}
+	_ plugin.StateDumper          = &Producer{}
+)
+
+// subscriberManager is the subset of kvevents.SubscriberManager the producer
+// relies on, narrowed so tests can substitute a fake.
+type subscriberManager interface {
+	EnsureSubscriber(
+		ctx context.Context,
+		podIdentifier, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, topicFilter string,
+		remoteSocket bool,
+	) error
+	RemoveSubscriber(ctx context.Context, podIdentifier string) bool
+	GetActiveSubscribers() ([]string, []string)
+	Shutdown(ctx context.Context)
+}
 
 // Producer is a DataProducer plugin that maintains a KV-block prefix-cache
-// index by subscribing to vLLM KV-events and writes per-endpoint
+// index by subscribing to engine KV-events and writes per-endpoint
 // PrefixCacheMatchInfo for each request. Operators pair it with the
 // generic prefix-cache-scorer (set prefixMatchInfoProducerName to this
 // producer's instance name) to route requests by precise cache locality.
@@ -78,10 +96,9 @@ type Producer struct {
 	typedName      plugin.TypedName
 	kvCacheIndexer kvCacheIndexer
 
-	subscribersManager *kvevents.SubscriberManager
+	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
-
-	kvBlockScorer kvcache.KVBlockScorer
+	podSelector        labels.Selector // nil matches every endpoint.
 
 	dk plugin.DataKey
 
@@ -99,8 +116,7 @@ type Producer struct {
 }
 
 // PluginFactory parses the raw plugin configuration and returns a configured
-// Producer. Rejects configs with indexerConfig.tokenizersPoolConfig set, since
-// this producer is tokens-only and requires an upstream token-producer.
+// Producer.
 func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	indexerConfig, err := kvcache.NewDefaultConfig()
 	if err != nil {
@@ -121,11 +137,6 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	if parameters.IndexerConfig == nil {
 		return nil, errors.New("indexerConfig is required")
 	}
-	// Tokens-only: reject configs that rely on the indexer's internal tokenizer.
-	//nolint:staticcheck // SA1019
-	if parameters.IndexerConfig.TokenizersPoolConfig != nil {
-		return nil, errors.New("tokenizersPoolConfig is not supported; configure a token-producer plugin instead")
-	}
 
 	p, err := New(handle.Context(), name, parameters)
 	if err != nil {
@@ -144,6 +155,19 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
+	if config.KVEventsConfig == nil {
+		config.KVEventsConfig = kvevents.DefaultConfig()
+	}
+
+	var podSelector labels.Selector
+	if kc := config.KVEventsConfig; kc.DiscoverPods && kc.PodDiscoveryConfig != nil && kc.PodDiscoveryConfig.PodLabelSelector != "" {
+		sel, err := labels.Parse(kc.PodDiscoveryConfig.PodLabelSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid kvEventsConfig.podDiscoveryConfig.podLabelSelector %q: %w",
+				kc.PodDiscoveryConfig.PodLabelSelector, err)
+		}
+		podSelector = sel
+	}
 
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
 	if err != nil {
@@ -156,22 +180,20 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	}
 	go indexer.Run(ctx)
 
-	scorerConfig := kvcache.DefaultKVBlockScorerConfig()
-	if config.IndexerConfig != nil && config.IndexerConfig.BackendConfigs != nil {
-		scorerConfig.BackendConfigs = config.IndexerConfig.BackendConfigs
-	}
-	kvBlockScorer, err := kvcache.NewKVBlockScorer(scorerConfig)
+	adapter, err := engineadapter.NewAdapter(config.KVEventsConfig.EngineType)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
+		return nil, fmt.Errorf("failed to create KV-events engine adapter: %w", err)
 	}
-
-	pool := kvevents.NewPool(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool, err := kvevents.NewPool(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, adapter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create KV-events pool: %w", err)
+	}
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
 	if config.KVEventsConfig.ZMQEndpoint != "" {
-		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber",
-			config.KVEventsConfig.ZMQEndpoint, config.KVEventsConfig.TopicFilter, false); err != nil {
+		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber", "",
+			config.KVEventsConfig.ZMQEndpoint, "", "", config.KVEventsConfig.TopicFilter, false); err != nil {
 			return nil, fmt.Errorf("failed to create local subscriber for global socket mode: %w", err)
 		}
 	}
@@ -181,12 +203,14 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		return nil, err
 	}
 
+	prefixmetrics.Register()
+
 	return &Producer{
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
-		kvBlockScorer:      kvBlockScorer,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
+		podSelector:        podSelector,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
@@ -202,21 +226,92 @@ func (p *Producer) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
+// Debug-dump caps keep the payload bounded. A list is partial when its matching
+// TotalX exceeds MaxX.
+const (
+	maxDumpSubscribers        = 100
+	maxDumpSpeculativeEntries = 100
+)
+
+// precisePrefixState is the snapshot returned by DumpState. The KV-block index
+// is keyed by prompt-derived block hashes and is not enumerable, so it is not
+// reported; the active subscriber pod identities and the live speculative
+// request ids are enumerated (sorted and capped) for debugging.
+type precisePrefixState struct {
+	Subscribers             []string `json:"subscribers"`
+	TotalSubscribers        int      `json:"totalSubscribers"`
+	MaxSubscribers          int      `json:"maxSubscribers"`
+	SpeculativeIndexing     bool     `json:"speculativeIndexing"`
+	SpeculativeEntries      []string `json:"speculativeEntries"`
+	TotalSpeculativeEntries int      `json:"totalSpeculativeEntries"`
+	MaxSpeculativeEntries   int      `json:"maxSpeculativeEntries"`
+	BlockSizeTokens         int      `json:"blockSizeTokens"`
+}
+
+// DumpState reports the producer's bounded operational state: the active
+// KV-event subscriber pod identities, whether speculative indexing is on and
+// the live speculative request ids, and the block size in tokens. Both lists
+// are sorted and capped; the prompt-derived block index is not exposed.
+func (p *Producer) DumpState() (json.RawMessage, error) {
+	subscribers := []string{}
+	var totalSubscribers int
+	if p.subscribersManager != nil {
+		ids, _ := p.subscribersManager.GetActiveSubscribers()
+		totalSubscribers = len(ids)
+		subscribers = sortedCapped(ids, maxDumpSubscribers)
+	}
+	speculativeEntries := []string{}
+	var totalSpeculativeEntries int
+	if p.speculativeCache != nil {
+		keys := p.speculativeCache.Keys()
+		totalSpeculativeEntries = len(keys)
+		speculativeEntries = sortedCapped(keys, maxDumpSpeculativeEntries)
+	}
+	return json.Marshal(precisePrefixState{
+		Subscribers:             subscribers,
+		TotalSubscribers:        totalSubscribers,
+		MaxSubscribers:          maxDumpSubscribers,
+		SpeculativeIndexing:     p.speculativeEnabled,
+		SpeculativeEntries:      speculativeEntries,
+		TotalSpeculativeEntries: totalSpeculativeEntries,
+		MaxSpeculativeEntries:   maxDumpSpeculativeEntries,
+		BlockSizeTokens:         p.blockSizeTokens,
+	})
+}
+
+// sortedCapped returns a sorted copy of in (never nil, so empty lists serialize
+// as [] not null), truncated to limit entries.
+func sortedCapped(in []string, limit int) []string {
+	out := append([]string{}, in...)
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // Produces declares the PrefixCacheMatchInfoDataKey published per endpoint,
 // name-bound to this producer instance.
 func (p *Producer) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}}
 }
 
-// Consumes declares the TokenizedPrompt dependency from token-producer so
-// the data-layer DAG orders tokenization before this producer runs.
+// Consumes declares the TokenizedRequest dependency from token-producer so
+// the data-layer DAG orders tokenization before this producer runs, and uses
+// Level-2 attribute matching to require the engine-aligned vllm backend
+// (rejecting the estimate backend's byte-packed pseudo-tokens at startup).
 func (p *Producer) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
-		Required: map[plugin.DataKey]any{tokenproducer.TokenizedPromptDataKey: scheduling.TokenizedPrompt{}},
+		Required: map[plugin.DataKey]any{
+			tokenproducer.TokenizedPromptDataKey: plugin.ConsumedData{
+				Type:    scheduling.TokenizedRequest{},
+				Matches: plugin.MatchKeyValues(map[string]string{"backend": tokenproducer.BackendVLLM}),
+			},
+		},
 	}
 }
 
-// Produce hashes the request's TokenizedPrompt into KV-block keys, looks
+// Produce hashes the request's TokenizedRequest into KV-block keys, looks
 // them up in the per-endpoint KV-block index, and writes PrefixCacheMatchInfo
 // to each candidate endpoint. No-op when the request carries no tokens.
 // With speculativeIndexing enabled, the computed block keys are stashed
@@ -229,80 +324,128 @@ func (p *Producer) Produce(ctx context.Context,
 	)
 	defer span.End()
 
-	span.SetAttributes(attribute.Int("llm_d.epp.producer.candidate_endpoints", len(endpoints)))
+	span.SetAttributes(semconv.LLMDEPPProducerCandidateEndpoints(len(endpoints)))
 	if request != nil {
 		if request.TargetModel != "" {
-			span.SetAttributes(attribute.String("gen_ai.request.model", request.TargetModel))
+			span.SetAttributes(semconv.GenAIRequestModel(request.TargetModel))
 		}
-		if request.RequestID != "" {
-			span.SetAttributes(attribute.String("gen_ai.request.id", request.RequestID))
+		if clientRequestID := request.Headers[reqcommon.RequestIDHeaderKey]; clientRequestID != "" {
+			span.SetAttributes(semconv.GenAIRequestID(clientRequestID))
 		}
 	}
 
-	perPromptKeys, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
+	perPromptKeys, perPromptMMContent, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to compute block keys: %w", err)
 	}
 	if len(perPromptKeys) == 0 {
-		span.SetAttributes(attribute.String("llm_d.epp.producer.result", "skipped_no_tokens"))
+		span.SetAttributes(semconv.LLMDEPPProducerResult("skipped_no_tokens"))
 		return nil
 	}
 
-	return p.produceFromBlockKeys(ctx, span, request, endpoints, perPromptKeys)
+	return p.produceFromBlockKeys(ctx, span, request, endpoints, perPromptKeys, perPromptMMContent)
 }
 
+// produceFromBlockKeys matches the per-prompt block keys against the index and
+// publishes per-endpoint PrefixCacheMatchInfo. perPromptKeys and
+// perPromptMMContent are computeBlockKeys' aligned return values.
 func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
-	perPromptKeys [][]kvblock.BlockHash,
+	perPromptKeys [][]kvblock.BlockHash, perPromptMMContent []*mmPromptContent,
 ) error {
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
 
-	type promptLookup struct {
-		keys      []kvblock.BlockHash
-		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
-	}
-
-	aggregatedScores := make(map[string]float64)
+	// A multi-prompt request scores as the sum of its prompts' matches. The
+	// first prompt's result is the aggregate, so single-prompt requests copy
+	// nothing. MM block indices and feature spans are prompt-relative while
+	// the pod match aggregates across prompts, so each prompt's content is
+	// counted against that prompt's match length and the counts summed per
+	// pod.
+	var matches map[string]kvcache.PodMatch
+	var mmMatches map[string]int
+	var mmTokens map[string]int
+	mmTracked := false
 	totalBlocks := 0
-	lookups := make([]promptLookup, 0, len(perPromptKeys))
-	for _, blockKeys := range perPromptKeys {
-		keyToPods, err := p.kvCacheIndexer.KVBlockIndex().Lookup(ctx, blockKeys, endpointSet)
+	for i, blockKeys := range perPromptKeys {
+		promptMatches, err := p.kvCacheIndexer.MatchBlockKeys(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("failed to lookup block keys: %w", err)
-		}
-		scores, err := p.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
-		if err != nil {
-			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("failed to score block keys: %w", err)
-		}
-		for pod, score := range scores {
-			aggregatedScores[pod] += score
+			return fmt.Errorf("failed to match block keys: %w", err)
 		}
 		totalBlocks += len(blockKeys)
-		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
+		if mm := perPromptMMContent[i]; mm != nil {
+			mmTracked = true
+			if mmMatches == nil {
+				mmMatches = map[string]int{}
+				mmTokens = map[string]int{}
+			}
+			for pod, m := range promptMatches {
+				mmMatches[pod] += countMMMatchedBlocks(mm.blockIndices, m.MatchedBlocks)
+				mmTokens[pod] += countMMMatchedTokens(mm.features, m.MatchedBlocks, p.blockSizeTokens)
+			}
+		}
+		if matches == nil {
+			matches = promptMatches
+			continue
+		}
+		for pod, m := range promptMatches {
+			matches[pod] = addPodMatch(matches[pod], m)
+		}
 	}
 
+	// weightedScoreRoundOff absorbs float error in the summed tier weights
+	// before flooring: ten cpu-tier blocks at 0.8 sum to 7.999999999999999.
+	// It covers at least 278,000 blocks at any one default tier weight.
+	const weightedScoreRoundOff = 1e-6
+
 	maxMatch := 0
+	maxMMMatch := 0
+	results := make([]endpointResult, 0, len(endpoints))
 	for _, ep := range endpoints {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		md := ep.GetMetadata()
 		if md == nil {
 			continue
 		}
-		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
-		matchLen := int(aggregatedScores[addr])
+		podKey := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		match := matches[podKey]
+		if mmTracked {
+			maxMMMatch = max(maxMMMatch, mmMatches[podKey])
+		}
+		if match.BlocksByTier == nil {
+			match.BlocksByTier = map[string]int{} // no match: consumers still read a map
+		}
+		matchLen := int(match.WeightedScore + weightedScoreRoundOff)
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
-		cachedBlocks := 0
-		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
+		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
+			WithCachedBlockCount(match.MatchedBlocks).
+			WithConfirmedCachedBlockCount(match.ConfirmedBlocks).
+			WithCachedBlocksByTier(match.BlocksByTier)
+		if mmTracked {
+			info.WithMM(attrprefix.MMMatchInfo{
+				MatchBlocks: mmMatches[podKey],
+				MatchTokens: mmTokens[podKey],
+			})
 		}
-		ep.Put(p.dk.String(),
-			attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).WithCachedBlockCount(cachedBlocks))
+		results = append(results, endpointResult{endpoint: ep, info: info})
 	}
+	if err := p.publishEndpointResults(ctx, results); err != nil {
+		return err
+	}
+
+	state := &bestAvailableState{predictedCachedTokens: make(map[datalayer.ID]int, len(results))}
+	for _, result := range results {
+		predicted := predictedCachedTokens(result.info)
+		state.predictedCachedTokens[result.endpoint.GetMetadata().ID] = predicted
+		state.cachedTokens = max(state.cachedTokens, predicted)
+	}
+	p.pluginState.Write(request.RequestID, bestAvailableStateKey, state)
 
 	if p.speculativeEnabled {
 		p.pluginState.Write(request.RequestID, blockKeysStateKey,
@@ -310,11 +453,52 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	}
 
 	span.SetAttributes(
-		attribute.Int("llm_d.epp.producer.total_blocks", totalBlocks),
-		attribute.Int("llm_d.epp.producer.max_match_blocks", maxMatch),
+		semconv.LLMDEPPProducerTotalBlocks(totalBlocks),
+		semconv.LLMDEPPProducerMaxMatchBlocks(maxMatch),
 	)
+	// The total is request-wide, matching the mm pair's denominator: a
+	// prompt shorter than one block produces no keys and cannot match,
+	// but its MM content still counts toward the request's total. The
+	// IsRecording guard skips the feature walk on the tracing-disabled path.
+	if mmTracked && span.IsRecording() {
+		span.SetAttributes(
+			mmMatchedBlocksKey.Int(maxMMMatch),
+			mmTotalBlocksKey.Int(totalMMBlocks(request, p.blockSizeTokens)),
+		)
+	}
 
-	logger.V(logging.TRACE).Info("Produce completed",
-		"blockKeys", totalBlocks, "scores", aggregatedScores)
+	if v := logger.V(logging.TRACE); v.Enabled() {
+		v.Info("Produce completed", "blockKeys", totalBlocks, "matches", matches)
+	}
+	return nil
+}
+
+// addPodMatch sums b into a. A zero a (a pod first seen in a later prompt)
+// takes b as is.
+func addPodMatch(a, b kvcache.PodMatch) kvcache.PodMatch {
+	if a.BlocksByTier == nil {
+		return b
+	}
+	a.WeightedScore += b.WeightedScore
+	a.MatchedBlocks += b.MatchedBlocks
+	a.ConfirmedBlocks += b.ConfirmedBlocks
+	for tier, count := range b.BlocksByTier {
+		a.BlocksByTier[tier] += count
+	}
+	return a
+}
+
+type endpointResult struct {
+	endpoint scheduling.Endpoint
+	info     *attrprefix.PrefixCacheMatchInfo
+}
+
+func (p *Producer) publishEndpointResults(ctx context.Context, results []endpointResult) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, result := range results {
+		result.endpoint.Put(p.dk, result.info)
+	}
 	return nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright 2025 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ func (r *recordingNotifier) upsertedNames() []string {
 	defer r.mu.Unlock()
 	names := make([]string, len(r.upserted))
 	for i, m := range r.upserted {
-		names[i] = m.NamespacedName.String()
+		names[i] = m.ID.String()
 	}
 	return names
 }
@@ -75,10 +75,11 @@ func writeTemp(t *testing.T, content string) string {
 
 func newFD(path string, watch bool) *FileDiscovery {
 	return &FileDiscovery{
-		path:      path,
-		watchFile: watch,
-		endpoints: make(map[types.NamespacedName]struct{}),
-		ready:     make(chan struct{}),
+		path:            path,
+		watchFile:       watch,
+		validateAddress: validateIPv4Address,
+		endpoints:       make(map[types.NamespacedName]struct{}),
+		ready:           make(chan struct{}),
 	}
 }
 
@@ -164,7 +165,7 @@ endpoints:
 	cancel()
 
 	require.NoError(t, newFD(path, false).Start(ctx, notifier))
-	assert.Equal(t, "default", notifier.upserted[0].NamespacedName.Namespace)
+	assert.Equal(t, "default", notifier.upserted[0].ID.Namespace)
 }
 
 func TestStart_MetricsHostIsAddressPort(t *testing.T) {
@@ -180,6 +181,29 @@ endpoints:
 
 	require.NoError(t, newFD(path, false).Start(ctx, notifier))
 	assert.Equal(t, "10.0.0.1:8000", notifier.upserted[0].MetricsHost)
+}
+
+func TestStart_AttributesSectionCarriedIntoMetadata(t *testing.T) {
+	path := writeTemp(t, `
+endpoints:
+  - name: ep1
+    address: "10.0.0.1"
+    port: "8000"
+    attributes:
+      pathPrefix: /laneA
+      model: fp8
+  - name: ep2
+    address: "10.0.0.2"
+    port: "8000"
+`)
+	notifier := &recordingNotifier{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, newFD(path, false).Start(ctx, notifier))
+	require.Len(t, notifier.upserted, 2)
+	assert.Equal(t, map[string]string{"pathPrefix": "/laneA", "model": "fp8"}, notifier.upserted[0].Attributes)
+	assert.Empty(t, notifier.upserted[1].Attributes)
 }
 
 func TestStart_MissingFile(t *testing.T) {
@@ -211,6 +235,41 @@ endpoints:
 	assert.ErrorContains(t, err, "invalid IPv4 address")
 }
 
+func TestStart_RankIndex(t *testing.T) {
+	path := writeTemp(t, `
+endpoints:
+  - name: ep1
+    address: "10.0.0.1"
+    port: "8000"
+  - name: ep2
+    address: "10.0.0.1"
+    port: "8001"
+    rankIndex: 1
+`)
+	notifier := &recordingNotifier{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, newFD(path, false).Start(ctx, notifier))
+	require.Len(t, notifier.upserted, 2)
+	assert.Equal(t, "10.0.0.1", notifier.upserted[0].Address)
+	assert.Equal(t, 0, notifier.upserted[0].RankIndex)
+	assert.Equal(t, "10.0.0.1", notifier.upserted[1].Address)
+	assert.Equal(t, 1, notifier.upserted[1].RankIndex)
+}
+
+func TestStart_NegativeRankIndex(t *testing.T) {
+	path := writeTemp(t, `
+endpoints:
+  - name: ep1
+    address: "10.0.0.1"
+    port: "8000"
+    rankIndex: -1
+`)
+	err := newFD(path, false).Start(context.Background(), &recordingNotifier{})
+	assert.ErrorContains(t, err, "invalid rankIndex")
+}
+
 func TestStart_InvalidPort(t *testing.T) {
 	path := writeTemp(t, `
 endpoints:
@@ -220,6 +279,41 @@ endpoints:
 `)
 	err := newFD(path, false).Start(context.Background(), &recordingNotifier{})
 	assert.ErrorContains(t, err, "invalid port")
+}
+
+func TestStart_MissingName(t *testing.T) {
+	path := writeTemp(t, `
+endpoints:
+  - address: "10.0.0.1"
+    port: "8000"
+`)
+	notifier := &recordingNotifier{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := newFD(path, false).Start(ctx, notifier)
+	assert.ErrorContains(t, err, "name is required")
+	assert.Empty(t, notifier.upserted)
+}
+
+func TestStart_DuplicateName(t *testing.T) {
+	path := writeTemp(t, `
+endpoints:
+  - name: ep1
+    address: "10.0.0.1"
+    port: "8000"
+  - name: ep1
+    address: "10.0.0.2"
+    port: "8000"
+`)
+	notifier := &recordingNotifier{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := newFD(path, false).Start(ctx, notifier)
+	assert.ErrorContains(t, err, "duplicate name")
+	require.Len(t, notifier.upserted, 1)
+	assert.Equal(t, "10.0.0.1", notifier.upserted[0].Address)
 }
 
 func TestStart_FileTooLarge(t *testing.T) {
@@ -283,7 +377,7 @@ endpoints:
 		notifier.mu.Lock()
 		defer notifier.mu.Unlock()
 		for _, m := range notifier.upserted {
-			if m.NamespacedName.Name == "ep3" {
+			if m.ID.Name == "ep3" {
 				return true
 			}
 		}
@@ -337,7 +431,7 @@ func TestDumpStateCaps(t *testing.T) {
 
 func TestDumpStateConcurrentWithLoad(t *testing.T) {
 	path := writeTemp(t, "endpoints:\n- name: ep1\n  address: 10.0.0.1\n  port: \"8000\"\n")
-	f := &FileDiscovery{path: path, endpoints: map[types.NamespacedName]struct{}{}}
+	f := &FileDiscovery{path: path, validateAddress: validateIPv4Address, endpoints: map[types.NamespacedName]struct{}{}}
 	notifier := &recordingNotifier{}
 
 	var wg sync.WaitGroup

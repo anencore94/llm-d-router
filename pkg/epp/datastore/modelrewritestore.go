@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright 2025 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -143,6 +143,25 @@ func (ms *modelRewriteStore) getAll() []*v1alpha2.InferenceModelRewrite {
 		rewrites = append(rewrites, rewrite)
 	}
 	return rewrites
+}
+
+// configuredModelNames returns every model name an InferenceModelRewrite
+// enumerates: exact-match sources and rewrite targets. These form the closed
+// set of operator-configured names that metric labels must never fold into the
+// cardinality overflow bucket.
+func configuredModelNames(infModelRewrite *v1alpha2.InferenceModelRewrite) []string {
+	names := sets.New[string]()
+	for _, rule := range infModelRewrite.Spec.Rules {
+		for _, match := range rule.Matches {
+			if match.Model != nil {
+				names.Insert(match.Model.Value)
+			}
+		}
+		for _, target := range rule.Targets {
+			names.Insert(target.ModelRewrite)
+		}
+	}
+	return names.UnsortedList()
 }
 
 // rewriteRuleWithMetadata decorates a rule with metadata from its parent object

@@ -1,0 +1,352 @@
+/*
+Copyright 2025 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Runtime confinement of a plugin's endpoint attribute access to the DataKeys
+// it declares. Typing AttributeMap by DataKey stops a plugin naming a key it
+// never declared in source; the scope here stops it reaching a key declared by
+// some other plugin, which is what makes Produces() and Consumes() a contract
+// rather than documentation. ValidateAndOrderDataDependencies enforces the same
+// contract statically, over the declarations alone.
+//
+// The scope covers endpoint attributes reached through the extension points
+// that receive a []scheduling.Endpoint: filters, scorers, and DataProducers.
+// Through request_scope.go it also covers the per-request store at those points,
+// at PreRequest, and in the profile handler.
+//
+// Datalayer extractors stay outside it: they write through
+// Endpoint.GetAttributes() directly rather than through a scoped endpoint.
+
+package datalayer
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/go-logr/logr"
+
+	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
+)
+
+// Violations records what a plugin did outside its declarations during one
+// extension-point invocation. The scoped request and every endpoint wrapper
+// produced by a single call share one instance, so a plugin that reaches for the
+// same undeclared key on each of a hundred candidates is reported once rather
+// than a hundred times.
+//
+// The lock is taken only on the rejection path. A conforming plugin never
+// touches it, so confinement costs an allowed access nothing beyond the map
+// lookup.
+type Violations struct {
+	mu           sync.Mutex
+	write        error
+	readReported bool
+}
+
+// Write returns the first write rejected during the invocation, or nil when the
+// plugin stayed inside its declarations. Extension points that can fail a
+// request turn this into an error; those without an error channel ignore it.
+func (v *Violations) Write() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.write
+}
+
+// recordWrite stores the first rejected write and reports whether this was it.
+func (v *Violations) recordWrite(err error) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.write != nil {
+		return false
+	}
+	v.write = err
+	return true
+}
+
+// recordRead reports whether this is the first rejected read of the invocation.
+func (v *Violations) recordRead() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.readReported {
+		return false
+	}
+	v.readReported = true
+	return true
+}
+
+// ScopedEndpoint wraps a scheduling.Endpoint and confines attribute access to a
+// plugin's declared keys. Writes outside Produces() are dropped and recorded;
+// reads outside Consumes() (plus the plugin's own Produces(), since a producer
+// may read back what it wrote) resolve as absent.
+//
+// Reads resolve as absent rather than failing because the read paths -- Filter,
+// Score -- have no error channel, and every consumer already handles a missing
+// optional attribute. Writes have one: a producer's violation is surfaced
+// through Violations.Write and turned into an error by the caller that ran it.
+//
+// Either way the rejection increments a counter, so an extension point that
+// cannot fail the request still makes a misdeclared plugin visible in
+// production rather than leaving it to log verbosity.
+type ScopedEndpoint struct {
+	inner fwksched.Endpoint
+	*endpointScope
+}
+
+// endpointScope is the state every ScopedEndpoint of one invocation shares. The
+// wrappers hold a pointer to it so the per-endpoint cost of scoping is the
+// wrapped endpoint plus one word, whatever the scope carries.
+type endpointScope struct {
+	allowedPut map[fwkplugin.DataKey]struct{}
+	allowedGet map[fwkplugin.DataKey]struct{}
+	reporter
+}
+
+// reporter counts, logs, and accumulates the rejections of one plugin during one
+// extension-point invocation. ScopedEndpoint and requestScope share it so an
+// endpoint attribute and a request attribute are reported the same way.
+type reporter struct {
+	typedName      fwkplugin.TypedName
+	extensionPoint string
+	logger         logr.Logger
+	violations     *Violations
+}
+
+var _ fwksched.Endpoint = &ScopedEndpoint{}
+
+func (e *ScopedEndpoint) GetMetadata() *fwkdl.EndpointMetadata { return e.inner.GetMetadata() }
+func (e *ScopedEndpoint) GetMetrics() *fwkdl.Metrics           { return e.inner.GetMetrics() }
+func (e *ScopedEndpoint) String() string                       { return e.inner.String() }
+
+// Unwrap returns the underlying endpoint. Callers hand plugin results back to
+// the framework unwrapped so endpoint identity -- which the scheduler relies on
+// to key score maps -- survives the round trip.
+func (e *ScopedEndpoint) Unwrap() fwksched.Endpoint { return e.inner }
+
+func (e *ScopedEndpoint) Put(key fwkplugin.DataKey, value fwkdl.Cloneable) {
+	if _, ok := e.allowedPut[key]; !ok {
+		e.reject(metrics.DataScopeAccessWrite, fmt.Errorf(
+			"plugin %q wrote undeclared DataKey %q; add it to Produces()", e.typedName.String(), key))
+		return
+	}
+	e.inner.Put(key, value)
+}
+
+func (e *ScopedEndpoint) Get(key fwkplugin.DataKey) (fwkdl.Cloneable, bool) {
+	if _, ok := e.allowedGet[key]; !ok {
+		e.reject(metrics.DataScopeAccessRead, fmt.Errorf(
+			"plugin %q read undeclared DataKey %q; add it to Consumes()", e.typedName.String(), key))
+		return nil, false
+	}
+	return e.inner.Get(key)
+}
+
+// reject counts the violation and logs it. The first offence of each kind in an
+// invocation is logged at Error, the rest at DEBUG: a plugin that misreaches on
+// every candidate endpoint would otherwise emit one error line per endpoint per
+// request.
+func (r *reporter) reject(access string, err error) {
+	metrics.RecordPluginDataScopeViolation(r.extensionPoint, r.typedName.Type, r.typedName.Name, access)
+
+	first := false
+	if access == metrics.DataScopeAccessWrite {
+		first = r.violations.recordWrite(err)
+	} else {
+		first = r.violations.recordRead()
+	}
+	if first {
+		r.logger.Error(err, "Rejected access outside the plugin's declared keys",
+			"extensionPoint", r.extensionPoint, "access", access)
+		return
+	}
+	r.logger.V(logging.DEBUG).Info("Rejected access outside the plugin's declared keys",
+		"extensionPoint", r.extensionPoint, "access", access, "error", err.Error())
+}
+
+// Keys returns only the declared keys that are present, so enumeration cannot
+// be used to discover an attribute the plugin may not read.
+func (e *ScopedEndpoint) Keys() []fwkplugin.DataKey {
+	var keys []fwkplugin.DataKey
+	for _, key := range e.inner.Keys() {
+		if _, ok := e.allowedGet[key]; ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// Clone returns a copy holding only the declared keys, so cloning cannot be
+// used to read around the scope.
+func (e *ScopedEndpoint) Clone() fwkdl.AttributeMap {
+	clone := fwkdl.NewAttributes()
+	for _, key := range e.Keys() {
+		if value, ok := e.inner.Get(key); ok {
+			clone.Put(key, value)
+		}
+	}
+	return clone
+}
+
+// scopeSpec holds the allowed-key sets derived from a plugin's declarations.
+// The maps are shared read-only by every ScopedEndpoint wrapper across all
+// invocations.
+type scopeSpec struct {
+	allowedPut map[fwkplugin.DataKey]struct{}
+	allowedGet map[fwkplugin.DataKey]struct{}
+}
+
+// scopeSpecs maps a plugin's TypedName().String() to the spec derived from its
+// declarations. RegisterScopeSpecs writes it during startup; Scope only reads.
+// ValidateAndOrderDataDependencies keys plugins the same way, so within the
+// datalayer contract the typed name identifies the plugin.
+var (
+	scopeSpecsMu sync.RWMutex
+	scopeSpecs   = map[string]*scopeSpec{}
+
+	// unregisteredReported dedups the error log for plugins missing from
+	// scopeSpecs, which Scope would otherwise emit on every invocation.
+	unregisteredReported sync.Map // string -> struct{}
+)
+
+// RegisterScopeSpecs derives the allowed-key sets from each plugin's
+// Produces() and Consumes() declarations and stores them for Scope to look up.
+// Declarations are fixed at plugin construction, so the sets are derived once
+// here rather than on every Scope invocation. Call it after all plugins are
+// instantiated; registering a typed name again replaces its spec.
+func RegisterScopeSpecs(plugins []fwkplugin.Plugin) {
+	scopeSpecsMu.Lock()
+	defer scopeSpecsMu.Unlock()
+	for _, plugin := range plugins {
+		scopeSpecs[plugin.TypedName().String()] = buildScopeSpec(plugin)
+	}
+}
+
+func buildScopeSpec(plugin fwkplugin.Plugin) *scopeSpec {
+	produces := map[fwkplugin.DataKey]any{}
+	if producer, ok := plugin.(fwkplugin.ProducerPlugin); ok {
+		produces = producer.Produces()
+	}
+	spec := &scopeSpec{
+		allowedPut: make(map[fwkplugin.DataKey]struct{}, len(produces)),
+		allowedGet: make(map[fwkplugin.DataKey]struct{}, len(produces)),
+	}
+	for key := range produces {
+		spec.allowedPut[key] = struct{}{}
+		// A producer may read back its own output.
+		spec.allowedGet[key] = struct{}{}
+	}
+	if consumer, ok := plugin.(fwkplugin.ConsumerPlugin); ok {
+		deps := consumer.Consumes()
+		for key := range deps.Required {
+			spec.allowedGet[key] = struct{}{}
+		}
+		for key := range deps.Optional {
+			spec.allowedGet[key] = struct{}{}
+		}
+	}
+	return spec
+}
+
+// scopeSpecFor returns the registered spec for a plugin, deriving and caching
+// one from its own declarations when startup registration missed it. The
+// declarations are fixed at construction, so a derived spec is the one
+// RegisterScopeSpecs would have stored; the miss is a wiring bug worth an error
+// log, reported once per typed name, but not a reason to cut a plugin off from
+// the data it declared.
+func scopeSpecFor(logger logr.Logger, p fwkplugin.Plugin) *scopeSpec {
+	name := p.TypedName().String()
+	scopeSpecsMu.RLock()
+	spec, ok := scopeSpecs[name]
+	scopeSpecsMu.RUnlock()
+	if ok {
+		return spec
+	}
+
+	spec = buildScopeSpec(p)
+	scopeSpecsMu.Lock()
+	scopeSpecs[name] = spec
+	scopeSpecsMu.Unlock()
+
+	if _, reported := unregisteredReported.LoadOrStore(name, struct{}{}); !reported {
+		logger.Error(fmt.Errorf("plugin %q has no registered scope spec; pass it to RegisterScopeSpecs", name),
+			"Deriving a plugin's scope from its declarations")
+	}
+	return spec
+}
+
+// Scope confines endpoints to what plugin declares. extensionPoint labels the
+// violation counter, so a misdeclared plugin is attributable to the point that
+// ran it. The returned Violations accumulates what the plugin did outside its
+// declarations, for callers whose extension point can report it.
+//
+// A plugin that declares nothing reaches nothing: an absent declaration is a
+// statement that the plugin exchanges no data, not a request to be exempt.
+//
+// The allowed-key sets come from the registry populated by RegisterScopeSpecs
+// at startup, treating Produces() and Consumes() as immutable after
+// construction. A plugin missing from the registry has its spec derived from
+// its own declarations on first use.
+func Scope(logger logr.Logger, extensionPoint string, plugin fwkplugin.Plugin, endpoints []fwksched.Endpoint) ([]fwksched.Endpoint, *Violations) {
+	violations := &Violations{}
+	return scopeEndpoints(logger, extensionPoint, plugin, endpoints, violations), violations
+}
+
+func scopeEndpoints(logger logr.Logger, extensionPoint string, plugin fwkplugin.Plugin, endpoints []fwksched.Endpoint, violations *Violations) []fwksched.Endpoint {
+	spec := scopeSpecFor(logger, plugin)
+	scope := &endpointScope{
+		allowedPut: spec.allowedPut,
+		allowedGet: spec.allowedGet,
+		reporter: reporter{
+			typedName:      plugin.TypedName(),
+			extensionPoint: extensionPoint,
+			logger:         logger,
+			violations:     violations,
+		},
+	}
+
+	// One backing array rather than an allocation per endpoint: this runs for
+	// every filter and scorer on every request, over the whole candidate set.
+	wrappers := make([]ScopedEndpoint, len(endpoints))
+	scoped := make([]fwksched.Endpoint, len(endpoints))
+	for i, endpoint := range endpoints {
+		wrappers[i] = ScopedEndpoint{inner: endpoint, endpointScope: scope}
+		scoped[i] = &wrappers[i]
+	}
+	return scoped
+}
+
+// Unscope restores the underlying endpoints of a plugin's result.
+func Unscope(endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	unscoped := make([]fwksched.Endpoint, len(endpoints))
+	for i, endpoint := range endpoints {
+		unscoped[i] = UnscopeEndpoint(endpoint)
+	}
+	return unscoped
+}
+
+// UnscopeEndpoint returns the underlying endpoint of one key of a scorer's
+// result. The scheduler sums scores across scorers in a map keyed by endpoint,
+// so a wrapper left in a key would split one endpoint's score into several
+// entries. Unwrapping each key as it is summed avoids building a rekeyed copy of
+// every scorer's result.
+func UnscopeEndpoint(endpoint fwksched.Endpoint) fwksched.Endpoint {
+	if scoped, ok := endpoint.(*ScopedEndpoint); ok {
+		return scoped.inner
+	}
+	return endpoint
+}

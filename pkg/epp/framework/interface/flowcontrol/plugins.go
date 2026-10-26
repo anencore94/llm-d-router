@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -100,21 +101,11 @@ type OrderingPolicy interface {
 	plugin.Plugin
 
 	// Less reports whether item 'a' should be dispatched before item 'b'.
-	// This makes the policy act as a sort.Interface for the queue.
+	// This makes the policy act as a sort.Interface for the queue, determining the dispatch order
+	// (the queue's head is the highest-priority item per this comparator).
 	//
-	// Invariants:
-	//   - Returning true means 'a' has higher priority than 'b'.
-	//   - If the queue supports CapabilityPriorityConfigurable, this function determines the heap order.
+	// Invariant: returning true means 'a' has higher priority than 'b'.
 	Less(a, b QueueItemAccessor) bool
-
-	// RequiredQueueCapabilities returns the set of capabilities that a SafeQueue MUST support to effectively apply this
-	// policy.
-	//
-	// For example:
-	//   - "fcfs-ordering-policy" coupled with CapabilityFIFO is O(1).
-	//   - "edf-ordering-policy" (Earliest Deadline First) REQUIRES CapabilityPriorityConfigurable (Heap) to function
-	//     correctly.
-	RequiredQueueCapabilities() []QueueCapability
 }
 
 // SaturationDetector provides real-time load signals.
@@ -136,6 +127,44 @@ type SaturationDetector interface {
 	Saturation(ctx context.Context, endpoints []datalayer.Endpoint) float64
 }
 
+// Pipeline stages named by WithSaturationStage.
+const (
+	SaturationStagePrefill = "prefill"
+	SaturationStageDecode  = "decode"
+)
+
+type saturationStageKey struct{}
+
+// WithSaturationStage returns a context naming the pipeline stage (SaturationStagePrefill or
+// SaturationStageDecode) whose endpoints a SaturationDetector.Saturation call evaluates.
+func WithSaturationStage(ctx context.Context, stage string) context.Context {
+	return context.WithValue(ctx, saturationStageKey{}, stage)
+}
+
+// SaturationStageFromContext returns the stage set by WithSaturationStage, or "" when the
+// endpoints were not partitioned by stage.
+func SaturationStageFromContext(ctx context.Context) string {
+	stage, _ := ctx.Value(saturationStageKey{}).(string)
+	return stage
+}
+
+// DispatchReservationTracker closes the observation gap between flow-control dispatch and the
+// request lifecycle hooks that publish in-flight load. A reservation is created immediately
+// before a request is released from the flow-control queue and removed after PreRequest hooks
+// have published the request to the endpoint load signal.
+//
+// Reservations are pool-wide: scheduling chooses the destination after dispatch, so a reservation
+// is not scoped to a stage or endpoint. An implementation that watches a subset of endpoints
+// (for example a stage-scoped child of a composite detector) counts every outstanding
+// reservation against its own capacity.
+//
+// Implementations MUST be goroutine-safe. Request IDs are the reservation identity; duplicate
+// reserve and release calls must be idempotent.
+type DispatchReservationTracker interface {
+	ReserveDispatch(requestID string) bool
+	ReleaseDispatch(requestID string) bool
+}
+
 // UsageLimitPolicy computes the usage limit of a priority band dynamically.
 //
 // The goal of this policy is to enable adaptive capacity management by gating lower-priority traffic
@@ -144,35 +173,114 @@ type SaturationDetector interface {
 // Saturation represents resource usage as a fraction of total capacity (0.0 = idle, 1.0 = fully saturated)
 // as described in [/pkg/epp/flowcontrol/contracts.SaturationDetector]
 //
-// Architecture (Stateless Singleton):
-// UsageLimitPolicy plugins are Singletons. A single instance handles limit computation for all priority bands
-// across all shards. The plugin MUST be stateless: it is a pure function that maps the current saturation and
-// active priority domain to a set of ceilings. Any signal conditioning (trend detection, smoothing) belongs in
-// the SaturationDetector layer, not here.
+// Architecture (Mostly Stateless Singleton):
+// UsageLimitPolicy plugins are Singletons. A single instance handles limit computation for all priority bands.
+// The plugin SHOULD be stateless -- a pure function mapping the current saturation and active priority
+// domain to a set of ceilings. Small bounded dispatch-spreading state (e.g. a tick counter used to fold
+// successive calls into a proportional duty cycle) is permitted; signal conditioning (trend detection,
+// smoothing) is not, and belongs in the SaturationDetector layer.
 //
 // Integration:
-// This policy is called during dispatch decision-making, before a request is allowed to proceed. For each
-// priority band, the returned ceiling is compared against current saturation. If saturation exceeds the
-// ceiling for a given priority, requests at that priority are gated (not dispatched).
+// This policy is called during dispatch decision-making, before a request is allowed to proceed. Each band's
+// ceiling is authoritative for that band alone: if saturation is at or above the ceiling computed for a
+// priority, requests at that priority are gated (not dispatched). Gating is decided per band, independent of
+// the order in which bands are visited and of the outcome at any other band.
 //
-// Conformance: Implementations MUST ensure all methods are goroutine-safe.
+// The framework calls ComputeLimit exactly once per dispatch cycle. This is a contract term, not an
+// implementation detail: dispatch-spreading policies use the call itself as their time base (one tick
+// per cycle), and computing all ceilings in one call is what lets every gated band observe the same
+// open/closed decision within a cycle. The batch shape exists to preserve both properties.
+//
+// Conformance: Implementations MUST ensure all methods are goroutine-safe. Computed ceilings MUST be
+// monotonically non-increasing in the given priority order (highest priority first). Monotonicity makes the
+// open bands a prefix of that order, so every band that may dispatch outranks every gated band. Ceilings that
+// rise as priority descends invert that: a lower band dispatches while a higher band is held back.
 type UsageLimitPolicy interface {
 	plugin.Plugin
 
 	// ComputeLimit calculates usage ceilings for all currently active priority levels based on current
-	// saturation. The plugin observes the active priority domain (which changes dynamically as workloads
-	// come and go) and computes relative ceilings from scratch on each call.
+	// saturation, writing the ceiling for the n-th priority into the n-th element of the
+	// caller-provided ceilings buffer. The plugin observes the active priority domain (which changes
+	// dynamically as workloads come and go) and computes relative ceilings from scratch on each call.
+	//
+	// The framework guarantees len(ceilings) == len(priorities) and pre-fills every element with 1.0
+	// (no gating), so an entry the plugin does not write fails open. Writing into the framework-owned
+	// buffer means a result of the wrong size cannot exist; there is no return value to validate.
 	//
 	// Parameters:
 	//   - ctx: Request context for logging, tracing, etc.
 	//   - saturation: Current pool-wide resource saturation as a fraction [0.0, 1.0]
-	//   - priorities: Ordered list of currently active priority levels (highest first)
-	//
-	// Returns:
-	//   - ceilings: Computed ceiling for each given priority (n-th ceiling is assigned to the given n-th priority)
+	//   - priorities: Ordered list of currently active priority levels (highest first).
+	//     The slice is a shared snapshot owned by the framework: read-only, and it MUST NOT be
+	//     retained after the call returns.
+	//   - ceilings: Output buffer owned by the framework, valid only for the duration of the call.
+	//     Ceiling semantics per element:
 	//     - 0.0 = fully gated (cannot dispatch regardless of current saturation)
 	//     - 1.0 = no gating (can dispatch until fully saturated)
 	//     - Values between 0.0 and 1.0 reserve capacity headroom
+	ComputeLimit(ctx context.Context, saturation float64, priorities []int, ceilings []float64)
+}
+
+// BandSelectionParameters carries the inputs of a single Rank call.
+//
+// Every field is owned by the framework and valid only for the duration of the call: implementations MUST NOT
+// modify or retain them.
+type BandSelectionParameters struct {
+	// Saturation is the current pool-wide resource saturation as a fraction [0.0, 1.0].
+	Saturation float64
+
+	// Priorities lists the currently active priority levels, highest first.
+	Priorities []int
+
+	// Ceilings holds the ceilings computed by the UsageLimitPolicy for this cycle, indexed in step with
+	// Priorities. A band whose ceiling is at or below Saturation is gated and is skipped wherever it is
+	// ranked.
+	Ceilings []float64
+}
+
+// BandSelectionPolicy governs the order in which priority bands are offered a dispatch opportunity.
+//
+// In simple terms, this policy answers the question: "Which priority band gets to dispatch next?"
+//
+// While FairnessPolicy shares dispatch opportunities among the flows inside one band, band selection decides
+// which bands compete and in what sequence. Strict order serves bands from highest to lowest priority, which
+// lets a band starve while any higher band has work. Alternative implementations spread opportunities across
+// bands to bound that starvation.
+//
+// Architecture (Stateful Singleton):
+// A single instance serves the whole dispatch loop. Both methods are called only from the processor's dispatch
+// goroutine, so scheduling state (round credits, virtual time) can live in plugin fields without
+// synchronization.
+//
+// Conformance: state exposed outside the dispatch goroutine, such as metrics or introspection endpoints, MUST
+// be goroutine-safe.
+type BandSelectionPolicy interface {
+	plugin.Plugin
+
+	// Rank writes the sequence in which bands should be offered a dispatch opportunity, as indices into
+	// params.Priorities, into the caller-provided order buffer.
 	//
-	ComputeLimit(ctx context.Context, saturation float64, priorities []int) (ceilings []float64)
+	// The framework walks that sequence and dispatches from the first band that yields an item, so a band
+	// that is gated, empty, or fails to dispatch costs only its position in the sequence. Implementations
+	// rank candidates without modelling queue occupancy or dispatch failure.
+	//
+	// The framework guarantees len(order) == len(params.Priorities) and pre-fills it with the identity
+	// permutation, which is strict highest-to-lowest order, so a policy that writes nothing falls back to
+	// strict dispatch. Writing into the framework-owned buffer means a result of the wrong size cannot
+	// exist; there is no return value to validate. An order that omits or repeats an index is a programming
+	// error: an omitted band never dispatches, and a repeated one is retried in place.
+	//
+	// Parameters:
+	//   - ctx: Request context for logging, tracing, etc.
+	//   - params: Inputs for this cycle.
+	//   - order: Output buffer owned by the framework, valid only for the duration of the call.
+	Rank(ctx context.Context, params BandSelectionParameters, order []int)
+
+	// RecordDispatch reports the priority of the band that dispatched an item. The framework calls it at
+	// most once per dispatch cycle, after the dispatch succeeds, and not at all on cycles that dispatch
+	// nothing.
+	//
+	// Settling share accounting here ties it to the service a band actually received. A band charged at
+	// ranking time for an item it never dispatched drifts away from its configured share.
+	RecordDispatch(ctx context.Context, priority int)
 }

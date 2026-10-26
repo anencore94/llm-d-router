@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +21,14 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/google/uuid"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -40,7 +43,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	metricsutils "k8s.io/component-base/metrics/testutil"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -48,14 +50,17 @@ import (
 
 	eppRunner "github.com/llm-d/llm-d-router/cmd/epp/runner"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	dlmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/utilization"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 	eppServer "github.com/llm-d/llm-d-router/pkg/epp/server"
 	testutil "github.com/llm-d/llm-d-router/pkg/epp/util/testing"
-	integration "github.com/llm-d/llm-d-router/test/integration"
+	fwknet "github.com/llm-d/llm-d-router/test/framework/net"
+	"github.com/llm-d/llm-d-router/test/integration"
 )
 
 // Global State (Initialized in TestMain)
@@ -100,6 +105,9 @@ type HarnessConfig struct {
 
 	// Tracing indicates if tracing should be enabled for this test.
 	Tracing bool
+
+	// emitEndpointScores enables emitting per-endpoint scores in the request-path dynamic metadata.
+	emitEndpointScores bool
 }
 
 // HarnessOption is a functional option for configuring the TestHarness.
@@ -134,9 +142,17 @@ func WithTracing() HarnessOption {
 	}
 }
 
+// WithEmitEndpointScores starts the EPP with --emit-endpoint-scores enabled.
+func WithEmitEndpointScores() HarnessOption {
+	return func(c *HarnessConfig) {
+		c.emitEndpointScores = true
+	}
+}
+
 // metricsBackend abstracts how pod metrics are injected into the test environment.
 type metricsBackend interface {
 	SetPodMetrics(m map[types.NamespacedName]*fwkdl.Metrics)
+	SetPodPollErrors(errs map[types.NamespacedName]error)
 }
 
 // mockDataSourceBackend wraps the mock DataSource to implement metricsBackend.
@@ -146,6 +162,10 @@ type mockDataSourceBackend struct {
 
 func (b *mockDataSourceBackend) SetPodMetrics(m map[types.NamespacedName]*fwkdl.Metrics) {
 	b.mockDataSource.SetMetrics(m)
+}
+
+func (b *mockDataSourceBackend) SetPodPollErrors(errs map[types.NamespacedName]error) {
+	b.mockDataSource.SetErrors(errs)
 }
 
 // TestHarness encapsulates the environment for a single isolated EPP test run.
@@ -202,7 +222,28 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespaceName}}
 	require.NoError(t, k8sClient.Create(ctx, ns), "failed to create test namespace")
 
+	// Tracing Setup (InMemory).
+	var exporter *tracetest.InMemoryExporter
+	var tp *sdktrace.TracerProvider
+	if config.Tracing {
+		exporter = tracetest.NewInMemoryExporter()
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithSyncer(exporter),
+		)
+		otel.SetTracerProvider(tp)
+		tracing.InitTextMapPropagator()
+	}
+
+	// Reserve the ext_proc port once, up front: the server serves on this listener, so
+	// the port stays bound for the lifetime of the test and no other process can take
+	// it (issue #1066).
+	lis, err := fwknet.ReserveListener()
+	require.NoError(t, err, "failed to reserve ext_proc port")
+	t.Cleanup(func() { _ = lis.Close() })
+	grpcPort := lis.Addr().(*net.TCPAddr).Port
+
 	eppOptions := defaultEppServerOptions(t, testNamespaceName, configText)
+	eppOptions.EmitEndpointScores = config.emitEndpointScores
 	if config.runMode == modeStandalone && config.standaloneStrategy == strategyNoCRD {
 		// Only standalone EPP without crd need to set the EndpointSelector.
 		eppOptions.EndpointSelector = labels.SelectorFromSet(labels.Set{"app": testPoolName})
@@ -216,40 +257,49 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 		Type: mockDataSourceType,
 		Name: mockDataSourceType,
 	})
-	runner, mgr, dataStore, err := eppRunner.NewTestRunnerSetup(ctx, testEnv.Config, eppOptions, mockDataSource)
+	runner, mgr, dataStore, err := eppRunner.NewTestRunnerSetup(ctx, testEnv.Config, eppOptions, mockDataSource, lis)
 	require.NoError(t, err, "failed to create manager")
 	backend := metricsBackend(&mockDataSourceBackend{mockDataSource: mockDataSource})
 
-	// Tracing Setup (InMemory)
-	var exporter *tracetest.InMemoryExporter
-	var tp *sdktrace.TracerProvider
-	if config.Tracing {
-		exporter = tracetest.NewInMemoryExporter()
-		tp = sdktrace.NewTracerProvider(
-			sdktrace.WithSyncer(exporter),
-		)
-		otel.SetTracerProvider(tp)
-	}
-
 	mgrCtx, mgrCancel := context.WithCancel(ctx)
-
-	// Start Manager.
 	mgrDone := make(chan struct{})
+	mgrErr := make(chan error, 1)
 	go func() {
 		defer close(mgrDone)
-		if err := mgr.Start(mgrCtx); err != nil {
-			// Context cancellation is expected during teardown.
-			if !strings.Contains(err.Error(), "context canceled") {
-				logger.Error(err, "manager stopped unexpectedly")
-			}
+		err := mgr.Start(mgrCtx)
+		mgrErr <- err
+		// Context cancellation is expected during teardown.
+		if err != nil && !strings.Contains(err.Error(), "context canceled") {
+			logger.Error(err, "manager stopped unexpectedly")
 		}
 	}()
+
+	// Cleanups run LIFO, so this teardown runs after the manager-stop cleanup below.
+	t.Cleanup(func() {
+		if config.Tracing {
+			_ = tp.Shutdown(ctx)
+			// Reset to no-op to avoid pollution between tests.
+			otel.SetTracerProvider(noop.NewTracerProvider())
+		}
+		// Deleting the Namespace cascades to all contained resources.
+		_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: eppOptions.PoolNamespace}})
+		// Crucial: Reset global metrics registry to prevent pollution between serial tests.
+		metrics.Reset()
+	})
+	// Registered before the readiness wait below can fail the test, so the manager
+	// goroutine cannot outlive it. Waiting on mgrDone keeps the manager fully stopped
+	// before the global metrics registry is reset and the namespace is deleted.
+	t.Cleanup(func() {
+		mgrCancel()
+		<-mgrDone
+	})
 
 	extProcClient, conn := integration.ExtProcServerClient(
 		mgrCtx,
 		t,
-		eppOptions.GRPCPort,
+		grpcPort,
 		logger,
+		mgrErr,
 	)
 
 	h := &TestHarness{
@@ -268,26 +318,6 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 		Runner:             runner,
 	}
 
-	// 8. Register Cleanup
-
-	t.Cleanup(func() {
-		mgrCancel()
-		// Wait for the manager (and its gRPC server) to fully stop before returning.
-		// Without this, the gRPC server may still hold its port when the next test
-		// calls GetFreePort(), causing a bind: address already in use race.
-		<-mgrDone
-		if config.Tracing {
-			_ = tp.Shutdown(ctx)
-			// Reset to no-op to avoid pollution between tests.
-			otel.SetTracerProvider(noop.NewTracerProvider())
-		}
-		_ = h.grpcConn.Close()
-		// Deleting the Namespace cascades to all contained resources.
-		_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: eppOptions.PoolNamespace}})
-		// Crucial: Reset global metrics registry to prevent pollution between serial tests.
-		metrics.Reset()
-	})
-
 	return h
 }
 
@@ -299,19 +329,12 @@ func defaultEppServerOptions(t *testing.T, namespace, configText string) *eppSer
 	eppOptions.PoolNamespace = namespace
 	eppOptions.ConfigText = configText
 
-	metricsPort, err := integration.GetFreePort()
-	require.NoError(t, err)
-	eppOptions.MetricsPort = metricsPort
-
-	grpcPort, err := integration.GetFreePort()
-	require.NoError(t, err)
-	eppOptions.GRPCPort = grpcPort
-
-	healthPort, err := integration.GetFreePort()
-	require.NoError(t, err)
-	eppOptions.GRPCHealthPort = healthPort
+	// No test dials the health server, so let the kernel assign the port: a
+	// port 0 bind cannot lose a race to another listener.
+	eppOptions.GRPCHealthPort = 0
 	eppOptions.EndpointTargetPorts = []int{8000}
 	eppOptions.SecureServing = false
+	eppOptions.AllowExperimentalPlugins = true
 	return eppOptions
 }
 
@@ -383,16 +406,22 @@ func (h *TestHarness) WithPods(pods []PodState) *TestHarness {
 	return h
 }
 
-// WaitForReadyPodsMetric blocks until the prometheus metric 'inference_pool_ready_pods' matches the expected count.
+// SetPodPollErrors makes every metrics poll of the given endpoints fail with the
+// mapped error. A nil map makes every poll succeed.
+func (h *TestHarness) SetPodPollErrors(errs map[types.NamespacedName]error) {
+	h.metricsBackend.SetPodPollErrors(errs)
+}
+
+// WaitForReadyPodsMetric blocks until the prometheus metric 'llm_d_epp_ready_endpoints' matches the expected count.
 func (h *TestHarness) WaitForReadyPodsMetric(expectedCount int) {
 	h.t.Helper()
 
 	expected := cleanMetric(metricReadyPods(expectedCount))
 	require.Eventually(h.t, func() bool {
-		err := metricsutils.GatherAndCompare(crmetrics.Registry, strings.NewReader(expected),
-			"inference_pool_ready_pods")
+		err := promtestutil.GatherAndCompare(crmetrics.Registry, strings.NewReader(expected),
+			"llm_d_epp_ready_endpoints")
 		return err == nil
-	}, 10*time.Second, 50*time.Millisecond, "Timed out waiting for inference_pool_ready_pods metric to settle")
+	}, 10*time.Second, 50*time.Millisecond, "Timed out waiting for llm_d_epp_ready_endpoints metric to settle")
 }
 
 // WaitForSync blocks until the EPP Datastore has synced the expected number of pods.
@@ -426,6 +455,30 @@ func (h *TestHarness) WaitForSync(expectedPods int, checkModelObjective string) 
 	return h
 }
 
+// WaitForMetricsDelivery blocks until every tracked endpoint has received a metrics update.
+// Endpoints start with a zero UpdateTime, which the default utilization-detector filter
+// drops as stale; tests asserting on the full candidate set need it.
+func (h *TestHarness) WaitForMetricsDelivery() *TestHarness {
+	h.t.Helper()
+
+	require.Eventually(h.t, func() bool {
+		pods := h.Datastore.PodList(datastore.AllPodsPredicate)
+		if len(pods) == 0 {
+			return false
+		}
+		for _, pod := range pods {
+			// Half the staleness threshold: fresh enough that the filter still accepts
+			// the endpoint once the wait returns, loose enough to tolerate a slow polling tick.
+			if m := pod.GetMetrics(); m == nil || time.Since(m.UpdateTime) > utilization.DefaultMetricsStalenessThreshold/2 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 50*time.Millisecond,
+		"Timed out waiting for endpoint metrics delivery")
+	return h
+}
+
 // ExpectMetrics asserts that specific metrics match the expected Prometheus output.
 // It uses Eventually to allow for slight delays in metric recording (e.g. async token counting).
 func (h *TestHarness) ExpectMetrics(expected map[string]string) {
@@ -433,7 +486,7 @@ func (h *TestHarness) ExpectMetrics(expected map[string]string) {
 	for name, value := range expected {
 		var err error
 		assert.Eventually(h.t, func() bool {
-			err = metricsutils.GatherAndCompare(crmetrics.Registry, strings.NewReader(value), name)
+			err = promtestutil.GatherAndCompare(crmetrics.Registry, strings.NewReader(value), name)
 			return err == nil
 		}, 2*time.Second, 50*time.Millisecond, "Timed out waiting for metric %s to match: %v", name)
 		if err != nil {

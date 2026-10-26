@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package disagg
 
 import (
@@ -7,16 +23,23 @@ import (
 	"net"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
+	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
 
@@ -36,7 +59,7 @@ const (
 
 func makeEndpoint(nsn k8stypes.NamespacedName, ip, port string, labels map[string]string) scheduling.Endpoint {
 	return scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: nsn, Address: ip, Port: port, Labels: labels},
+		&fwkdl.EndpointMetadata{ID: nsn, Address: ip, Port: port, Labels: labels},
 		nil,
 		fwkdl.NewAttributes(),
 	)
@@ -73,29 +96,29 @@ func profileNames(m map[string]scheduling.SchedulerProfile) []string {
 func completionsRequest(prompt string) *scheduling.InferenceRequest {
 	return &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, len(prompt)/averageCharactersPerToken)}},
+			Completions:      &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, len(prompt)/averageCharactersPerToken)}}},
 		},
 	}
 }
 
 // chatRequest builds a chat-completions InferenceRequest, populating the
 // tokenized prompt with one multimodal feature per requested modality so
-// that multimodal detection (which reads TokenizedPrompt) is exercised.
+// that multimodal detection (which reads TokenizedRequest) is exercised.
 func chatRequest(hasImage, hasVideo, hasAudio bool) *scheduling.InferenceRequest {
 	blocks := []fwkrh.ContentBlock{{Type: "text", Text: "describe this"}}
 	var features []fwkrh.MultiModalFeature
 	if hasImage {
 		blocks = append(blocks, fwkrh.ContentBlock{Type: "image_url", ImageURL: fwkrh.ImageBlock{URL: "https://example.com/img.jpg"}})
-		features = append(features, fwkrh.MultiModalFeature{Modality: fwkrh.ModalityImage})
+		features = append(features, fwkrh.MultiModalFeature{Modality: reqcommon.ModalityImage})
 	}
 	if hasVideo {
 		blocks = append(blocks, fwkrh.ContentBlock{Type: "video_url"})
-		features = append(features, fwkrh.MultiModalFeature{Modality: fwkrh.ModalityImage})
+		features = append(features, fwkrh.MultiModalFeature{Modality: reqcommon.ModalityImage})
 	}
 	if hasAudio {
 		blocks = append(blocks, fwkrh.ContentBlock{Type: "input_audio"})
-		features = append(features, fwkrh.MultiModalFeature{Modality: fwkrh.ModalityImage})
+		features = append(features, fwkrh.MultiModalFeature{Modality: reqcommon.ModalityImage})
 	}
 	body := &fwkrh.InferenceRequestBody{
 		ChatCompletions: &fwkrh.ChatCompletionsRequest{
@@ -103,7 +126,7 @@ func chatRequest(hasImage, hasVideo, hasAudio bool) *scheduling.InferenceRequest
 		},
 	}
 	if len(features) > 0 {
-		body.TokenizedPrompt = &fwkrh.TokenizedPrompt{MultiModalFeatures: features}
+		body.TokenizedRequest = &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{MultiModalFeatures: features}}}
 	}
 	return &scheduling.InferenceRequest{Body: body}
 }
@@ -113,10 +136,15 @@ func chatRequest(hasImage, hasVideo, hasAudio bool) *scheduling.InferenceRequest
 // any existing multimodal features.
 func withPrompt(req *scheduling.InferenceRequest, prompt string) *scheduling.InferenceRequest {
 	req.Body.Completions = &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: prompt}}
-	if req.Body.TokenizedPrompt == nil {
-		req.Body.TokenizedPrompt = &fwkrh.TokenizedPrompt{}
+	if req.Body.TokenizedRequest == nil {
+		req.Body.TokenizedRequest = &fwkrh.TokenizedRequest{}
 	}
-	req.Body.TokenizedPrompt.PerPromptTokens = [][]uint32{make([]uint32, len(prompt)/averageCharactersPerToken)}
+	tokenIDs := make([]uint32, len(prompt)/averageCharactersPerToken)
+	if len(req.Body.TokenizedRequest.Prompts) > 0 {
+		req.Body.TokenizedRequest.Prompts[0].TokenIDs = tokenIDs
+	} else {
+		req.Body.TokenizedRequest.Prompts = []fwkrh.PromptTokens{{TokenIDs: tokenIDs}}
+	}
 	return req
 }
 
@@ -127,7 +155,7 @@ func injectPrefixCache(profileResults map[string]*scheduling.ProfileRunResult, c
 		return
 	}
 	for _, ep := range res.TargetEndpoints {
-		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(),
+		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey,
 			attrprefix.NewPrefixCacheMatchInfo(cachedTokens, inputTokens, 1))
 	}
 }
@@ -138,7 +166,7 @@ func handleWithDeciders(ctx context.Context) plugin.Handle {
 	p1, _ := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
 	h.AddPlugin(PrefixBasedPDDeciderPluginType, p1)
 	h.AddPlugin(AlwaysDisaggPDDeciderPluginType, newAlwaysDisaggPDDecider())
-	h.AddPlugin(AlwaysDisaggMulimodalPluginType, newAlwaysDisaggEncodeDecider())
+	h.AddPlugin(AlwaysDisaggMulimodalPluginType, NewAlwaysDisaggEncodeDecider())
 	return h
 }
 
@@ -150,6 +178,32 @@ func (m *mockEncodeDecider) TypedName() plugin.TypedName { return plugin.TypedNa
 
 func (m *mockEncodeDecider) disaggregate(_ context.Context, _ *scheduling.InferenceRequest, _ scheduling.Endpoint) bool {
 	return m.allow
+}
+
+type mockPDDecider struct {
+	allow bool
+}
+
+func (m *mockPDDecider) TypedName() plugin.TypedName { return plugin.TypedName{} }
+
+func (m *mockPDDecider) disaggregate(_ context.Context, _ *scheduling.InferenceRequest, _ scheduling.Endpoint) bool {
+	return m.allow
+}
+
+// consumingDecider declares its own data dependencies and disaggregates when
+// the request attribute under read is true.
+type consumingDecider struct {
+	deps plugin.DataDependencies
+	read plugin.DataKey
+}
+
+func (d *consumingDecider) TypedName() plugin.TypedName { return plugin.TypedName{} }
+
+func (d *consumingDecider) Consumes() plugin.DataDependencies { return d.deps }
+
+func (d *consumingDecider) disaggregate(_ context.Context, request *scheduling.InferenceRequest, _ scheduling.Endpoint) bool {
+	allow, _ := scheduling.ReadRequestAttribute[bool](request, d.read)
+	return allow
 }
 
 // ── Helper function tests ────────────────────────────────────────────────────
@@ -164,7 +218,7 @@ func TestHasMultimodalContent(t *testing.T) {
 		{"nil body", &scheduling.InferenceRequest{Body: nil}, false},
 		{"nil tokenized prompt", &scheduling.InferenceRequest{Body: &fwkrh.InferenceRequestBody{}}, false},
 		{"empty multimodal features", &scheduling.InferenceRequest{
-			Body: &fwkrh.InferenceRequestBody{TokenizedPrompt: &fwkrh.TokenizedPrompt{}},
+			Body: &fwkrh.InferenceRequestBody{TokenizedRequest: &fwkrh.TokenizedRequest{}},
 		}, false},
 		{"text only", chatRequest(false, false, false), false},
 		{"image", chatRequest(true, false, false), true},
@@ -172,8 +226,8 @@ func TestHasMultimodalContent(t *testing.T) {
 		{"audio", chatRequest(false, false, true), true},
 		{"feature present", &scheduling.InferenceRequest{
 			Body: &fwkrh.InferenceRequestBody{
-				TokenizedPrompt: &fwkrh.TokenizedPrompt{
-					MultiModalFeatures: []fwkrh.MultiModalFeature{{Modality: fwkrh.ModalityImage}},
+				TokenizedRequest: &fwkrh.TokenizedRequest{
+					Prompts: []fwkrh.PromptTokens{{MultiModalFeatures: []fwkrh.MultiModalFeature{{Modality: reqcommon.ModalityImage}}}},
 				},
 			},
 		}, true},
@@ -250,55 +304,10 @@ func TestHandlerFactory(t *testing.T) {
 		{"unknown encodeDecider", map[string]any{
 			"deciders": map[string]any{"encode": "INVALID"},
 		}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			b, _ := json.Marshal(tt.params)
-			p, err := HandlerFactory("h", plugin.StrictDecoder(b), handle)
-			if tt.expectErr {
-				assert.Error(t, err)
-				assert.Nil(t, p)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, p)
-			}
-		})
-	}
-}
-
-func TestHandlerFactory_DeprecatedFlatParams(t *testing.T) {
-	ctx := utils.NewTestContext(t)
-	handle := handleWithDeciders(ctx)
-
-	tests := []struct {
-		name      string
-		params    map[string]any
-		expectErr bool
-	}{
-		{"deprecated prefillDeciderPluginName", map[string]any{
-			"prefillDeciderPluginName": PrefixBasedPDDeciderPluginType,
-		}, false},
-		{"deprecated encodeDeciderPluginName", map[string]any{
-			"encodeDeciderPluginName": AlwaysDisaggMulimodalPluginType,
-		}, false},
-		{"deprecated custom profile names", map[string]any{
-			"decodeProfile":            "my-decode",
-			"prefillProfile":           "my-prefill",
-			"encodeProfile":            "my-encode",
-			"prefillDeciderPluginName": PrefixBasedPDDeciderPluginType,
-		}, false},
-		{"nested format with unknown extra fields is rejected", map[string]any{
+		{"unknown field is rejected", map[string]any{
 			"profiles":     map[string]any{"decode": "decode"},
 			"unknownField": "ignored",
 		}, true},
-		{"mixing deprecated and nested fields is an error", map[string]any{
-			"decodeProfile": "my-decode",
-			"profiles":      map[string]any{"decode": "other-decode"},
-		}, true},
-		{"mixing deprecated decider and nested deciders is an error", map[string]any{
-			"prefillDeciderPluginName": PrefixBasedPDDeciderPluginType,
-			"deciders":                 map[string]any{"prefill": AlwaysDisaggPDDeciderPluginType},
-		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -315,47 +324,123 @@ func TestHandlerFactory_DeprecatedFlatParams(t *testing.T) {
 	}
 }
 
-// TestHandlerFactory_PdProfileHandlerParams verifies that
-// Handler accepts the exact parameter format of the deprecated
-// pd-profile-handler, enabling a zero-change migration between the two types.
-func TestHandlerFactory_PdProfileHandlerParams(t *testing.T) {
-	ctx := utils.NewTestContext(t)
-	handle := handleWithDeciders(ctx)
+func TestHandler_Consumes_PrefixMatchInfoProducerName(t *testing.T) {
+	const preciseName = "precise-prefix-cache-producer"
+
+	prefixDecider := func(t *testing.T, producerName string) deciderPlugin {
+		t.Helper()
+		decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{
+			NonCachedTokens:             4,
+			PrefixMatchInfoProducerName: producerName,
+		})
+		require.NoError(t, err)
+		return decider
+	}
 
 	tests := []struct {
-		name      string
-		params    map[string]any
-		expectErr bool
+		name        string
+		pdDecider   func(t *testing.T) deciderPlugin
+		expectedKey plugin.DataKey
 	}{
-		{"pd-profile-handler defaults (no params)", map[string]any{}, false},
-		{"pd-profile-handler with deciderPluginName", map[string]any{
-			"decodeProfile":     "decode",
-			"prefillProfile":    "prefill",
-			"deciderPluginName": PrefixBasedPDDeciderPluginType,
-		}, false},
-		{"pd-profile-handler with unknown fields is rejected", map[string]any{
-			"decodeProfile":     "decode",
-			"prefillProfile":    "prefill",
-			"deciderPluginName": PrefixBasedPDDeciderPluginType,
-			"prefixPluginType":  "prefix-cache-scorer", // unknown to both schemas (#1068)
-			"prefixPluginName":  "prefix-cache-scorer",
-			"primaryPort":       8080,
-		}, true},
-		{"pd-profile-handler unknown deciderPluginName", map[string]any{
-			"deciderPluginName": "INVALID",
-		}, true},
+		{
+			name:        "nil pd decider",
+			pdDecider:   func(*testing.T) deciderPlugin { return nil },
+			expectedKey: attrprefix.PrefixCacheMatchInfoDataKey,
+		},
+		{
+			name:        "decider that does not select a prefix producer",
+			pdDecider:   func(*testing.T) deciderPlugin { return newAlwaysDisaggPDDecider() },
+			expectedKey: attrprefix.PrefixCacheMatchInfoDataKey,
+		},
+		{
+			name:        "empty prefixMatchInfoProducerName",
+			pdDecider:   func(t *testing.T) deciderPlugin { return prefixDecider(t, "") },
+			expectedKey: attrprefix.PrefixCacheMatchInfoDataKey,
+		},
+		{
+			name:        "named prefixMatchInfoProducerName",
+			pdDecider:   func(t *testing.T) deciderPlugin { return prefixDecider(t, preciseName) },
+			expectedKey: attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(preciseName),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, _ := json.Marshal(tt.params)
-			p, err := HandlerFactory("h", plugin.StrictDecoder(b), handle)
-			if tt.expectErr {
-				assert.Error(t, err)
-				assert.Nil(t, p)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, p)
+			handler := NewDisaggProfileHandler(
+				defaultDecodeProfile, defaultPrefillProfile, defaultEncodeProfile,
+				tt.pdDecider(t), nil,
+			)
+
+			consumed := handler.Consumes()
+			assert.Contains(t, consumed.Required, tt.expectedKey)
+			assert.Contains(t, consumed.Required, tokenproducer.TokenizedPromptDataKey)
+			if tt.expectedKey != attrprefix.PrefixCacheMatchInfoDataKey {
+				assert.NotContains(t, consumed.Required, attrprefix.PrefixCacheMatchInfoDataKey)
 			}
+		})
+	}
+}
+
+func TestHandler_Consumes_MergesDeciderDeclarations(t *testing.T) {
+	pdRequired := plugin.NewDataKey("pd-required", "")
+	pdOptional := plugin.NewDataKey("pd-optional", "")
+	encodeRequired := plugin.NewDataKey("encode-required", "")
+	encodeOptional := plugin.NewDataKey("encode-optional", "")
+	// Optional for the prefill decider, required by the encode decider.
+	shared := plugin.NewDataKey("shared", "")
+
+	handler := NewDisaggProfileHandler(
+		defaultDecodeProfile, defaultPrefillProfile, defaultEncodeProfile,
+		&consumingDecider{deps: plugin.DataDependencies{
+			Required: map[plugin.DataKey]any{pdRequired: false},
+			Optional: map[plugin.DataKey]any{pdOptional: false, shared: false},
+		}},
+		&consumingDecider{deps: plugin.DataDependencies{
+			Required: map[plugin.DataKey]any{encodeRequired: false, shared: false},
+			Optional: map[plugin.DataKey]any{encodeOptional: false},
+		}},
+	)
+
+	consumed := handler.Consumes()
+	for _, key := range []plugin.DataKey{pdRequired, encodeRequired, shared} {
+		assert.Contains(t, consumed.Required, key)
+	}
+	for _, key := range []plugin.DataKey{pdOptional, encodeOptional} {
+		assert.Contains(t, consumed.Optional, key)
+	}
+	assert.NotContains(t, consumed.Optional, shared, "a key one decider requires is required")
+}
+
+// The scheduler hands Pick a request confined to the handler's declarations,
+// so an attribute a decider declares must be readable through it.
+func TestHandler_Pick_DeciderReadsDeclaredAttributeThroughScope(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	gate := plugin.NewDataKey("prefill-gate", "")
+
+	for _, tt := range []struct {
+		name string
+		deps plugin.DataDependencies
+	}{
+		{name: "required", deps: plugin.DataDependencies{Required: map[plugin.DataKey]any{gate: false}}},
+		{name: "optional", deps: plugin.DataDependencies{Optional: map[plugin.DataKey]any{gate: false}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
+				&consumingDecider{deps: tt.deps, read: gate}, nil).WithName("scoped-handler-" + tt.name)
+			datalayer.RegisterScopeSpecs([]plugin.Plugin{h})
+
+			req := completionsRequest(testLongPrompt)
+			req.PutAttribute(gate, true)
+			scoped, violations := datalayer.ScopeRequest(logr.Discard(), "ProfilePicker", h, req)
+
+			got := h.Pick(ctx, scoped,
+				map[string]scheduling.SchedulerProfile{
+					defaultDecodeProfile:  &mockProfile{},
+					defaultPrefillProfile: &mockProfile{},
+				},
+				map[string]*scheduling.ProfileRunResult{defaultDecodeProfile: makeProfileRunResult("pod1")})
+
+			assert.ElementsMatch(t, []string{defaultPrefillProfile}, profileNames(got))
+			require.NoError(t, violations.Write())
 		})
 	}
 }
@@ -374,7 +459,7 @@ func TestHandlerFactory_InvalidJSON(t *testing.T) {
 
 func TestHandler_Pick_PD(t *testing.T) {
 	ctx := utils.NewTestContext(t)
-	req := completionsRequest("hello world hello world hello world") // ~8 tokens
+	const prompt = "hello world hello world hello world" // ~8 tokens
 
 	profiles := map[string]scheduling.SchedulerProfile{
 		defaultDecodeProfile:  &mockProfile{},
@@ -435,6 +520,10 @@ func TestHandler_Pick_PD(t *testing.T) {
 			h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
 				decider, nil)
 
+			// Fresh request per subtest: the decider memoizes its decision on
+			// the request attribute store, and sharing one request across cases
+			// would let an earlier subtest's memo leak into a later one.
+			req := completionsRequest(prompt)
 			inputTokens := len(req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 			injectPrefixCache(tt.profileResults, tt.cachedTokens, inputTokens)
 
@@ -469,8 +558,10 @@ func TestHandler_Pick_PD_InputTokenError(t *testing.T) {
 
 func TestHandler_Pick_PD_Series(t *testing.T) {
 	ctx := context.Background()
-	short := completionsRequest("hello world, hello world!")
-	long := completionsRequest("hello world, hello world! and some additional padding text here")
+	const (
+		shortPrompt = "hello world, hello world!"
+		longPrompt  = "hello world, hello world! and some additional padding text here"
+	)
 
 	profiles := map[string]scheduling.SchedulerProfile{
 		defaultDecodeProfile:  &mockProfile{},
@@ -480,7 +571,7 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 		name            string
 		nonCachedTokens int
 		steps           []struct {
-			req          *scheduling.InferenceRequest
+			prompt       string
 			cachedTokens int
 			want         []string
 		}
@@ -489,24 +580,24 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 			name:            "same request twice: first disaggregates, second hits cache",
 			nonCachedTokens: 2,
 			steps: []struct {
-				req          *scheduling.InferenceRequest
+				prompt       string
 				cachedTokens int
 				want         []string
 			}{
-				{short, 0, []string{defaultPrefillProfile}},
-				{short, len(short.Body.Completions.Prompt.Raw) / averageCharactersPerToken, []string{}},
+				{shortPrompt, 0, []string{defaultPrefillProfile}},
+				{shortPrompt, len(shortPrompt) / averageCharactersPerToken, []string{}},
 			},
 		},
 		{
 			name:            "short then long: long triggers disaggregation",
 			nonCachedTokens: 2,
 			steps: []struct {
-				req          *scheduling.InferenceRequest
+				prompt       string
 				cachedTokens int
 				want         []string
 			}{
-				{short, 0, []string{defaultPrefillProfile}},
-				{long, len(short.Body.Completions.Prompt.Raw) / averageCharactersPerToken, []string{defaultPrefillProfile}},
+				{shortPrompt, 0, []string{defaultPrefillProfile}},
+				{longPrompt, len(shortPrompt) / averageCharactersPerToken, []string{defaultPrefillProfile}},
 			},
 		},
 	}
@@ -519,13 +610,17 @@ func TestHandler_Pick_PD_Series(t *testing.T) {
 				decider, nil)
 
 			for _, step := range tt.steps {
+				// Fresh request per step: production models each call as its own
+				// *InferenceRequest, and the decider's per-request memoization
+				// would otherwise return the previous step's decision.
+				req := completionsRequest(step.prompt)
 				// Fresh results per step to avoid mutation leaking between iterations.
 				results := map[string]*scheduling.ProfileRunResult{
 					defaultDecodeProfile: makeProfileRunResult("pod1"),
 				}
-				inputTokens := len(step.req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
+				inputTokens := len(req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
 				injectPrefixCache(results, step.cachedTokens, inputTokens)
-				got := h.Pick(ctx, step.req, profiles, results)
+				got := h.Pick(ctx, req, profiles, results)
 				assert.ElementsMatch(t, step.want, profileNames(got))
 			}
 		})
@@ -589,6 +684,95 @@ func TestHandler_ProcessResults_PD(t *testing.T) {
 	}
 }
 
+// TestHandler_PD_PrefillRequiredButUnavailable exercises the real Pick ->
+// ProcessResults sequence (as the scheduler runs them) for the two ways a
+// picked prefill profile can end up nil in profileResults: the PD decider
+// declining to run it (safe to complete decode-only) versus the profile
+// having been picked and run, but finding no endpoint (must fail the
+// request rather than silently complete decode-only). Regression test for
+// https://github.com/llm-d/llm-d-router/issues/2427: with an always-disagg
+// decider and no ready prefill endpoints, requests were completing on
+// decode alone instead of failing.
+func TestHandler_PD_PrefillRequiredButUnavailable(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+	newDecodeResults := func() map[string]*scheduling.ProfileRunResult {
+		return map[string]*scheduling.ProfileRunResult{
+			defaultDecodeProfile: makeProfileRunResult("pod1"),
+		}
+	}
+
+	t.Run("decider declines prefill -> decode-only, no error", func(t *testing.T) {
+		req := completionsRequest(testLongPrompt)
+		decodeResults := newDecodeResults()
+		h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
+			&mockPDDecider{allow: false}, nil)
+
+		LlmdDisaggDecisionCount.Reset()
+		got := h.Pick(ctx, req, profiles, decodeResults)
+		assert.ElementsMatch(t, []string{}, profileNames(got), "decider should decline prefill")
+		assert.InDelta(t, 1, testutil.ToFloat64(LlmdDisaggDecisionCount.WithLabelValues(
+			"", DisaggProfileHandlerType, "unknown", metricsutil.DisaggPathDecodeOnly)), 0)
+
+		res, err := h.ProcessResults(ctx, req, decodeResults)
+		assert.NoError(t, err, "a declined prefill stage must not fail the request")
+		assert.Contains(t, res.ProfileResults, defaultDecodeProfile)
+		assert.NotContains(t, res.ProfileResults, defaultPrefillProfile)
+	})
+
+	t.Run("decider requires prefill, none available -> error", func(t *testing.T) {
+		req := completionsRequest(testLongPrompt)
+		decodeResults := newDecodeResults()
+		h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
+			newAlwaysDisaggPDDecider(), nil)
+
+		got := h.Pick(ctx, req, profiles, decodeResults)
+		assert.ElementsMatch(t, []string{defaultPrefillProfile}, profileNames(got), "decider should pick prefill")
+
+		// Simulate the scheduler running the picked prefill profile and finding
+		// no endpoint: it records a nil result, exactly like a declined stage.
+		failedResults := map[string]*scheduling.ProfileRunResult{
+			defaultDecodeProfile:  decodeResults[defaultDecodeProfile],
+			defaultPrefillProfile: nil,
+		}
+		LlmdDisaggDecisionCount.Reset()
+		got = h.Pick(ctx, req, profiles, failedResults)
+		assert.ElementsMatch(t, []string{}, profileNames(got), "all stages should be done")
+		assert.Equal(t, 0, testutil.CollectAndCount(LlmdDisaggDecisionCount),
+			"a request rejected for no prefill endpoint must not be counted as a routing decision")
+
+		_, err := h.ProcessResults(ctx, req, failedResults)
+		assert.Error(t, err, "a required prefill stage that found no endpoint must fail the request")
+	})
+}
+
+func TestHandler_PrefillFirst_PrefillUnavailableNotCounted(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithStageOrder(StageOrderPrefillFirst)
+	results := map[string]*scheduling.ProfileRunResult{
+		defaultPrefillProfile: nil,
+		defaultDecodeProfile:  makeProfileRunResult("pod1"),
+	}
+
+	LlmdDisaggDecisionCount.Reset()
+	got := h.Pick(ctx, req, profiles, results)
+	assert.ElementsMatch(t, []string{}, profileNames(got), "all stages should be done")
+	assert.Equal(t, 0, testutil.CollectAndCount(LlmdDisaggDecisionCount),
+		"a request rejected for no prefill endpoint must not be counted as a routing decision")
+
+	_, err := h.ProcessResults(ctx, req, results)
+	assert.Error(t, err)
+}
+
 func TestHandler_ProcessResults_NilRequest(t *testing.T) {
 	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "",
 		nil, nil)
@@ -616,7 +800,7 @@ func TestHandler_Pick_CustomProfiles(t *testing.T) {
 
 	h := NewDisaggProfileHandler(
 		customDecodeProfile, customPrefillProfile, customEncodeProfile,
-		decider, newAlwaysDisaggEncodeDecider(),
+		decider, NewAlwaysDisaggEncodeDecider(),
 	)
 
 	// Stage 1: decode not run → run decode
@@ -734,7 +918,7 @@ func TestHandler_Pick_EPD(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewDisaggProfileHandler(defaultDecodeProfile, "", defaultEncodeProfile, nil, newAlwaysDisaggEncodeDecider())
+			h := NewDisaggProfileHandler(defaultDecodeProfile, "", defaultEncodeProfile, nil, NewAlwaysDisaggEncodeDecider())
 			got := h.Pick(ctx, tt.req, profiles, tt.results)
 			assert.ElementsMatch(t, tt.want, profileNames(got))
 		})
@@ -833,7 +1017,7 @@ func TestHandler_ProcessResults_EPD(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewDisaggProfileHandler(defaultDecodeProfile, "", defaultEncodeProfile, nil, newAlwaysDisaggEncodeDecider())
+			h := NewDisaggProfileHandler(defaultDecodeProfile, "", defaultEncodeProfile, nil, NewAlwaysDisaggEncodeDecider())
 			res, err := h.ProcessResults(context.Background(), &scheduling.InferenceRequest{}, tt.results)
 			if tt.expectErr {
 				assert.Error(t, err)
@@ -948,7 +1132,7 @@ func TestHandler_Pick_EPD_Full(t *testing.T) {
 
 			h := NewDisaggProfileHandler(
 				defaultDecodeProfile, defaultPrefillProfile, defaultEncodeProfile,
-				decider, newAlwaysDisaggEncodeDecider(),
+				decider, NewAlwaysDisaggEncodeDecider(),
 			)
 
 			inputTokens := 0
@@ -1067,7 +1251,7 @@ func TestHandler_ProcessResults_EPD_Full(t *testing.T) {
 			decider, _ := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{})
 			h := NewDisaggProfileHandler(
 				defaultDecodeProfile, defaultPrefillProfile, defaultEncodeProfile,
-				decider, newAlwaysDisaggEncodeDecider(),
+				decider, NewAlwaysDisaggEncodeDecider(),
 			)
 			res, err := h.ProcessResults(context.Background(), &scheduling.InferenceRequest{}, tt.results)
 			if tt.expectErr {
@@ -1126,7 +1310,7 @@ func TestHandler_Pick_NilDeciders(t *testing.T) {
 		{
 			name:          "pdDecider nil, encodeDecider present, multimodal → run encode",
 			pdDecider:     nil,
-			encodeDecider: newAlwaysDisaggEncodeDecider(),
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
 			req:           multimodalLong,
 			results: map[string]*scheduling.ProfileRunResult{
 				defaultDecodeProfile: makeProfileRunResult("pod1"),
@@ -1137,7 +1321,7 @@ func TestHandler_Pick_NilDeciders(t *testing.T) {
 		{
 			name:          "pdDecider nil, encodeDecider present, encode done → skip prefill",
 			pdDecider:     nil,
-			encodeDecider: newAlwaysDisaggEncodeDecider(),
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
 			req:           multimodalLong,
 			results: map[string]*scheduling.ProfileRunResult{
 				defaultDecodeProfile: makeProfileRunResult("pod1"),
@@ -1216,7 +1400,7 @@ func TestHandler_ProcessResults_NilDeciders(t *testing.T) {
 		{
 			name:          "pdDecider nil, encode ran successfully",
 			pdDecider:     nil,
-			encodeDecider: newAlwaysDisaggEncodeDecider(),
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
 			results: map[string]*scheduling.ProfileRunResult{
 				defaultDecodeProfile: makeProfileRunResult("pod1"),
 				defaultEncodeProfile: makeProfileRunResult("pod2"),
@@ -1333,47 +1517,6 @@ func TestHandler_Factory_NilDeciders(t *testing.T) {
 	}
 }
 
-// TestBothProfileAndHeadersHandlerPreRequest verifies that when both
-// disagg-profile-handler and the deprecated disagg-headers-handler are
-// active, both PreRequest hooks run without error. The result is redundant
-// (same header written twice) but not conflicting.
-func TestBothProfileAndHeadersHandlerPreRequest(t *testing.T) {
-	ctx := utils.NewTestContext(t)
-
-	profileHandler := NewDisaggProfileHandler("decode", "prefill", "encode", nil, nil).WithName("profile")
-	headersHandler := NewHeadersHandler("prefill", "encode").WithName("headers") //nolint:staticcheck // intentional: testing deprecated path
-
-	podAddr := "10.0.0.5"
-	podPort := "8080"
-	ep := scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "default", Name: "prefill-pod"},
-			Address:        podAddr,
-			Port:           podPort,
-		},
-		&fwkdl.Metrics{},
-		nil,
-	)
-
-	request := &scheduling.InferenceRequest{
-		RequestID: "req-both",
-		Headers:   map[string]string{},
-	}
-	result := &scheduling.SchedulingResult{
-		PrimaryProfileName: "decode",
-		ProfileResults: map[string]*scheduling.ProfileRunResult{
-			"prefill": {TargetEndpoints: []scheduling.Endpoint{ep}},
-		},
-	}
-
-	profileHandler.PreRequest(ctx, request, result)
-	headersHandler.PreRequest(ctx, request, result)
-
-	expected := net.JoinHostPort(podAddr, podPort)
-	assert.Equal(t, expected, request.Headers[routing.PrefillEndpointHeader],
-		"both handlers set the same prefill header — redundant but no conflict")
-}
-
 func TestHandler_PreRequest_EncodeMultipleEndpoints(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 	h := NewDisaggProfileHandler("decode", "", "encode", nil, nil)
@@ -1390,8 +1533,409 @@ func TestHandler_PreRequest_EncodeMultipleEndpoints(t *testing.T) {
 		},
 	}
 
-	h.PreRequest(ctx, request, result)
+	_ = h.PreRequest(ctx, request, result)
 
 	want := net.JoinHostPort("10.0.0.1", "8000") + "," + net.JoinHostPort("10.0.0.2", "8000")
 	assert.Equal(t, want, request.Headers[routing.EncoderEndpointsHeader])
+}
+
+func TestHandler_Pick_PD_StampsPeerEndpointBeforePrefill(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+
+	decodeResult := makeProfileRunResult("pod1")
+	profileResults := map[string]*scheduling.ProfileRunResult{defaultDecodeProfile: decodeResult}
+	inputTokens := len(req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
+	injectPrefixCache(profileResults, 2, inputTokens) // few cached tokens → prefill needed
+
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
+	assert.NoError(t, err)
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", decider, nil)
+
+	got := h.Pick(ctx, req, profiles, profileResults)
+	assert.ElementsMatch(t, []string{defaultPrefillProfile}, profileNames(got), "prefill must run")
+
+	peer, ok := scheduling.ReadRequestAttribute[scheduling.Endpoint](req, PeerEndpointAttributeKey)
+	assert.True(t, ok, "peer endpoint attribute must be published before prefill runs")
+	assert.Equal(t, decodeResult.TargetEndpoints[0], peer)
+}
+
+func TestHandler_Pick_PD_NoPeerEndpointWhenPrefillSkipped(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+
+	profileResults := map[string]*scheduling.ProfileRunResult{defaultDecodeProfile: makeProfileRunResult("pod1")}
+	inputTokens := len(req.Body.Completions.Prompt.Raw) / averageCharactersPerToken
+	injectPrefixCache(profileResults, inputTokens, inputTokens) // fully cached → no prefill needed
+
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
+	assert.NoError(t, err)
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", decider, nil)
+
+	got := h.Pick(ctx, req, profiles, profileResults)
+	assert.Empty(t, got, "prefill must be skipped")
+
+	_, ok := scheduling.ReadRequestAttribute[scheduling.Endpoint](req, PeerEndpointAttributeKey)
+	assert.False(t, ok, "peer endpoint attribute must not be published when prefill is skipped")
+}
+
+// ── StageOrder & PrefillFirst tests ──────────────────────────────────────────
+
+func TestHandler_Factory_StageOrder(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	handle := handleWithDeciders(ctx)
+
+	tests := []struct {
+		name        string
+		params      map[string]any
+		expectErr   bool
+		expectOrder StageOrder
+	}{
+		{
+			name:        "default stageOrder is decode-first",
+			params:      map[string]any{},
+			expectErr:   false,
+			expectOrder: StageOrderDecodeFirst,
+		},
+		{
+			name: "stageOrder prefill-first (kebab-case)",
+			params: map[string]any{
+				"stageOrder": "prefill-first",
+			},
+			expectErr:   false,
+			expectOrder: StageOrderPrefillFirst,
+		},
+		{
+			name: "stageOrder PrefillFirst (PascalCase)",
+			params: map[string]any{
+				"stageOrder": "PrefillFirst",
+			},
+			expectErr:   false,
+			expectOrder: StageOrderPrefillFirst,
+		},
+		{
+			name: "stageOrder decode-first (explicit)",
+			params: map[string]any{
+				"stageOrder": "decode-first",
+			},
+			expectErr:   false,
+			expectOrder: StageOrderDecodeFirst,
+		},
+		{
+			name: "stageOrder DecodeFirst (PascalCase)",
+			params: map[string]any{
+				"stageOrder": "DecodeFirst",
+			},
+			expectErr:   false,
+			expectOrder: StageOrderDecodeFirst,
+		},
+		{
+			name: "invalid stageOrder returns error",
+			params: map[string]any{
+				"stageOrder": "INVALID_ORDER",
+			},
+			expectErr: true,
+		},
+		{
+			name: "prefill-first with deciders.prefill returns error",
+			params: map[string]any{
+				"stageOrder": "prefill-first",
+				"deciders": map[string]any{
+					"prefill": PrefixBasedPDDeciderPluginType,
+				},
+			},
+			expectErr: true,
+		},
+		{
+			name: "prefill-first with deciders.encode succeeds",
+			params: map[string]any{
+				"stageOrder": "prefill-first",
+				"deciders": map[string]any{
+					"encode": AlwaysDisaggMulimodalPluginType,
+				},
+			},
+			expectErr:   false,
+			expectOrder: StageOrderPrefillFirst,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, _ := json.Marshal(tt.params)
+			p, err := HandlerFactory("h", plugin.StrictDecoder(b), handle)
+			if tt.expectErr {
+				assert.Error(t, err)
+				assert.Nil(t, p)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, p)
+				h, ok := p.(*Handler)
+				assert.True(t, ok)
+				assert.Equal(t, tt.expectOrder, h.stageOrder)
+			}
+		})
+	}
+}
+
+func TestHandler_Pick_PrefillFirst_PD(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+
+	tests := []struct {
+		name           string
+		profileResults map[string]*scheduling.ProfileRunResult
+		want           []string
+	}{
+		{
+			name:           "prefill not run → run prefill",
+			profileResults: map[string]*scheduling.ProfileRunResult{},
+			want:           []string{defaultPrefillProfile},
+		},
+		{
+			name: "prefill done → run decode",
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+			},
+			want: []string{defaultDecodeProfile},
+		},
+		{
+			name: "prefill failed (nil) → run decode",
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: nil,
+			},
+			want: []string{defaultDecodeProfile},
+		},
+		{
+			name: "decode done → done",
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+				defaultDecodeProfile:  makeProfileRunResult("pod2"),
+			},
+			want: []string{},
+		},
+		{
+			name: "decode failed (nil) → done",
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+				defaultDecodeProfile:  nil,
+			},
+			want: []string{},
+		},
+		{
+			name: "decode failed (0 endpoints) → done",
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+				defaultDecodeProfile:  {TargetEndpoints: []scheduling.Endpoint{}},
+			},
+			want: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+				WithStageOrder(StageOrderPrefillFirst)
+			got := h.Pick(ctx, req, profiles, tt.profileResults)
+			assert.ElementsMatch(t, tt.want, profileNames(got))
+		})
+	}
+}
+
+func TestHandler_Pick_PrefillFirst_EPD_Full(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	multimodalReq := chatRequest(true, false, false)
+	textReq := chatRequest(false, false, false)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+		defaultEncodeProfile:  &mockProfile{},
+	}
+
+	tests := []struct {
+		name           string
+		req            *scheduling.InferenceRequest
+		encodeDecider  deciderPlugin
+		profileResults map[string]*scheduling.ProfileRunResult
+		want           []string
+	}{
+		{
+			name:           "nothing run, multimodal → run prefill first",
+			req:            multimodalReq,
+			encodeDecider:  NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{},
+			want:           []string{defaultPrefillProfile},
+		},
+		{
+			name:          "prefill done, multimodal → run encode next",
+			req:           multimodalReq,
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+			},
+			want: []string{defaultEncodeProfile},
+		},
+		{
+			name:          "prefill done, text-only → skip encode, run decode",
+			req:           textReq,
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+			},
+			want: []string{defaultDecodeProfile},
+		},
+		{
+			name:          "prefill done, encode done → run decode",
+			req:           multimodalReq,
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+				defaultEncodeProfile:  makeProfileRunResult("pod2"),
+			},
+			want: []string{defaultDecodeProfile},
+		},
+		{
+			name:          "all three done → done",
+			req:           multimodalReq,
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: makeProfileRunResult("pod1"),
+				defaultEncodeProfile:  makeProfileRunResult("pod2"),
+				defaultDecodeProfile:  makeProfileRunResult("pod3"),
+			},
+			want: []string{},
+		},
+		{
+			name:          "prefill failed, multimodal → run encode next",
+			req:           multimodalReq,
+			encodeDecider: NewAlwaysDisaggEncodeDecider(),
+			profileResults: map[string]*scheduling.ProfileRunResult{
+				defaultPrefillProfile: nil,
+			},
+			want: []string{defaultEncodeProfile},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewDisaggProfileHandler(
+				defaultDecodeProfile, defaultPrefillProfile, defaultEncodeProfile,
+				nil, tt.encodeDecider,
+			).WithStageOrder(StageOrderPrefillFirst)
+			got := h.Pick(ctx, tt.req, profiles, tt.profileResults)
+			assert.ElementsMatch(t, tt.want, profileNames(got))
+		})
+	}
+}
+
+func TestHandler_Pick_PrefillFirst_StampsPeerEndpointBeforeDecode(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+
+	prefillResult := makeProfileRunResult("pod-prefill")
+	profileResults := map[string]*scheduling.ProfileRunResult{
+		defaultPrefillProfile: prefillResult,
+	}
+
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithStageOrder(StageOrderPrefillFirst)
+
+	got := h.Pick(ctx, req, profiles, profileResults)
+	assert.ElementsMatch(t, []string{defaultDecodeProfile}, profileNames(got), "decode must run next")
+
+	peer, ok := scheduling.ReadRequestAttribute[scheduling.Endpoint](req, PeerEndpointAttributeKey)
+	assert.True(t, ok, "peer endpoint attribute must be published before decode runs")
+	assert.Equal(t, prefillResult.TargetEndpoints[0], peer)
+}
+
+func TestHandler_Pick_PrefillFirst_NoPeerEndpointWhenPrefillFailed(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	req := completionsRequest(testLongPrompt)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		defaultDecodeProfile:  &mockProfile{},
+		defaultPrefillProfile: &mockProfile{},
+	}
+
+	// Prefill failed (nil result)
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithStageOrder(StageOrderPrefillFirst)
+
+	got := h.Pick(ctx, req, profiles, map[string]*scheduling.ProfileRunResult{
+		defaultPrefillProfile: nil,
+	})
+	assert.ElementsMatch(t, []string{defaultDecodeProfile}, profileNames(got), "decode must run next")
+
+	_, ok := scheduling.ReadRequestAttribute[scheduling.Endpoint](req, PeerEndpointAttributeKey)
+	assert.False(t, ok, "peer endpoint attribute must not be published when prefill failed")
+}
+
+func TestHandler_Pick_PrefillFirst_CustomProfiles(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	profiles := map[string]scheduling.SchedulerProfile{
+		customDecodeProfile:  &mockProfile{},
+		customPrefillProfile: &mockProfile{},
+		customEncodeProfile:  &mockProfile{},
+	}
+
+	h := NewDisaggProfileHandler(
+		customDecodeProfile, customPrefillProfile, customEncodeProfile,
+		nil, NewAlwaysDisaggEncodeDecider(),
+	).WithStageOrder(StageOrderPrefillFirst)
+
+	req := chatRequest(true, false, false)
+
+	// Stage 1: prefill not run → run prefill
+	got := h.Pick(ctx, req, profiles, map[string]*scheduling.ProfileRunResult{})
+	assert.ElementsMatch(t, []string{customPrefillProfile}, profileNames(got))
+
+	// Stage 2: prefill done, multimodal → run encode
+	results := map[string]*scheduling.ProfileRunResult{
+		customPrefillProfile: makeProfileRunResult("pod1"),
+	}
+	got = h.Pick(ctx, req, profiles, results)
+	assert.ElementsMatch(t, []string{customEncodeProfile}, profileNames(got))
+
+	// Stage 3: prefill done, encode done → run decode
+	results[customEncodeProfile] = makeProfileRunResult("pod2")
+	got = h.Pick(ctx, req, profiles, results)
+	assert.ElementsMatch(t, []string{customDecodeProfile}, profileNames(got))
+}
+
+func TestHandler_ProcessResults_PrefillFirst(t *testing.T) {
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithStageOrder(StageOrderPrefillFirst)
+
+	results := map[string]*scheduling.ProfileRunResult{
+		defaultDecodeProfile:  makeProfileRunResult("decode-pod"),
+		defaultPrefillProfile: makeProfileRunResult("prefill-pod"),
+	}
+
+	req := &scheduling.InferenceRequest{Headers: map[string]string{}}
+	res, err := h.ProcessResults(context.Background(), req, results)
+	assert.NoError(t, err)
+	assert.Equal(t, defaultDecodeProfile, res.PrimaryProfileName)
+	assert.Contains(t, res.ProfileResults, defaultDecodeProfile)
+	assert.Contains(t, res.ProfileResults, defaultPrefillProfile)
 }

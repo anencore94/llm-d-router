@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,6 +34,19 @@ import (
 // DefaultHeader is the default request/response header carrying the session
 // token.
 const DefaultHeader = "x-session-token"
+
+// EncodedEndpointHeaderConfig configures the encoded_endpoint_header strategy.
+type EncodedEndpointHeaderConfig struct {
+	// Header carries the base64-encoded pod token. Defaults to DefaultHeader.
+	Header string `json:"header"`
+}
+
+// ApplyDefaults fills an empty Header with DefaultHeader. Run after decode.
+func (c *EncodedEndpointHeaderConfig) ApplyDefaults() {
+	if c.Header == "" {
+		c.Header = DefaultHeader
+	}
+}
 
 // NormalizeHeader lowercases and trims the configured session header name,
 // falling back to DefaultHeader when empty. Request headers are lowercased at
@@ -80,7 +93,7 @@ func WriteResponseHeader(ctx context.Context, pluginType, sessionHeader string, 
 		response.Headers = make(map[string]string)
 	}
 
-	response.Headers[sessionHeader] = base64.StdEncoding.EncodeToString([]byte(targetPod.NamespacedName.String()))
+	response.Headers[sessionHeader] = base64.StdEncoding.EncodeToString([]byte(targetPod.ID.String()))
 }
 
 // ResolvePodToWrite looks up the target pod from the scheduling results if profileName is set.

@@ -1,0 +1,114 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package config
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/spf13/viper"
+
+	"github.com/llm-d/llm-d-router/pkg/common/request"
+)
+
+type Config struct {
+	LogLevel int            `mapstructure:"log_level"`
+	Tracing  bool           `mapstructure:"tracing"`
+	Server   ServerConfig   `mapstructure:"server"`
+	Gateway  GatewayConfig  `mapstructure:"gateway"`
+	Pipeline PipelineConfig `mapstructure:"pipeline"`
+}
+
+// BytesPerMB is the number of bytes in one megabyte.
+const BytesPerMB = 1024 * 1024
+
+// DefaultMaxRequestBodySize is the default cap for server.max_request_body_size,
+// in megabytes. It is generous enough to accommodate multimodal requests that
+// inline images as data: URIs; text-only deployments can lower it.
+const DefaultMaxRequestBodySize = 64 // 64 MB
+
+type ServerConfig struct {
+	ListenAddr         string        `mapstructure:"listen_addr"`
+	MetricsPort        int           `mapstructure:"metrics_port"` // default 9090; non-positive disables the endpoint
+	MetricsCertDir     string        `mapstructure:"metrics_cert_dir"`
+	SecureServing      bool          `mapstructure:"secure_serving"`
+	CertPath           string        `mapstructure:"cert_path"`
+	TLSMinVersion      string        `mapstructure:"tls_min_version"`
+	TLSCipherSuites    []string      `mapstructure:"tls_cipher_suites"`
+	ReadTimeout        time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout       time.Duration `mapstructure:"write_timeout"`
+	ShutdownTimeout    time.Duration `mapstructure:"shutdown_timeout"`
+	MaxRequestBodySize int64         `mapstructure:"max_request_body_size"`
+}
+
+type GatewayConfig struct {
+	Address             string        `mapstructure:"address"`
+	MaxIdleConnsPerHost int           `mapstructure:"max_idle_conns_per_host"`
+	IdleConnTimeout     time.Duration `mapstructure:"idle_conn_timeout"`
+	Timeout             time.Duration `mapstructure:"timeout"`
+}
+
+type PipelineConfig struct {
+	KVConnector            string       `mapstructure:"kv_connector"`
+	ECConnector            string       `mapstructure:"ec_connector"`
+	UseOpenAIFormat        bool         `mapstructure:"use_openai_format"`
+	ForwardResponseHeaders []string     `mapstructure:"forward_response_headers"`
+	Steps                  []StepConfig `mapstructure:"steps"`
+}
+
+type StepConfig struct {
+	Type   string         `mapstructure:"type"`
+	Params map[string]any `mapstructure:"params"`
+}
+
+func Load(path string) (*Config, error) {
+	v := viper.New()
+	v.SetConfigFile(path)
+	v.SetEnvPrefix("COORDINATOR")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	v.SetDefault("log_level", 2)
+	v.SetDefault("tracing", false)
+	v.SetDefault("server.listen_addr", ":8080")
+	v.SetDefault("server.metrics_port", 9090)
+	v.SetDefault("server.metrics_cert_dir", "")
+	v.SetDefault("server.secure_serving", true)
+	v.SetDefault("server.cert_path", "")
+	v.SetDefault("server.tls_min_version", "")
+	v.SetDefault("server.tls_cipher_suites", []string{})
+	v.SetDefault("server.read_timeout", 30*time.Second)
+	v.SetDefault("server.write_timeout", 120*time.Second)
+	v.SetDefault("server.shutdown_timeout", 25*time.Second)
+	v.SetDefault("server.max_request_body_size", DefaultMaxRequestBodySize)
+	v.SetDefault("gateway.max_idle_conns_per_host", 100)
+	v.SetDefault("gateway.idle_conn_timeout", 90*time.Second)
+	v.SetDefault("gateway.timeout", 60*time.Second)
+	v.SetDefault("pipeline.use_openai_format", true)
+	v.SetDefault("pipeline.forward_response_headers", []string{request.DisaggregatedRevisionHeaderKey})
+
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("unmarshalling config: %w", err)
+	}
+	return &cfg, nil
+}

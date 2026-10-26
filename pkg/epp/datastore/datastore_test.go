@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +30,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -39,7 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
-	"github.com/llm-d/llm-d-router/apix/v1alpha2"
+	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/mocks"
@@ -168,7 +170,7 @@ func TestPool(t *testing.T) {
 					WithScheme(scheme).
 					Build()
 
-				ds := NewDatastore(context.Background(), epf, 0)
+				ds := NewDatastore(context.Background(), epf)
 				_ = ds.PoolSet(context.Background(), fakeClient, poolutil.InferencePoolToEndpointPool(tt.inferencePool))
 				gotPool, gotErr := ds.PoolGet()
 				if diff := cmp.Diff(tt.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
@@ -195,21 +197,21 @@ func TestPool(t *testing.T) {
 func TestObjective(t *testing.T) {
 	chatModel := "chat"
 	tsModel := "food-review"
-	model1ts := testutil.MakeInferenceObjective("model1").ObjRef()
+	model1ts := testutil.MakeV1InferenceObjective("model1").ObjRef()
 	// Same model name as model1ts, different object name.
-	model2ts := testutil.MakeInferenceObjective("model2").ObjRef()
+	model2ts := testutil.MakeV1InferenceObjective("model2").ObjRef()
 	// Same model name as model1ts, newer timestamp
-	model1tsCritical := testutil.MakeInferenceObjective("model1").
+	model1tsCritical := testutil.MakeV1InferenceObjective("model1").
 		Priority(2).ObjRef()
 	// Same object name as model2ts, different model name.
-	model2chat := testutil.MakeInferenceObjective(model2ts.Name).ObjRef()
+	model2chat := testutil.MakeV1InferenceObjective(model2ts.Name).ObjRef()
 
 	tests := []struct {
 		name           string
-		existingModels []*v1alpha2.InferenceObjective
+		existingModels []*apixv1.InferenceObjective
 		op             func(ds Datastore) bool
 		wantOpResult   bool
-		wantModels     []*v1alpha2.InferenceObjective
+		wantModels     []*apixv1.InferenceObjective
 	}{
 		{
 			name: "Add model1 with food-review as modelName",
@@ -217,52 +219,52 @@ func TestObjective(t *testing.T) {
 				ds.ObjectiveSet(model1ts)
 				return cmp.Diff(ds.ObjectiveGet(model1ts.Name), model1ts) == ""
 			},
-			wantModels:   []*v1alpha2.InferenceObjective{model1ts},
+			wantModels:   []*apixv1.InferenceObjective{model1ts},
 			wantOpResult: true,
 		},
 		{
 			name:           "Set model1 with the same modelName, but with diff priority, should update.",
-			existingModels: []*v1alpha2.InferenceObjective{model1ts},
+			existingModels: []*apixv1.InferenceObjective{model1ts},
 			op: func(ds Datastore) bool {
 				ds.ObjectiveSet(model1tsCritical)
 				return cmp.Diff(ds.ObjectiveGet(model1tsCritical.Name), model1tsCritical) == ""
 			},
 			wantOpResult: true,
-			wantModels:   []*v1alpha2.InferenceObjective{model1tsCritical},
+			wantModels:   []*apixv1.InferenceObjective{model1tsCritical},
 		},
 		{
 			name:           "Set model1 with the food-review modelName, both models should exist",
-			existingModels: []*v1alpha2.InferenceObjective{model2chat},
+			existingModels: []*apixv1.InferenceObjective{model2chat},
 			op: func(ds Datastore) bool {
 				ds.ObjectiveSet(model1ts)
 				return cmp.Diff(ds.ObjectiveGet(model1ts.Name), model1ts) == ""
 			},
 			wantOpResult: true,
-			wantModels:   []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			wantModels:   []*apixv1.InferenceObjective{model2chat, model1ts},
 		},
 		{
 			name:           "Set model1 with the food-review modelName, both models should exist",
-			existingModels: []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			existingModels: []*apixv1.InferenceObjective{model2chat, model1ts},
 			op: func(ds Datastore) bool {
 				ds.ObjectiveSet(model1ts)
 				return cmp.Diff(ds.ObjectiveGet(model1ts.Name), model1ts) == ""
 			},
 			wantOpResult: true,
-			wantModels:   []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			wantModels:   []*apixv1.InferenceObjective{model2chat, model1ts},
 		},
 		{
 			name:           "Getting by model name, chat -> model2",
-			existingModels: []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			existingModels: []*apixv1.InferenceObjective{model2chat, model1ts},
 			op: func(ds Datastore) bool {
 				gotChat := ds.ObjectiveGet(chatModel)
 				return gotChat != nil && cmp.Diff(model2chat, gotChat) == ""
 			},
 			wantOpResult: false,
-			wantModels:   []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			wantModels:   []*apixv1.InferenceObjective{model2chat, model1ts},
 		},
 		{
 			name:           "Delete the model",
-			existingModels: []*v1alpha2.InferenceObjective{model2chat, model1ts},
+			existingModels: []*apixv1.InferenceObjective{model2chat, model1ts},
 			op: func(ds Datastore) bool {
 				ds.ObjectiveDelete(types.NamespacedName{Name: model1ts.Name, Namespace: model1ts.Namespace})
 				got := ds.ObjectiveGet(tsModel)
@@ -270,7 +272,7 @@ func TestObjective(t *testing.T) {
 
 			},
 			wantOpResult: true,
-			wantModels:   []*v1alpha2.InferenceObjective{model2chat},
+			wantModels:   []*apixv1.InferenceObjective{model2chat},
 		},
 	}
 	for _, test := range tests {
@@ -280,7 +282,7 @@ func TestObjective(t *testing.T) {
 		}
 		for _, epf := range factories {
 			t.Run(test.name, func(t *testing.T) {
-				ds := NewDatastore(t.Context(), epf, 0)
+				ds := NewDatastore(t.Context(), epf)
 				for _, m := range test.existingModels {
 					ds.ObjectiveSet(m)
 				}
@@ -290,7 +292,7 @@ func TestObjective(t *testing.T) {
 					t.Errorf("Unexpected operation result, want: %v, got: %v", test.wantOpResult, gotOpResult)
 				}
 
-				if diff := cmp.Diff(test.wantModels, ds.ObjectiveGetAll(), cmpopts.SortSlices(func(a, b *v1alpha2.InferenceObjective) bool {
+				if diff := cmp.Diff(test.wantModels, ds.ObjectiveGetAll(), cmpopts.SortSlices(func(a, b *apixv1.InferenceObjective) bool {
 					return a.Name < b.Name
 				})); diff != "" {
 					t.Errorf("Unexpected models diff: %s", diff)
@@ -304,6 +306,10 @@ var (
 	pod1 = &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod1",
+		},
+		Status: corev1.PodStatus{
+			PodIP:  "10.0.0.1",
+			HostIP: "192.168.1.10",
 		},
 	}
 	pod1Metrics = &fwkdl.Metrics{
@@ -319,6 +325,10 @@ var (
 	pod2 = &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod2",
+		},
+		Status: corev1.PodStatus{
+			PodIP:  "10.0.0.2",
+			HostIP: "192.168.1.10",
 		},
 	}
 	pod2Metrics = &fwkdl.Metrics{
@@ -419,10 +429,10 @@ func TestMetrics(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				Build()
-			ds := NewDatastore(ctx, epf, 0)
+			ds := NewDatastore(ctx, epf)
 			_ = ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool))
 			for _, pod := range test.storePods {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod)
 			}
 			time.Sleep(1 * time.Second) // Give some time for the metrics to be fetched.
 			if test.predict == nil {
@@ -455,7 +465,7 @@ func TestPods(t *testing.T) {
 			existingPods: []*corev1.Pod{},
 			wantPods:     []*corev1.Pod{pod1},
 			op: func(ctx context.Context, ds Datastore) {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod1)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod1)
 			},
 		},
 		{
@@ -463,7 +473,7 @@ func TestPods(t *testing.T) {
 			existingPods: []*corev1.Pod{pod1},
 			wantPods:     []*corev1.Pod{pod1, pod2},
 			op: func(ctx context.Context, ds Datastore) {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod2)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod2)
 			},
 		},
 		{
@@ -491,13 +501,13 @@ func TestPods(t *testing.T) {
 		for _, epf := range factories {
 			t.Run(test.name, func(t *testing.T) {
 				ctx := context.Background()
-				ds := NewDatastore(t.Context(), epf, 0)
+				ds := NewDatastore(t.Context(), epf)
 				fakeClient := fake.NewFakeClient()
 				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool)); err != nil {
 					t.Error(err)
 				}
 				for _, pod := range test.existingPods {
-					ds.PodUpdateOrAddIfNotExist(ctx, pod)
+					_ = ds.PodUpdateOrAddIfNotExist(ctx, pod)
 				}
 
 				test.op(ctx, ds)
@@ -505,8 +515,11 @@ func TestPods(t *testing.T) {
 				gotPods := make([]*corev1.Pod, len(podList))
 				for idx, pm := range podList {
 					gotPods[idx] = &corev1.Pod{
-						ObjectMeta: metav1.ObjectMeta{Name: pm.GetMetadata().PodName, Namespace: pm.GetMetadata().NamespacedName.Namespace},
-						Status:     corev1.PodStatus{PodIP: pm.GetMetadata().GetIPAddress()},
+						ObjectMeta: metav1.ObjectMeta{Name: pm.GetMetadata().Name, Namespace: pm.GetMetadata().ID.Namespace},
+						Status: corev1.PodStatus{
+							PodIP:  pm.GetMetadata().GetIPAddress(),
+							HostIP: pm.GetMetadata().GetNodeAddress(),
+						},
 					}
 				}
 				if !cmp.Equal(gotPods, test.wantPods, cmpopts.SortSlices(func(a, b *corev1.Pod) bool { return a.Name < b.Name })) {
@@ -582,7 +595,7 @@ func TestTargetPortsChange(t *testing.T) {
 					WithObjects(readyPod1).
 					Build()
 
-				ds := NewDatastore(ctx, epf, 0)
+				ds := NewDatastore(ctx, epf)
 
 				// Set initial pool with multiple target ports
 				initialPool := testutil.MakeInferencePool("test-pool").
@@ -619,7 +632,7 @@ func TestTargetPortsChange(t *testing.T) {
 				// Verify endpoint names
 				gotNames := make([]string, 0, len(finalEndpoints))
 				for _, ep := range finalEndpoints {
-					gotNames = append(gotNames, ep.GetMetadata().NamespacedName.Name)
+					gotNames = append(gotNames, ep.GetMetadata().ID.Name)
 				}
 				if diff := cmp.Diff(test.wantEndpointNames, gotNames, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
 					t.Errorf("Endpoint names mismatch (-want +got):\n%s", diff)
@@ -642,20 +655,21 @@ func TestEndpointMetadata(t *testing.T) {
 			existingPods: []*corev1.Pod{},
 			wantEndpointMetas: []*fwkdl.EndpointMetadata{
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-0",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolTargetPort,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolTargetPort),
 					Labels:      map[string]string{},
 				},
 			},
 			op: func(ctx context.Context, ds Datastore) {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod1)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod1)
 			},
 			pool: inferencePool,
 		},
@@ -664,25 +678,27 @@ func TestEndpointMetadata(t *testing.T) {
 			existingPods: []*corev1.Pod{},
 			wantEndpointMetas: []*fwkdl.EndpointMetadata{
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-0",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort0,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort0),
 					Labels:      map[string]string{},
 				},
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-1",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort1,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort1),
 					Labels:      map[string]string{},
@@ -690,7 +706,7 @@ func TestEndpointMetadata(t *testing.T) {
 				},
 			},
 			op: func(ctx context.Context, ds Datastore) {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod1)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod1)
 			},
 			pool: inferencePoolMultiTarget,
 		},
@@ -699,58 +715,62 @@ func TestEndpointMetadata(t *testing.T) {
 			existingPods: []*corev1.Pod{pod1},
 			wantEndpointMetas: []*fwkdl.EndpointMetadata{
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-0",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort0,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort0),
 					Labels:      map[string]string{},
 				},
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-1",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort1,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort1),
 					Labels:      map[string]string{},
 					RankIndex:   1,
 				},
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod2.Name + "-rank-0",
 						Namespace: pod2.Namespace,
 					},
 
-					PodName:     pod2.Name,
+					Name:        pod2.Name,
 					Address:     pod2.Status.PodIP,
+					NodeAddress: pod2.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort0,
-					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort0),
+					MetricsHost: net.JoinHostPort(pod2.Status.PodIP, inferencePoolMultiTargetPort0),
 					Labels:      map[string]string{},
 				},
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod2.Name + "-rank-1",
 						Namespace: pod2.Namespace,
 					},
 
-					PodName:     pod2.Name,
+					Name:        pod2.Name,
 					Address:     pod2.Status.PodIP,
+					NodeAddress: pod2.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort1,
-					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort1),
+					MetricsHost: net.JoinHostPort(pod2.Status.PodIP, inferencePoolMultiTargetPort1),
 					Labels:      map[string]string{},
 					RankIndex:   1,
 				},
 			},
 			op: func(ctx context.Context, ds Datastore) {
-				ds.PodUpdateOrAddIfNotExist(ctx, pod2)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, pod2)
 			},
 			pool: inferencePoolMultiTarget,
 		},
@@ -759,25 +779,27 @@ func TestEndpointMetadata(t *testing.T) {
 			existingPods: []*corev1.Pod{pod1, pod2},
 			wantEndpointMetas: []*fwkdl.EndpointMetadata{
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-0",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort0,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort0),
 					Labels:      map[string]string{},
 				},
 				{
-					NamespacedName: types.NamespacedName{
+					ID: types.NamespacedName{
 						Name:      pod1.Name + "-rank-1",
 						Namespace: pod1.Namespace,
 					},
 
-					PodName:     pod1.Name,
+					Name:        pod1.Name,
 					Address:     pod1.Status.PodIP,
+					NodeAddress: pod1.Status.HostIP,
 					Port:        inferencePoolMultiTargetPort1,
 					MetricsHost: net.JoinHostPort(pod1.Status.PodIP, inferencePoolMultiTargetPort1),
 					Labels:      map[string]string{},
@@ -799,13 +821,13 @@ func TestEndpointMetadata(t *testing.T) {
 		for _, epf := range factories {
 			t.Run(test.name, func(t *testing.T) {
 				ctx := context.Background()
-				ds := NewDatastore(t.Context(), epf, 0)
+				ds := NewDatastore(t.Context(), epf)
 				fakeClient := fake.NewFakeClient()
 				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(test.pool)); err != nil {
 					t.Error(err)
 				}
 				for _, pod := range test.existingPods {
-					ds.PodUpdateOrAddIfNotExist(ctx, pod)
+					_ = ds.PodUpdateOrAddIfNotExist(ctx, pod)
 				}
 
 				test.op(ctx, ds)
@@ -814,7 +836,7 @@ func TestEndpointMetadata(t *testing.T) {
 				for idx, pm := range podList {
 					gotMetadata[idx] = pm.GetMetadata()
 				}
-				if diff := cmp.Diff(test.wantEndpointMetas, gotMetadata, cmpopts.SortSlices(func(a, b *fwkdl.EndpointMetadata) bool { return a.NamespacedName.Name < b.NamespacedName.Name })); diff != "" {
+				if diff := cmp.Diff(test.wantEndpointMetas, gotMetadata, cmpopts.SortSlices(func(a, b *fwkdl.EndpointMetadata) bool { return a.ID.Name < b.ID.Name })); diff != "" {
 					t.Errorf("ConvertTo() mismatch (-want +got):\n%s", diff)
 				}
 			})
@@ -952,7 +974,7 @@ func TestActivePortFiltering(t *testing.T) {
 					WithScheme(scheme).
 					Build()
 
-				ds := NewDatastore(ctx, epf, 0)
+				ds := NewDatastore(ctx, epf)
 
 				// Use the first pool in the test
 				if len(test.pools) > 0 {
@@ -964,7 +986,7 @@ func TestActivePortFiltering(t *testing.T) {
 
 				// Add all pods
 				for _, pod := range test.pods {
-					ds.PodUpdateOrAddIfNotExist(ctx, pod)
+					_ = ds.PodUpdateOrAddIfNotExist(ctx, pod)
 				}
 
 				// Check final endpoint count
@@ -977,7 +999,7 @@ func TestActivePortFiltering(t *testing.T) {
 				if test.wantEndpointNames != nil {
 					gotNames := make([]string, 0, len(finalEndpoints))
 					for _, ep := range finalEndpoints {
-						gotNames = append(gotNames, ep.GetMetadata().NamespacedName.Name)
+						gotNames = append(gotNames, ep.GetMetadata().ID.Name)
 					}
 					if diff := cmp.Diff(test.wantEndpointNames, gotNames, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
 						t.Errorf("Endpoint names mismatch (-want +got):\n%s", diff)
@@ -1064,7 +1086,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 			operations: []func(Datastore){
 				// Update the pod to reduce active ports from 3 to 1
 				func(ds Datastore) {
-					ds.PodUpdateOrAddIfNotExist(context.Background(), updatedPod1)
+					_ = ds.PodUpdateOrAddIfNotExist(context.Background(), updatedPod1)
 				},
 			},
 			wantEndpointCount: 1, // Only port 8000 should remain active
@@ -1080,7 +1102,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 			operations: []func(Datastore){
 				// Update the pod to have no active ports
 				func(ds Datastore) {
-					ds.PodUpdateOrAddIfNotExist(context.Background(), inactivePod1)
+					_ = ds.PodUpdateOrAddIfNotExist(context.Background(), inactivePod1)
 				},
 			},
 			wantEndpointCount: 0, // No ports should remain active
@@ -1104,7 +1126,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 					WithScheme(scheme).
 					Build()
 
-				ds := NewDatastore(ctx, epf, 0)
+				ds := NewDatastore(ctx, epf)
 
 				// Set up the pool
 				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(test.pool)); err != nil {
@@ -1112,7 +1134,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 				}
 
 				// Add the initial pod
-				ds.PodUpdateOrAddIfNotExist(ctx, test.initialPod)
+				_ = ds.PodUpdateOrAddIfNotExist(ctx, test.initialPod)
 
 				// Wait a bit for the datastore to process the pod
 				time.Sleep(100 * time.Millisecond)
@@ -1158,7 +1180,7 @@ func TestPodUpdateOrAddIfNotExist_ConcurrentPoolSet(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 			ctx := context.Background()
-			ds := NewDatastore(ctx, epf, 0)
+			ds := NewDatastore(ctx, epf)
 
 			pool := poolutil.InferencePoolToEndpointPool(
 				testutil.MakeInferencePool("pool1").
@@ -1199,7 +1221,7 @@ func TestPodUpdateOrAddIfNotExist_ConcurrentPoolSet(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for range 1000 {
-					ds.PodUpdateOrAddIfNotExist(ctx, pod)
+					_ = ds.PodUpdateOrAddIfNotExist(ctx, pod)
 				}
 			}()
 
@@ -1324,31 +1346,16 @@ func TestExtractActivePorts(t *testing.T) {
 			expectedPorts: sets.New(8000),
 		},
 		{
-			name: "Pod with legacy GAIE annotation key",
+			name: "Legacy GAIE annotation key is ignored",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "test-pod",
 					Namespace:   "default",
-					Annotations: map[string]string{legacyGAIEActivePortsAnnotation: "8000,8001"},
+					Annotations: map[string]string{"inference.networking.k8s.io/active-ports": "8000"},
 				},
 			},
 			validPorts:    []int{8000, 8001, 8002},
-			expectedPorts: sets.New(8000, 8001),
-		},
-		{
-			name: "New annotation key takes precedence over legacy GAIE key",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						activePortsAnnotation:           "8000",
-						legacyGAIEActivePortsAnnotation: "8001",
-					},
-				},
-			},
-			validPorts:    []int{8000, 8001, 8002},
-			expectedPorts: sets.New(8000),
+			expectedPorts: sets.New(8000, 8001, 8002),
 		},
 	}
 
@@ -1367,10 +1374,10 @@ func TestExtractActivePorts(t *testing.T) {
 func TestEndpointUpsert_NewEndpoint(t *testing.T) {
 	const addr, port = "10.0.0.1", "8000"
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{}, 0)
+	ds := NewDatastore(ctx, &mockEndpointFactory{})
 	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr, Port: port})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr, Port: port})
 
 	eps := ds.PodList(AllPodsPredicate)
 	assert.Len(t, eps, 1)
@@ -1380,11 +1387,11 @@ func TestEndpointUpsert_NewEndpoint(t *testing.T) {
 func TestEndpointUpsert_UpdateExisting(t *testing.T) {
 	const addr1, addr2 = "10.0.0.1", "10.0.0.2"
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{}, 0)
+	ds := NewDatastore(ctx, &mockEndpointFactory{})
 	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr1})
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr2})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr1})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr2})
 
 	eps := ds.PodList(AllPodsPredicate)
 	assert.Len(t, eps, 1)
@@ -1395,19 +1402,19 @@ func TestEndpointUpsert_UpdateExistingNotifiesEndpointFactory(t *testing.T) {
 	const addr1, addr2 = "10.0.0.1", "10.0.0.2"
 	ctx := context.Background()
 	factory := &mockEndpointFactory{}
-	ds := NewDatastore(ctx, factory, 0)
+	ds := NewDatastore(ctx, factory)
 	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr1})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr1})
 	assert.Empty(t, factory.updateEvents())
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr2})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr2})
 
 	updates := factory.updateEvents()
 	assert.Len(t, updates, 1)
 	assert.Equal(t, addr2, updates[0].GetMetadata().Address)
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr2})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr2})
 	assert.Len(t, factory.updateEvents(), 1)
 }
 
@@ -1415,19 +1422,19 @@ func TestEndpointUpsert_SemanticallyEqualMetadataDoesNotNotify(t *testing.T) {
 	const addr = "10.0.0.1"
 	ctx := context.Background()
 	factory := &mockEndpointFactory{}
-	ds := NewDatastore(ctx, factory, 0)
+	ds := NewDatastore(ctx, factory)
 	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr, Labels: nil})
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id, Address: addr, Labels: map[string]string{}})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr, Labels: nil})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id, Address: addr, Labels: map[string]string{}})
 
 	assert.Empty(t, factory.updateEvents())
 }
 
 func TestEndpointUpsert_NewEndpointFactoryReturnsNil(t *testing.T) {
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{returnNil: true}, 0)
-	meta := &fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Name: "ep1", Namespace: "default"}}
+	ds := NewDatastore(ctx, &mockEndpointFactory{returnNil: true})
+	meta := &fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "ep1", Namespace: "default"}}
 
 	assert.NotPanics(t, func() { ds.EndpointUpsert(ctx, meta) })
 	assert.Empty(t, ds.PodList(AllPodsPredicate))
@@ -1435,37 +1442,189 @@ func TestEndpointUpsert_NewEndpointFactoryReturnsNil(t *testing.T) {
 
 func TestEndpointDelete_Existing(t *testing.T) {
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{}, 0)
+	ds := NewDatastore(ctx, &mockEndpointFactory{})
 	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
 
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: id})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id})
 	assert.Len(t, ds.PodList(AllPodsPredicate), 1)
 
 	ds.EndpointDelete(id)
 	assert.Empty(t, ds.PodList(AllPodsPredicate))
 }
 
+// TestPodsSnapshotCurrent_CachedBetweenMutations verifies that the pods snapshot backing
+// PodList is reused across calls that fall between mutations, and rebuilt once a mutation
+// (EndpointUpsert/EndpointDelete) changes the pods map (#3078).
+func TestPodsSnapshotCurrent_CachedBetweenMutations(t *testing.T) {
+	ctx := context.Background()
+	ds := NewDatastore(ctx, &mockEndpointFactory{}).(*datastore)
+	id1 := types.NamespacedName{Name: "ep1", Namespace: "default"}
+	id2 := types.NamespacedName{Name: "ep2", Namespace: "default"}
+
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id1})
+
+	first := ds.podsSnapshotCurrent()
+	second := ds.podsSnapshotCurrent()
+	require.Len(t, first, 1)
+	assert.Same(t, &first[0], &second[0], "snapshot should be reused when the pods map has not changed")
+
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: id2})
+
+	third := ds.podsSnapshotCurrent()
+	require.Len(t, third, 2, "snapshot should be rebuilt after a mutation")
+}
+
 func TestEndpointDelete_Missing(t *testing.T) {
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{}, 0)
+	ds := NewDatastore(ctx, &mockEndpointFactory{})
 
 	assert.NotPanics(t, func() {
 		ds.EndpointDelete(types.NamespacedName{Name: "nonexistent", Namespace: "default"})
 	})
 }
 
+// TestPodUpdateOrAddIfNotExist_RegistrationDropReturnsError verifies that a dropped endpoint
+// registration (NewEndpoint returns nil with no surviving pods-map entry) is reported to the
+// caller instead of leaving the pod silently untracked, and that a retry succeeds once the
+// collector can start again (#2060).
+func TestPodUpdateOrAddIfNotExist_RegistrationDropReturnsError(t *testing.T) {
+	ctx := context.Background()
+	factory := &mockEndpointFactory{returnNil: true}
+	ds := NewDatastore(ctx, factory)
+	require.NoError(t, ds.PoolSet(ctx, fake.NewFakeClient(), poolutil.InferencePoolToEndpointPool(inferencePool)))
+
+	err := ds.PodUpdateOrAddIfNotExist(ctx, pod1)
+	require.ErrorIs(t, err, errRegistrationDropped)
+	assert.Empty(t, ds.PodList(AllPodsPredicate))
+
+	// The retry (the reconciler's requeue) succeeds once the collector can start.
+	factory.returnNil = false
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	assert.Len(t, ds.PodList(AllPodsPredicate), 1)
+}
+
+// TestPoolSet_ResyncRetriedAfterDropError verifies that a PoolSet retried with an identical pool
+// after a failed resync runs the resync again rather than skipping it because the pool compares
+// equal to the one already stored (#2060).
+func TestPoolSet_ResyncRetriedAfterDropError(t *testing.T) {
+	ctx := context.Background()
+	readyPod := testutil.FromBase(pod1).ReadyCondition().ObjRef()
+	fakeClient := fake.NewClientBuilder().WithObjects(readyPod).Build()
+
+	fail := true
+	factory := &datalayer.FakeEndpointFactory{
+		NewEndpointFn: func(_ context.Context, meta *fwkdl.EndpointMetadata) fwkdl.Endpoint {
+			if fail {
+				return nil
+			}
+			return fwkdl.NewEndpoint(meta, fwkdl.NewMetrics())
+		},
+	}
+	ds := NewDatastore(ctx, factory)
+
+	err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool))
+	require.ErrorIs(t, err, errRegistrationDropped)
+	assert.Empty(t, ds.PodList(AllPodsPredicate))
+
+	fail = false
+	require.NoError(t, ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool)))
+	assert.Len(t, ds.PodList(AllPodsPredicate), 1)
+}
+
+// TestUpsertEndpoint_ConcurrentStoreDuringNilAppliesMetadata verifies the duplicate-start race
+// is not reported as an error and does not lose this call's metadata: when a concurrent upsert
+// has stored an entry by the time NewEndpoint returns nil, the upsert applies its metadata to
+// that entry through the update path.
+func TestUpsertEndpoint_ConcurrentStoreDuringNilAppliesMetadata(t *testing.T) {
+	ctx := context.Background()
+	id := types.NamespacedName{Name: "ep1", Namespace: "default"}
+
+	var ds *datastore
+	factory := &datalayer.FakeEndpointFactory{
+		NewEndpointFn: func(_ context.Context, _ *fwkdl.EndpointMetadata) fwkdl.Endpoint {
+			staleMeta := &fwkdl.EndpointMetadata{ID: id, Address: "10.0.0.1"}
+			ds.pods.Store(id, fwkdl.NewEndpoint(staleMeta, fwkdl.NewMetrics()))
+			ds.podsVersion.Add(1)
+			return nil
+		},
+	}
+	ds = NewDatastore(ctx, factory).(*datastore)
+
+	created, err := ds.upsertEndpoint(ctx, &fwkdl.EndpointMetadata{ID: id, Address: "10.0.0.2"})
+
+	require.NoError(t, err)
+	assert.False(t, created)
+	eps := ds.PodList(AllPodsPredicate)
+	require.Len(t, eps, 1)
+	assert.Equal(t, "10.0.0.2", eps[0].GetMetadata().Address)
+}
+
+// TestDatastore_ConcurrentAddRemoveCompleteness hammers concurrent delete/upsert of the same pod
+// and asserts the completeness invariant: an upsert either stores the pod or returns an error
+// the caller can retry on (#2060). The fake mirrors Runtime's collector registry: NewEndpoint
+// fails while a collector is registered for the endpoint, and ReleaseEndpoint deregisters only
+// after a delay, so an upsert can observe a pods-map miss while the collector is still
+// registered.
+func TestDatastore_ConcurrentAddRemoveCompleteness(t *testing.T) {
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	registered := map[types.NamespacedName]bool{}
+	factory := &datalayer.FakeEndpointFactory{
+		NewEndpointFn: func(_ context.Context, meta *fwkdl.EndpointMetadata) fwkdl.Endpoint {
+			mu.Lock()
+			defer mu.Unlock()
+			if registered[meta.ID] {
+				return nil
+			}
+			registered[meta.ID] = true
+			return fwkdl.NewEndpoint(meta, fwkdl.NewMetrics())
+		},
+		ReleaseEndpointFn: func(ep fwkdl.Endpoint) {
+			time.Sleep(50 * time.Microsecond)
+			mu.Lock()
+			defer mu.Unlock()
+			delete(registered, ep.GetMetadata().ID)
+		},
+	}
+	ds := NewDatastore(ctx, factory)
+	require.NoError(t, ds.PoolSet(ctx, fake.NewFakeClient(), poolutil.InferencePoolToEndpointPool(inferencePool)))
+
+	for i := 0; i < 200; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			ds.PodDelete(pod1.Name)
+		}()
+		go func() {
+			defer wg.Done()
+			// The racing upsert may observe the dropped-registration error; the retry below is
+			// what must converge.
+			_ = ds.PodUpdateOrAddIfNotExist(ctx, pod1)
+		}()
+		wg.Wait()
+
+		// The reconciler's requeue loop: retry until the registration lands.
+		require.Eventually(t, func() bool {
+			return ds.PodUpdateOrAddIfNotExist(ctx, pod1) == nil
+		}, 5*time.Second, time.Millisecond, "iteration %d: upsert never converged", i)
+		require.Len(t, ds.PodList(AllPodsPredicate), 1, "iteration %d: pod missing after successful upsert", i)
+	}
+}
+
 func TestDiscoveryNotifier_WorksAlongsideDirectUpsert(t *testing.T) {
 	ctx := context.Background()
-	ds := NewDatastore(ctx, &mockEndpointFactory{}, 0)
+	ds := NewDatastore(ctx, &mockEndpointFactory{})
 
 	// Populate one endpoint directly (simulates the K8s reconciler path).
 	directID := types.NamespacedName{Name: "direct-ep", Namespace: "default"}
-	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{NamespacedName: directID, Address: "10.0.0.1"})
+	ds.EndpointUpsert(ctx, &fwkdl.EndpointMetadata{ID: directID, Address: "10.0.0.1"})
 
 	// Add a second endpoint via DiscoveryNotifier (the file-discovery path).
 	notifier := fwkdl.NewDiscoveryNotifier(ds)
 	notifID := types.NamespacedName{Name: "notif-ep", Namespace: "default"}
-	notifier.Upsert(&fwkdl.EndpointMetadata{NamespacedName: notifID, Address: "10.0.0.2"})
+	notifier.Upsert(&fwkdl.EndpointMetadata{ID: notifID, Address: "10.0.0.2"})
 
 	// Both endpoints must coexist.
 	assert.Len(t, ds.PodList(AllPodsPredicate), 2)

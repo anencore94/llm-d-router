@@ -1,0 +1,35 @@
+version: "2"
+
+# Security linters only. Kept separate from .golangci.yml so the SARIF report
+# contains gosec findings alone and uploads to the code scanning "gosec"
+# category without style findings mixed in.
+
+run:
+  timeout: 5m
+  allow-parallel-runners: true
+
+linters:
+  default: none
+  enable:
+    - gosec
+  exclusions:
+    rules:
+      # The gate protects new production code. Test code trips gosec on patterns
+      # that are deliberate in tests (unchecked errors on mock handlers, httptest
+      # URLs, weak RNG for fixtures), so annotating each one adds noise without
+      # adding safety. Covers _test.go, helpers under test/ that are not
+      # themselves _test.go, and test harnesses under pkg/.../tests/.
+      - path: (_test\.go|^test/|/tests/)
+        linters:
+          - gosec
+
+output:
+  formats:
+    text:
+      path: stdout
+    sarif:
+      path: gosec.sarif
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

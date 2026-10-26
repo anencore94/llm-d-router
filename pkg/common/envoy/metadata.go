@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +22,12 @@ import (
 )
 
 func ExtractMetadataValues(req *extProcPb.ProcessingRequest) map[string]any {
-	metadata := make(map[string]any)
-	if req != nil && req.MetadataContext != nil && req.MetadataContext.FilterMetadata != nil {
-		for key, val := range req.MetadataContext.FilterMetadata {
-			metadata[key] = val.AsMap()
-		}
+	if req == nil || req.MetadataContext == nil || len(req.MetadataContext.FilterMetadata) == 0 {
+		return nil
+	}
+	metadata := make(map[string]any, len(req.MetadataContext.FilterMetadata))
+	for key, val := range req.MetadataContext.FilterMetadata {
+		metadata[key] = val.AsMap()
 	}
 	return metadata
 }

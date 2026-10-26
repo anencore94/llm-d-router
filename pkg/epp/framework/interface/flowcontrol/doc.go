@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +28,5 @@ limitations under the License.
 //   - IntraFlowDispatchPolicy: (Deprecated) Legacy interface for intra-flow ordering. Replaced by OrderingPolicy.
 //   - ItemComparator: (Deprecated) Legacy interface for exposing ordering logic. Replaced by OrderingPolicy.
 //
-// These components are linked by QueueCapability, which allows policies to declare their queue requirements (e.g.,
-// FIFO or priority-based ordering).
+// An OrderingPolicy supplies the comparator (Less) that determines dispatch order within a flow's queue.
 package flowcontrol

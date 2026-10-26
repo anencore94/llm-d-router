@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,34 +27,37 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/utils/clock"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
-// maxCleanupWorkers caps the number of concurrent workers for background cleanup tasks. This prevents a single shard
+// maxCleanupWorkers caps the number of concurrent workers for background cleanup tasks. This prevents the processor
 // from overwhelming the Go scheduler with too many goroutines.
 const maxCleanupWorkers = 4
 
-// ErrProcessorBusy is a sentinel error returned by the processor's Submit method indicating that the processor's.
+// ErrProcessorBusy is a sentinel error returned by the processor's Submit method indicating that the processor's
 // internal buffer is momentarily full and cannot accept new work.
-var ErrProcessorBusy = errors.New("shard processor is busy")
+var ErrProcessorBusy = errors.New("processor is busy")
 
 // Processor is the core worker of the FlowController.
 //
-// It is paired one-to-one with a RegistryShard instance and is responsible for all request lifecycle operations on that
-// shard, from the point an item is successfully submitted to it.
+// A single Processor owns the entire request data plane and is responsible for all request lifecycle operations from
+// the point an item is successfully submitted to it.
 //
 // # Request Lifecycle Management & Ownership
 //
 // The Processor takes ownership of a FlowItem only after it has been successfully sent to its internal enqueueChan
 // via Submit or SubmitOrBlock (i.e., when these methods return nil).
 // Once the Processor takes ownership, it is solely responsible for ensuring that item.Finalize() or
-// item.FinalizeWithOutcome() is called exactly once for that item, under all circumstances (dispatch, rejection, sweep,
+// item.FinalizeWithError() is called exactly once for that item, under all circumstances (dispatch, rejection, sweep,
 // or shutdown).
 //
 // If Submit or SubmitOrBlock return an error, ownership remains with the caller (the Controller), which must then
@@ -71,9 +75,15 @@ type Processor struct {
 	saturationDetector   flowcontrol.SaturationDetector
 	endpointCandidates   contracts.EndpointCandidates
 	usageLimitPolicy     flowcontrol.UsageLimitPolicy
+	bandSelectionPolicy  flowcontrol.BandSelectionPolicy
 	clock                clock.WithTicker
+	noEndpointRequestTTL time.Duration
 	cleanupSweepInterval time.Duration
 	logger               logr.Logger
+
+	// reclamation, when non-nil, enables demand-driven in-flight eviction on HoL blocking.
+	// See docs/flow-control-eviction.md.
+	reclamation *ReclamationController
 
 	// lifecycleCtx controls the processor's lifetime. Monitored by Submit* methods for safe shutdown.
 	lifecycleCtx context.Context
@@ -81,16 +91,41 @@ type Processor struct {
 	// enqueueChan is the entry point for new requests.
 	enqueueChan chan *FlowItem
 
-	// poolEmpty caches whether the candidate pool had zero endpoints as of the most recent dispatchCycle. enqueue reads
-	// it to distinguish a queue-capacity rejection caused by genuine unavailability (no backends, e.g. scale-from-zero)
-	// from one caused by backpressure against a contended but non-empty pool. Only accessed from the Run goroutine, so
-	// it needs no synchronization.
-	poolEmpty bool
+	// regime caches the unavailability regime observed by the most recent dispatchCycle. enqueue reads it to distinguish
+	// a queue-capacity rejection caused by genuine unavailability (no backends, e.g. scale-from-zero) from one caused by
+	// backpressure against a contended but non-empty pool, and the cleanup sweep reads it to pick the queue-wait budget
+	// in force and the point to charge it from. Written only by the Run goroutine; a single pointer lets a reader load
+	// the emptiness and its timestamp as one consistent sample. Never nil.
+	regime atomic.Pointer[regimeSample]
+
+	// ceilings is the reusable output buffer handed to the UsageLimitPolicy each dispatch cycle,
+	// avoiding a per-cycle allocation. Only accessed from the Run goroutine, so it needs no
+	// synchronization.
+	ceilings []float64
+
+	// order is the reusable output buffer handed to the BandSelectionPolicy each dispatch cycle, holding
+	// the sequence in which bands are offered a dispatch opportunity as indices into the priority slice.
+	// Only accessed from the Run goroutine, so it needs no synchronization.
+	order []int
 
 	// wg is used to wait for background tasks (cleanup sweep) to complete on shutdown.
 	wg             sync.WaitGroup
 	isShuttingDown atomic.Bool
 	shutdownOnce   sync.Once
+
+	// dropCounts accumulates non-dispatched request outcomes between periodic summary flushes.
+	// Written by both the main Run goroutine (enqueue, shutdown) and the runCleanupSweep goroutine (sweep),
+	// so each slot is an atomic to avoid a data race.
+	dropCounts [types.NumQueueOutcomes]atomic.Uint64
+}
+
+// regimeSample is one observation of the unavailability regime: whether the candidate pool was empty, and when that
+// answer last changed. The two travel together because a reader that mixed an emptiness from one observation with a
+// timestamp from another would charge queue wait against the wrong regime.
+type regimeSample struct {
+	empty bool
+	// since is the wall-clock time at which empty last changed value, or the zero time if it has never changed.
+	since time.Time
 }
 
 // NewProcessor creates a new Processor instance.
@@ -102,45 +137,55 @@ func NewProcessor(
 	saturationDetector flowcontrol.SaturationDetector,
 	endpointCandidates contracts.EndpointCandidates,
 	usageLimitPolicy flowcontrol.UsageLimitPolicy,
+	bandSelectionPolicy flowcontrol.BandSelectionPolicy,
 	clock clock.WithTicker,
+	noEndpointRequestTTL time.Duration,
 	cleanupSweepInterval time.Duration,
 	enqueueChannelBufferSize int,
 	logger logr.Logger,
+	reclamation *ReclamationController,
 ) *Processor {
-	return &Processor{
+	p := &Processor{
 		registry:             registry,
 		registryBackground:   registryBackground,
 		poolName:             poolName,
 		saturationDetector:   saturationDetector,
 		endpointCandidates:   endpointCandidates,
 		usageLimitPolicy:     usageLimitPolicy,
+		bandSelectionPolicy:  bandSelectionPolicy,
 		clock:                clock,
+		noEndpointRequestTTL: noEndpointRequestTTL,
 		cleanupSweepInterval: cleanupSweepInterval,
 		logger:               logger,
 		lifecycleCtx:         ctx,
 		enqueueChan:          make(chan *FlowItem, enqueueChannelBufferSize),
+		reclamation:          reclamation,
 	}
+	// Seeded so readers never handle a nil sample. The pool reads as non-empty until the first dispatch cycle observes
+	// otherwise, which keeps a request that arrives before that cycle on the saturation budget.
+	p.regime.Store(&regimeSample{})
+	return p
 }
 
 // Submit attempts a non-blocking handoff of an item to the processor's internal enqueue channel.
 //
 // Ownership Contract:
 //   - Returns nil: The item was successfully handed off.
-//     The ShardProcessor takes responsibility for calling Finalize on the item.
+//     The Processor takes responsibility for calling Finalize on the item.
 //   - Returns error: The item was not handed off.
 //     Ownership of the FlowItem remains with the caller, who is responsible for calling Finalize.
 //
 // Possible errors:
 //   - ErrProcessorBusy: The processor's input channel is full.
 //   - types.ErrFlowControllerNotRunning: The processor is shutting down.
-func (sp *Processor) Submit(item *FlowItem) error {
-	if sp.isShuttingDown.Load() {
+func (p *Processor) Submit(item *FlowItem) error {
+	if p.isShuttingDown.Load() {
 		return types.ErrFlowControllerNotRunning
 	}
 	select { // The default case makes this select non-blocking.
-	case sp.enqueueChan <- item:
+	case p.enqueueChan <- item:
 		return nil // Ownership transferred.
-	case <-sp.lifecycleCtx.Done():
+	case <-p.lifecycleCtx.Done():
 		return types.ErrFlowControllerNotRunning
 	default:
 		return ErrProcessorBusy
@@ -152,49 +197,52 @@ func (sp *Processor) Submit(item *FlowItem) error {
 //
 // Ownership Contract:
 //   - Returns nil: The item was successfully handed off.
-//     The ShardProcessor takes responsibility for calling Finalize on the item.
+//     The Processor takes responsibility for calling Finalize on the item.
 //   - Returns error: The item was not handed off.
 //     Ownership of the FlowItem remains with the caller, who is responsible for calling Finalize.
 //
 // Possible errors:
 //   - ctx.Err(): The provided context was cancelled or its deadline exceeded.
 //   - types.ErrFlowControllerNotRunning: The processor is shutting down.
-func (sp *Processor) SubmitOrBlock(ctx context.Context, item *FlowItem) error {
-	if sp.isShuttingDown.Load() {
+func (p *Processor) SubmitOrBlock(ctx context.Context, item *FlowItem) error {
+	if p.isShuttingDown.Load() {
 		return types.ErrFlowControllerNotRunning
 	}
 
 	select { // The absence of a default case makes this call blocking.
-	case sp.enqueueChan <- item:
+	case p.enqueueChan <- item:
 		return nil // Ownership transferred.
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-sp.lifecycleCtx.Done():
+	case <-p.lifecycleCtx.Done():
 		return types.ErrFlowControllerNotRunning
 	}
 }
 
-// Run is the main operational loop for the shard processor. It must be run as a goroutine.
+// Run is the main operational loop for the processor. It must be run as a goroutine.
 // It uses a `select` statement to interleave accepting new requests with dispatching existing ones, balancing
 // responsiveness with throughput.
-func (sp *Processor) Run(ctx context.Context) {
-	sp.logger.V(logutil.DEFAULT).Info("Shard processor run loop starting.")
-	defer sp.logger.V(logutil.DEFAULT).Info("Shard processor run loop stopped.")
+func (p *Processor) Run(ctx context.Context) {
+	// Log any panic with processor context before the default handlers repanic; the process
+	// fail-stops rather than continuing on state a panicked goroutine may have left inconsistent.
+	defer utilruntime.HandleCrashWithLogger(p.logger)
+	p.logger.V(logutil.DEFAULT).Info("Processor run loop starting.")
+	defer p.logger.V(logutil.DEFAULT).Info("Processor run loop stopped.")
 
-	sp.wg.Add(1)
-	go sp.runCleanupSweep(ctx)
+	p.wg.Add(1)
+	go p.runCleanupSweep(ctx)
 
 	// Create a ticker for periodic dispatch attempts to avoid tight loops
-	dispatchTicker := sp.clock.NewTicker(time.Millisecond)
+	dispatchTicker := p.clock.NewTicker(time.Millisecond)
 	defer dispatchTicker.Stop()
 
 	var gcCh <-chan time.Time
 	var priorityBandUpdateCh <-chan map[int]struct{}
-	if sp.registryBackground != nil {
-		gcTicker := sp.clock.NewTicker(sp.registryBackground.FlowGCTimeout())
+	if p.registryBackground != nil {
+		gcTicker := p.clock.NewTicker(p.registryBackground.FlowGCTimeout())
 		defer gcTicker.Stop()
 		gcCh = gcTicker.C()
-		priorityBandUpdateCh = sp.registryBackground.PriorityBandUpdateChannel()
+		priorityBandUpdateCh = p.registryBackground.PriorityBandUpdateChannel()
 	}
 
 	// This is the main worker loop. It continuously processes incoming requests and dispatches queued requests until the
@@ -211,35 +259,35 @@ func (sp *Processor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			sp.shutdown()
-			sp.wg.Wait()
+			p.shutdown()
+			p.wg.Wait()
 			return
-		case item, ok := <-sp.enqueueChan:
+		case item, ok := <-p.enqueueChan:
 			if !ok { // Should not happen in practice, but is a clean shutdown signal.
-				sp.shutdown()
-				sp.wg.Wait()
+				p.shutdown()
+				p.wg.Wait()
 				return
 			}
 			// This is a safeguard against logic errors in the distributor.
 			if item == nil {
-				sp.logger.Error(nil, "Logic error: nil item received on shard processor enqueue channel, ignoring.")
+				p.logger.Error(nil, "Logic error: nil item received on processor enqueue channel, ignoring.")
 				continue
 			}
-			sp.enqueue(item)
-			sp.dispatchCycle(ctx) // Process immediately when an item arrives
+			p.enqueue(item)
+			p.dispatchCycle(ctx) // Process immediately when an item arrives
 		case <-dispatchTicker.C():
-			sp.dispatchCycle(ctx) // Periodically attempt to dispatch from queues
+			p.dispatchCycle(ctx) // Periodically attempt to dispatch from queues
 		case desired := <-priorityBandUpdateCh:
-			sp.registryBackground.ApplyDesiredPriorities(desired)
+			p.registryBackground.ApplyDesiredPriorities(desired)
 		case <-gcCh:
-			sp.registryBackground.ExecuteGCCycle()
+			p.registryBackground.ExecuteGCCycle()
 		}
 	}
 }
 
 // enqueue processes an item received from the enqueueChan.
 // It handles capacity checks, checks for external finalization, and either admits the item to a queue or rejects it.
-func (sp *Processor) enqueue(item *FlowItem) {
+func (p *Processor) enqueue(item *FlowItem) {
 
 	req := item.OriginalRequest()
 	key := req.FlowKey()
@@ -261,46 +309,59 @@ func (sp *Processor) enqueue(item *FlowItem) {
 	// This is an optimistic check to avoid unnecessary processing on items already considered dead.
 	// The ultimate guarantee of cleanup for any races is the runCleanupSweep mechanism.
 	if finalState := outcome; finalState != nil {
-		sp.logger.V(logutil.TRACE).Info("Item finalized externally before processing, discarding.",
+		p.logger.V(logutil.TRACE).Info("Item finalized externally before processing, discarding.",
 			"outcome", finalState.Outcome, "err", finalState.Err, "flowKey", key, "requestID", req.ID())
+		p.recordDrop(finalState.Outcome)
+		return
+	}
+
+	// The active queue-wait budget includes time spent in the processor's enqueue buffer.
+	regime := p.regime.Load()
+	if isExpired(item, p.clock.Now(), regime, p.noEndpointRequestTTL) {
+		p.finalizeAndRecordDrop(item, expiryError(regime.empty))
 		return
 	}
 
 	// --- Configuration Validation ---
-	managedQ, err := sp.registry.ManagedQueue(key)
+	// Registry errors on both lookups are flattened with %v; see tryDistribution for why a finalized error must
+	// not preserve registry sentinels.
+	managedQ, err := p.registry.ManagedQueue(key)
 	if err != nil {
-		finalErr := fmt.Errorf("configuration error: failed to get queue for flow key %s: %w", key, err)
-		sp.logger.Error(finalErr, "Rejecting request, queue lookup failed", "flowKey", key, "requestID", req.ID())
-		item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
-		return
-	}
-
-	_, err = sp.registry.PriorityBandAccessor(key.Priority)
-	if err != nil {
-		finalErr := fmt.Errorf("configuration error: failed to get priority band for priority %d: %w", key.Priority, err)
-		sp.logger.Error(finalErr, "Rejecting request, priority band lookup failed", "flowKey", key, "requestID", req.ID())
-		item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
+		finalErr := fmt.Errorf("configuration error: failed to get queue for flow key %s: %v", key, err)
+		p.logger.Error(finalErr, "Rejecting request, queue lookup failed", "flowKey", key, "requestID", req.ID())
+		p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
 		return
 	}
 
 	// --- Capacity Check ---
 	// This check is safe because it is performed by the single-writer Run goroutine.
-	if ok, stats := sp.hasCapacity(key.Priority, req.ByteSize()); !ok {
+	ok, stats, err := p.hasCapacity(key.Priority, req.ByteSize())
+	if err != nil {
+		finalErr := fmt.Errorf("configuration error: failed to read capacity for priority %d: %v", key.Priority, err)
+		p.logger.Error(finalErr, "Rejecting request, capacity lookup failed", "flowKey", key, "requestID", req.ID())
+		p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
+		return
+	}
+	if !ok {
 		// When the pool has no endpoints, the queue is acting as a scale-from-zero waiting room. A capacity rejection in
 		// that state reflects genuine unavailability (surfaced as 503), not backpressure against a contended pool (429).
-		if sp.poolEmpty {
-			sp.logger.V(logutil.DEBUG).Info("Rejecting request, queue at capacity with no endpoints",
-				"flowKey", key, "reqID", req.ID(), "reqByteSize", req.ByteSize())
-			item.FinalizeWithOutcome(types.QueueOutcomeRejectedNoEndpoints, fmt.Errorf("%w: %w",
-				types.ErrRejected, types.ErrNoEndpoints))
+		if p.regime.Load().empty {
+			p.logger.V(logutil.DEBUG).Info("Rejecting request, queue at capacity with no endpoints",
+				"flowKey", key, "requestID", req.ID(), "reqByteSize", req.ByteSize(),
+				"bandLen", stats.Band.Len, "bandCapacityRequests", stats.Band.CapacityRequests,
+				"bandByteSize", stats.Band.ByteSize, "bandCapacityBytes", stats.Band.CapacityBytes,
+				"totalLen", stats.Global.Len, "totalCapacityRequests", stats.Global.CapacityRequests,
+				"totalByteSize", stats.Global.ByteSize, "totalCapacityBytes", stats.Global.CapacityBytes)
+			p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, types.ErrNoEndpoints))
 			return
 		}
-		sp.logger.V(logutil.DEBUG).Info("Rejecting request, queue at capacity",
+		p.logger.V(logutil.DEBUG).Info("Rejecting request, queue at capacity",
 			"flowKey", key, "requestID", req.ID(), "reqByteSize", req.ByteSize(),
-			"totalLen", stats.TotalLen, "totalCapacityRequests", stats.TotalCapacityRequests,
-			"totalByteSize", stats.TotalByteSize, "totalCapacityBytes", stats.TotalCapacityBytes)
-		item.FinalizeWithOutcome(types.QueueOutcomeRejectedCapacity, fmt.Errorf("%w: %w",
-			types.ErrRejected, types.ErrQueueAtCapacity))
+			"bandLen", stats.Band.Len, "bandCapacityRequests", stats.Band.CapacityRequests,
+			"bandByteSize", stats.Band.ByteSize, "bandCapacityBytes", stats.Band.CapacityBytes,
+			"totalLen", stats.Global.Len, "totalCapacityRequests", stats.Global.CapacityRequests,
+			"totalByteSize", stats.Global.ByteSize, "totalCapacityBytes", stats.Global.CapacityBytes)
+		p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, types.ErrQueueAtCapacity))
 		return
 	}
 
@@ -308,89 +369,184 @@ func (sp *Processor) enqueue(item *FlowItem) {
 	// The item is admitted. The ManagedQueue.Add implementation is responsible for calling item.SetHandle() atomically.
 	if err := managedQ.Add(item); err != nil {
 		finalErr := fmt.Errorf("failed to add item to queue for flow key %s: %w", key, err)
-		sp.logger.Error(finalErr, "Rejecting request, queue add failed",
+		p.logger.Error(finalErr, "Rejecting request, queue add failed",
 			"flowKey", key, "requestID", req.ID())
-		item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
+		p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
 		return
 	}
-	sp.logger.V(logutil.TRACE).Info("Item enqueued.",
+	p.logger.V(logutil.TRACE).Info("Item enqueued.",
 		"flowKey", key, "requestID", req.ID())
 }
 
-// hasCapacity checks if the shard and the specific priority band have enough capacity.
+// hasCapacity checks if the global limits and the specific priority band have enough capacity.
 // This check reflects actual resource utilization, including "zombie" items (finalized but unswept), to prevent
 // physical resource overcommitment.
-func (sp *Processor) hasCapacity(priority int, itemByteSize uint64) (bool, contracts.AggregateStats) {
-	stats := sp.registry.Stats()
-	if stats.TotalCapacityBytes > 0 && stats.TotalByteSize+itemByteSize > stats.TotalCapacityBytes {
-		return false, stats
+// A non-nil error means the capacity could not be read (the priority band is not configured), not that capacity is
+// exhausted.
+func (p *Processor) hasCapacity(priority int, itemByteSize uint64) (bool, contracts.CapacitySnapshot, error) {
+	snapshot, err := p.registry.CapacitySnapshot(priority)
+	if err != nil {
+		return false, snapshot, err
 	}
-	if stats.TotalCapacityRequests > 0 && stats.TotalLen+1 > stats.TotalCapacityRequests {
-		return false, stats
+	global, band := snapshot.Global, snapshot.Band
+	if global.CapacityBytes > 0 && global.ByteSize+itemByteSize > global.CapacityBytes {
+		return false, snapshot, nil
 	}
-
-	bandStats, ok := stats.PerPriorityBandStats[priority]
-	if !ok {
-		return false, stats
+	if global.CapacityRequests > 0 && global.Len+1 > global.CapacityRequests {
+		return false, snapshot, nil
 	}
-	if bandStats.CapacityBytes > 0 && bandStats.ByteSize+itemByteSize > bandStats.CapacityBytes {
-		return false, stats
+	if band.CapacityBytes > 0 && band.ByteSize+itemByteSize > band.CapacityBytes {
+		return false, snapshot, nil
 	}
-	if bandStats.CapacityRequests > 0 && bandStats.Len+1 > bandStats.CapacityRequests {
-		return false, stats
+	if band.CapacityRequests > 0 && band.Len+1 > band.CapacityRequests {
+		return false, snapshot, nil
 	}
-
-	return true, stats
+	return true, snapshot, nil
 }
 
-// dispatchCycle attempts to dispatch a single item by iterating through priority bands from highest to lowest.
-// It applies the configured policies for each band to select an item and then attempts to dispatch it.
-// It returns true if an item was successfully dispatched, and false otherwise.
-// It enforces Head-of-Line (HoL) blocking if the selected item is saturated.
+// recordCapacityUtilization emits occupancy/effective-capacity ratio gauges per priority band (aggregated over every
+// flow in the band, never per flow queue), plus the all-bands rollup in its own metric family when a global capacity
+// is configured. It reads one CapacitySnapshot per configured band; the metric contract (names, labels, semantics)
+// is defined by #2102.
+//
+// Band capacities always resolve to a value (applyDefaults supplies a fallback), so every configured band reports.
+// Global capacity is optional, so its series is omitted when unset rather than reported as a misleading 0.
+func (p *Processor) recordCapacityUtilization() {
+	var global contracts.CapacityDimension
+	for _, priority := range p.registry.AllOrderedPriorityLevels() {
+		snapshot, err := p.registry.CapacitySnapshot(priority)
+		if err != nil {
+			// The band was deleted between listing the priority levels and the read.
+			continue
+		}
+		global = snapshot.Global
+
+		band := snapshot.Band
+		priorityStr := strconv.Itoa(priority)
+		if band.CapacityRequests > 0 {
+			metrics.RecordFlowControlCapacityUtilizationRequests(priorityStr, p.poolName,
+				float64(band.Len)/float64(band.CapacityRequests))
+		}
+		if band.CapacityBytes > 0 {
+			metrics.RecordFlowControlCapacityUtilizationBytes(priorityStr, p.poolName,
+				float64(band.ByteSize)/float64(band.CapacityBytes))
+		}
+	}
+
+	// All-bands rollup, only when a global capacity is configured.
+	if global.CapacityRequests > 0 {
+		metrics.RecordFlowControlGlobalCapacityUtilizationRequests(p.poolName,
+			float64(global.Len)/float64(global.CapacityRequests))
+	}
+	if global.CapacityBytes > 0 {
+		metrics.RecordFlowControlGlobalCapacityUtilizationBytes(p.poolName,
+			float64(global.ByteSize)/float64(global.CapacityBytes))
+	}
+}
+
+// dispatchCycle attempts to dispatch a single item by offering priority bands a dispatch opportunity in the
+// order chosen by the BandSelectionPolicy. It applies the configured policies for each band to select an item
+// and then attempts to dispatch it. It returns true if an item was successfully dispatched, and false
+// otherwise. It enforces Head-of-Line (HoL) blocking for bands the UsageLimitPolicy gates.
 //
 // # Work Conservation and Head-of-Line (HoL) Blocking
 //
 // The cycle attempts to be work-conserving by skipping bands where selection fails.
-// However, if a selected item is saturated (cannot be scheduled), the cycle stops immediately. This enforces HoL
-// blocking to respect the policy's decision and prevent priority inversion, where dispatching lower-priority work might
-// exacerbate the saturation affecting the high-priority item.
-func (sp *Processor) dispatchCycle(ctx context.Context) bool {
+// A band gated by its usage ceiling is skipped for the same reason: dispatching it would exacerbate the
+// saturation holding back higher-priority work. Ceilings are monotonically non-increasing across descending
+// priority, so gated bands form a contiguous tail and a skip under strict order only ever reaches further
+// gated bands.
+func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	dispatchCycleStart := time.Now()
 	defer func() {
 		metrics.RecordFlowControlDispatchCycleDuration(time.Since(dispatchCycleStart))
 	}()
 
-	pool := sp.endpointCandidates.Locate(ctx, nil)
-	sp.poolEmpty = len(pool) == 0
-	saturation := sp.saturationDetector.Saturation(ctx, pool)
+	pool := p.endpointCandidates.Locate(ctx, nil)
 
-	// Record pool saturation metric
-	metrics.RecordFlowControlPoolSaturation(sp.poolName, saturation)
+	// Run is the sole writer, so the load and the store cannot interleave with another write.
+	if empty := len(pool) == 0; empty != p.regime.Load().empty {
+		p.regime.Store(&regimeSample{empty: empty, since: p.clock.Now()})
+	}
 
-	priorities := sp.registry.AllOrderedPriorityLevels()
-	ceilings := sp.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities)
+	prefill, decode, interleaved := partitionEndpoints(pool)
 
-	for i, priority := range priorities {
-		// --- Viability Check (Saturation/HoL Blocking) ---
-		// Check before selecting an item: if we are already saturated for this priority, stop immediately.
-		usageLimit := ceilings[i]
-		if saturation >= usageLimit {
-			sp.logger.V(logutil.DEBUG).Info("Priority band is saturated; enforcing HoL blocking.",
-				"priority", priority, "saturation", saturation, "usageLimit", usageLimit)
-			// Stop the dispatch cycle entirely to respect strict policy decision and prevent priority inversion where
-			// lower-priority work might exacerbate the saturation affecting high-priority work.
-			return false
+	// Interleaved pods serve both stages, so they contribute capacity to both pools,
+	// mirroring how the scheduling filters route requests.
+	prefill = append(prefill, interleaved...)
+	decode = append(decode, interleaved...)
+
+	saturation := -1.0
+	for _, part := range []struct {
+		name      string
+		endpoints []fwkdl.Endpoint
+	}{
+		{flowcontrol.SaturationStagePrefill, prefill},
+		{flowcontrol.SaturationStageDecode, decode},
+	} {
+		if len(part.endpoints) == 0 {
+			metrics.DeleteFlowControlPoolSaturation(p.poolName, part.name)
+			metrics.DeleteFlowControlDetectorSaturationStage(part.name)
+			metrics.DeleteFlowControlStaleEndpointsStage(part.name)
+			continue
 		}
+		stageSat := p.saturationDetector.Saturation(flowcontrol.WithSaturationStage(ctx, part.name), part.endpoints)
+		metrics.RecordFlowControlPoolSaturation(p.poolName, part.name, stageSat)
+		if stageSat > saturation {
+			saturation = stageSat
+		}
+	}
+	if saturation < 0 {
+		saturation = p.saturationDetector.Saturation(ctx, pool)
+	} else {
+		// Drop series recorded by an earlier unpartitioned evaluation (e.g. an empty pool at startup).
+		metrics.DeleteFlowControlDetectorSaturationStage("")
+		metrics.DeleteFlowControlStaleEndpointsStage("")
+	}
 
-		originalBand, err := sp.registry.PriorityBandAccessor(priority)
-		if err != nil {
-			sp.logger.Error(err, "Failed to get PriorityBandAccessor, skipping band", "priority", priority)
+	metrics.RecordFlowControlPoolSaturation(p.poolName, "effective", saturation)
+
+	// Record capacity utilization ratios (the demand-side twin of saturation) from the same periodic sample.
+	p.recordCapacityUtilization()
+
+	priorities := p.registry.AllOrderedPriorityLevels()
+	ceilings := p.ceilingsBuffer(len(priorities))
+	p.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities, ceilings)
+
+	// --- Viability Check (Saturation/HoL Blocking) ---
+	// Ceilings are monotonically non-increasing per the UsageLimitPolicy contract, so the gated bands form a
+	// contiguous tail of priorities and the first of them marks the head-of-line break.
+	breakIdx := len(priorities)
+	for i := range priorities {
+		if saturation >= ceilings[i] {
+			breakIdx = i
+			break
+		}
+	}
+
+	order := p.orderBuffer(len(priorities))
+	p.bandSelectionPolicy.Rank(ctx, flowcontrol.BandSelectionParameters{
+		Saturation: saturation,
+		Priorities: priorities,
+		Ceilings:   ceilings,
+	}, order)
+
+	for _, i := range order {
+		priority := priorities[i]
+		// Gating is per band, so a gated band is skipped wherever it is ranked rather than ending the cycle.
+		if saturation >= ceilings[i] {
 			continue
 		}
 
-		item, err := sp.selectItem(ctx, originalBand)
+		originalBand, err := p.registry.PriorityBandAccessor(priority)
 		if err != nil {
-			sp.logger.Error(err, "Failed to select item, skipping priority band for this cycle",
+			p.logger.Error(err, "Failed to get PriorityBandAccessor, skipping band", "priority", priority)
+			continue
+		}
+
+		item, err := p.selectItem(ctx, originalBand)
+		if err != nil {
+			p.logger.Error(err, "Failed to select item, skipping priority band for this cycle",
 				"priority", priority)
 			continue // Continue to the next band to maximize work conservation.
 		}
@@ -400,22 +556,95 @@ func (sp *Processor) dispatchCycle(ctx context.Context) bool {
 
 		// --- Dispatch ---
 		req := item.OriginalRequest()
-		if err := sp.dispatchItem(item); err != nil {
-			sp.logger.Error(err, "Failed to dispatch item, skipping priority band for this cycle",
+		if err := p.dispatchItem(item); err != nil {
+			p.logger.Error(err, "Failed to dispatch item, skipping priority band for this cycle",
 				"flowKey", req.FlowKey(), "requestID", req.ID())
 			continue // Continue to the next band to maximize work conservation.
 		}
+		p.bandSelectionPolicy.RecordDispatch(ctx, priority)
 		return true
+	}
+
+	// The cycle dispatched nothing. When a band is gated, the break is where head-of-line blocking bit, and
+	// reclamation is evaluated there to recover capacity for the work it holds back.
+	if breakIdx < len(priorities) {
+		p.logger.V(logutil.DEBUG).Info("Priority band is saturated; enforcing HoL blocking.",
+			"priority", priorities[breakIdx], "saturation", saturation, "usageLimit", ceilings[breakIdx])
+		if p.reclamation != nil {
+			p.maybeReclaim(ctx, saturation, priorities, ceilings, breakIdx)
+		}
 	}
 	return false
 }
 
+// ceilingsBuffer returns the reusable ceilings buffer sized to n, every element reset to 1.0 (no
+// gating). Pre-filling guarantees that an entry the policy does not write fails open rather than
+// carrying a stale value from the previous cycle.
+func (p *Processor) ceilingsBuffer(n int) []float64 {
+	if cap(p.ceilings) < n {
+		p.ceilings = make([]float64, n)
+	}
+	buf := p.ceilings[:n]
+	for i := range buf {
+		buf[i] = 1.0
+	}
+	return buf
+}
+
+// orderBuffer returns the reusable band order buffer sized to n, reset to the identity permutation.
+// Pre-filling with strict highest-to-lowest order guarantees that a policy which writes nothing falls
+// back to strict dispatch rather than replaying the previous cycle's order.
+func (p *Processor) orderBuffer(n int) []int {
+	if cap(p.order) < n {
+		p.order = make([]int, n)
+	}
+	buf := p.order[:n]
+	for i := range buf {
+		buf[i] = i
+	}
+	return buf
+}
+
+// partitionEndpoints classifies endpoints into prefill, decode, and interleaved buckets
+// based on the llm-d.ai/role pod label. Endpoints without a role label or without metadata
+// default to the decode bucket, matching the decode-filter's allowsNoLabel convention for
+// monolithic deployment safety. Encode-only pods and unrecognized role values are excluded
+// from all buckets because they are rejected by every role filter and receive no traffic.
+func partitionEndpoints(endpoints []fwkdl.Endpoint) (prefill, decode, interleaved []fwkdl.Endpoint) {
+	for _, ep := range endpoints {
+		if ep == nil {
+			continue
+		}
+		meta := ep.GetMetadata()
+		if meta == nil || meta.Labels == nil {
+			decode = append(decode, ep)
+			continue
+		}
+		role := meta.Labels[bylabel.RoleLabel]
+		switch role {
+		case bylabel.RolePrefill, bylabel.RoleEncodePrefill:
+			prefill = append(prefill, ep)
+		case bylabel.RoleDecode, "":
+			decode = append(decode, ep)
+		case bylabel.RolePrefillDecode, bylabel.RoleEncodePrefillDecode:
+			interleaved = append(interleaved, ep)
+		case bylabel.RoleEncode:
+			// Encode-only pods receive no prefill or decode traffic; excluding them
+			// keeps both stage signals clean.
+		default:
+			// Unrecognized role values are rejected by every role filter and receive
+			// no traffic; counting them anywhere dilutes the stage signal.
+		}
+	}
+	return
+}
+
 // selectItem applies the configured fairness and ordering policies to select a single item.
-func (sp *Processor) selectItem(
+func (p *Processor) selectItem(
 	ctx context.Context,
 	flowGroup flowcontrol.PriorityBandAccessor,
 ) (flowcontrol.QueueItemAccessor, error) {
-	fairnessP, err := sp.registry.FairnessPolicy(flowGroup.Priority())
+	fairnessP, err := p.registry.FairnessPolicy(flowGroup.Priority())
 	if err != nil {
 		return nil, fmt.Errorf("could not get FairnessPolicy: %w", err)
 	}
@@ -433,10 +662,10 @@ func (sp *Processor) selectItem(
 }
 
 // dispatchItem handles the final steps of dispatching an item: removing it from the queue and finalizing its outcome.
-func (sp *Processor) dispatchItem(itemAcc flowcontrol.QueueItemAccessor) error {
+func (p *Processor) dispatchItem(itemAcc flowcontrol.QueueItemAccessor) error {
 	req := itemAcc.OriginalRequest()
 	key := req.FlowKey()
-	managedQ, err := sp.registry.ManagedQueue(key)
+	managedQ, err := p.registry.ManagedQueue(key)
 	if err != nil {
 		return fmt.Errorf("failed to get ManagedQueue for flow %s: %w", key, err)
 	}
@@ -445,26 +674,42 @@ func (sp *Processor) dispatchItem(itemAcc flowcontrol.QueueItemAccessor) error {
 	if err != nil {
 		// This happens benignly if the item was already removed by the cleanup sweep loop.
 		// We log it at a low level for visibility but return nil so the dispatch cycle proceeds.
-		sp.logger.V(logutil.DEBUG).Info("Failed to remove item during dispatch (likely already finalized and swept).",
-			"flowKey", key, "requestID", req.ID(), "error", err)
+		p.logger.V(logutil.DEBUG).Info("Failed to remove item during dispatch (likely already finalized and swept).",
+			"flowKey", key, "requestID", req.ID(), "err", err)
 		return nil
 	}
 
-	removedItem := removedItemAcc.(*FlowItem)
-	sp.logger.V(logutil.TRACE).Info("Item dispatched.", "flowKey", req.FlowKey(), "requestID", req.ID())
-	removedItem.FinalizeWithOutcome(types.QueueOutcomeDispatched, nil)
+	removedItem, ok := removedItemAcc.(*FlowItem)
+	if !ok {
+		// Nothing to finalize on an unknown type; surface the error so the cycle moves to the next band.
+		return fmt.Errorf("internal error: item %q for flow %s has unexpected type %T", req.ID(), key, removedItemAcc)
+	}
+	// The request can be finalized asynchronously while it is being removed. Do not create a
+	// reservation for work that will not proceed past flow control.
+	if removedItem.FinalState() != nil {
+		return nil
+	}
+
+	reservationTracker, tracksReservations := p.saturationDetector.(flowcontrol.DispatchReservationTracker)
+	reserved := tracksReservations && reservationTracker.ReserveDispatch(req.ID())
+	p.logger.V(logutil.TRACE).Info("Item dispatched.", "flowKey", req.FlowKey(), "requestID", req.ID())
+	removedItem.FinalizeWithError(nil)
+	if reserved && removedItem.FinalState().Outcome != types.QueueOutcomeDispatched {
+		reservationTracker.ReleaseDispatch(req.ID())
+	}
 	return nil
 }
 
 // runCleanupSweep starts a background goroutine that periodically scans all queues for externally finalized items
 // ("zombie" items) and removes them in batches.
-func (sp *Processor) runCleanupSweep(ctx context.Context) {
-	defer sp.wg.Done()
-	logger := sp.logger.WithName("runCleanupSweep")
-	logger.V(logutil.DEFAULT).Info("Shard cleanup sweep goroutine starting.")
-	defer logger.V(logutil.DEFAULT).Info("Shard cleanup sweep goroutine stopped.")
+func (p *Processor) runCleanupSweep(ctx context.Context) {
+	defer p.wg.Done()
+	logger := p.logger.WithName("runCleanupSweep")
+	defer utilruntime.HandleCrashWithLogger(logger)
+	logger.V(logutil.DEFAULT).Info("Cleanup sweep goroutine starting.")
+	defer logger.V(logutil.DEFAULT).Info("Cleanup sweep goroutine stopped.")
 
-	ticker := sp.clock.NewTicker(sp.cleanupSweepInterval)
+	ticker := p.clock.NewTicker(p.cleanupSweepInterval)
 	defer ticker.Stop()
 
 	for {
@@ -472,61 +717,129 @@ func (sp *Processor) runCleanupSweep(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C():
-			sp.sweepFinalizedItems()
+			p.sweepFinalizedItems()
+			p.flushDropSummary()
 		}
 	}
 }
 
-// sweepFinalizedItems performs a single scan of all queues, removing finalized items in batch and releasing their
-// memory.
-func (sp *Processor) sweepFinalizedItems() {
+// sweepFinalizedItems performs a single scan of all queues, evicting items that have exhausted the queue-wait budget in
+// force and removing finalized items in batch, releasing their memory.
+//
+// Expiry is evaluated here rather than at admission because the budget depends on the unavailability regime, which the
+// request outlives: a pool that scales from zero moves its queued requests from the no-endpoint budget onto the
+// saturation budget. The regime is sampled once per sweep so that every queue decides against the same view.
+func (p *Processor) sweepFinalizedItems() {
+	now := p.clock.Now()
+	regime := p.regime.Load()
+	expiryErr := expiryError(regime.empty)
+
 	processFn := func(managedQ contracts.ManagedQueue, logger logr.Logger) {
 		predicate := func(itemAcc flowcontrol.QueueItemAccessor) bool {
-			return itemAcc.(*FlowItem).FinalState() != nil
+			item, ok := itemAcc.(*FlowItem)
+			if !ok {
+				// Nothing to finalize on an unknown type; leave it for the queue that owns it.
+				return false
+			}
+			if item.FinalState() != nil {
+				return true
+			}
+			if !isExpired(item, now, regime, p.noEndpointRequestTTL) {
+				return false
+			}
+			// Finalizing here rather than in a separate pass keeps expiry to a single scan. Finalization is
+			// idempotent, and an item finalized but not removed is the same zombie state the sweep already
+			// tolerates, so a queue that declines the removal costs nothing beyond a later sweep.
+			item.FinalizeWithError(expiryErr)
+			logger.V(logutil.TRACE).Info("Evicted item, queue-wait budget exhausted.",
+				"requestID", item.OriginalRequest().ID(), "outcome", item.FinalState().Outcome,
+				"poolEmpty", regime.empty)
+			return true
 		}
 		removedItems := managedQ.Cleanup(predicate)
 		if len(removedItems) > 0 {
+			for _, itemAcc := range removedItems {
+				if fi, ok := itemAcc.(*FlowItem); ok && fi != nil && fi.FinalState() != nil {
+					p.recordDrop(fi.FinalState().Outcome)
+				}
+			}
 			logger.V(logutil.TRACE).Info("Swept finalized items and released capacity.",
 				"count", len(removedItems))
 		}
 	}
-	sp.processAllQueuesConcurrently("sweepFinalizedItems", processFn)
+	p.processAllQueuesConcurrently("sweepFinalizedItems", processFn)
+}
+
+// isExpired reports whether item has exhausted the queue-wait budget in force. A zero budget disables eviction in
+// that regime.
+//
+// Elapsed time is charged from the later of enqueue and the most recent regime change. Charging from enqueue alone
+// would shed a request the moment it becomes dispatchable: an endpoint appearing after the saturation budget has
+// nominally elapsed would find that budget already spent, even though the request has only now become servable. Each
+// regime change therefore starts its budget fresh.
+func isExpired(
+	item *FlowItem,
+	now time.Time,
+	regime *regimeSample,
+	noEndpointRequestTTL time.Duration,
+) bool {
+	budget := item.EffectiveTTL()
+	if regime.empty {
+		budget = noEndpointRequestTTL
+	}
+	if budget <= 0 {
+		return false
+	}
+
+	chargeFrom := item.EnqueueTime()
+	if regime.since.After(chargeFrom) {
+		chargeFrom = regime.since
+	}
+	return !now.Before(chargeFrom.Add(budget))
+}
+
+// expiryError builds the error accompanying an expiry eviction, wrapping the sentinels that callers match on. The
+// no-endpoint regime adds `types.ErrNoEndpoints` so the eviction classifies as genuine unavailability.
+func expiryError(poolEmpty bool) error {
+	if poolEmpty {
+		return fmt.Errorf("%w: %w: %w", types.ErrEvicted, types.ErrTTLExpired, types.ErrNoEndpoints)
+	}
+	return fmt.Errorf("%w: %w", types.ErrEvicted, types.ErrTTLExpired)
 }
 
 // shutdown handles the graceful termination of the processor, ensuring all pending items (in channel and queues) are
 // Finalized.
-func (sp *Processor) shutdown() {
-	sp.shutdownOnce.Do(func() {
-		sp.isShuttingDown.Store(true)
-		sp.logger.V(logutil.DEFAULT).Info("Shard processor shutting down.")
+func (p *Processor) shutdown() {
+	p.shutdownOnce.Do(func() {
+		p.isShuttingDown.Store(true)
+		p.logger.V(logutil.DEFAULT).Info("Processor shutting down.")
 
 	DrainLoop: // Drain the enqueueChan to finalize buffered items.
 		for {
 			select {
-			case item := <-sp.enqueueChan:
+			case item := <-p.enqueueChan:
 				if item == nil {
 					continue
 				}
 				// Finalize buffered items.
-				item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther,
-					fmt.Errorf("%w: %w", types.ErrRejected, types.ErrFlowControllerNotRunning))
+				p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, types.ErrFlowControllerNotRunning))
 			default:
 				break DrainLoop
 			}
 		}
 		// We do not close enqueueChan because external goroutines (Controller) send on it.
 		// The channel will be garbage collected when the processor terminates.
-		sp.evictAll()
+		p.evictAll()
+		p.flushDropSummary()
 	})
 }
 
-// evictAll drains all queues on the shard, finalizes every item, and releases their memory.
-func (sp *Processor) evictAll() {
+// evictAll drains all queues, finalizes every item, and releases their memory.
+func (p *Processor) evictAll() {
 	processFn := func(managedQ contracts.ManagedQueue, logger logr.Logger) {
 		key := managedQ.FlowQueueAccessor().FlowKey()
 		removedItems := managedQ.Drain()
 
-		outcome := types.QueueOutcomeEvictedOther
 		errShutdown := fmt.Errorf("%w: %w", types.ErrEvicted, types.ErrFlowControllerNotRunning)
 		for _, i := range removedItems {
 			item, ok := i.(*FlowItem)
@@ -536,21 +849,52 @@ func (sp *Processor) evictAll() {
 				continue
 			}
 
-			// Finalization is idempotent; safe to call even if already finalized externally.
 			// The per-request log is emitted by EnqueueAndWait when it unblocks.
-			item.FinalizeWithOutcome(outcome, errShutdown)
+			p.finalizeAndRecordDrop(item, errShutdown)
 		}
 	}
-	sp.processAllQueuesConcurrently("evictAll", processFn)
+	p.processAllQueuesConcurrently("evictAll", processFn)
 }
 
-// processAllQueuesConcurrently iterates over all queues in all priority bands on the shard and executes the given
+// finalizeAndRecordDrop finalizes item with err and counts the outcome actually stored. Finalization is idempotent
+// (sync.Once), so when the controller goroutine finalizes the same item concurrently (e.g. a TTL expiry racing the
+// processor's capacity rejection), the winner's outcome is the one counted.
+func (p *Processor) finalizeAndRecordDrop(item *FlowItem, err error) {
+	item.FinalizeWithError(err)
+	p.recordDrop(item.FinalState().Outcome)
+}
+
+func (p *Processor) recordDrop(outcome types.QueueOutcome) {
+	if outcome == types.QueueOutcomeDispatched {
+		return
+	}
+	p.dropCounts[outcome].Add(1)
+}
+
+func (p *Processor) flushDropSummary() {
+	var total uint64
+	counts := make(map[string]uint64)
+	for i := range p.dropCounts {
+		if c := p.dropCounts[i].Swap(0); c > 0 {
+			total += c
+			counts[types.QueueOutcome(i).String()] = c
+		}
+	}
+	if total > 0 {
+		p.logger.V(logutil.DEFAULT).Info("Flow control request drop summary",
+			"poolName", p.poolName,
+			"totalDropped", total,
+			"counts", counts)
+	}
+}
+
+// processAllQueuesConcurrently iterates over all queues in all priority bands and executes the given
 // `processFn` for each queue using a dynamically sized worker pool.
-func (sp *Processor) processAllQueuesConcurrently(
+func (p *Processor) processAllQueuesConcurrently(
 	ctxName string,
 	processFn func(mq contracts.ManagedQueue, logger logr.Logger),
 ) {
-	logger := sp.logger.WithName(ctxName)
+	logger := p.logger.WithName(ctxName)
 
 	type resolvedQueue struct {
 		mq     contracts.ManagedQueue
@@ -558,17 +902,17 @@ func (sp *Processor) processAllQueuesConcurrently(
 	}
 
 	// Phase 1: Collect all queues and resolve ManagedQueue handles in one pass.
-	// This avoids holding locks on the shard while processing, and allows us to determine the optimal number of workers.
+	// This avoids holding registry locks while processing, and allows us to determine the optimal number of workers.
 	var resolvedQueues []resolvedQueue
-	for _, priority := range sp.registry.AllOrderedPriorityLevels() {
-		band, err := sp.registry.PriorityBandAccessor(priority)
+	for _, priority := range p.registry.AllOrderedPriorityLevels() {
+		band, err := p.registry.PriorityBandAccessor(priority)
 		if err != nil {
 			logger.Error(err, "Failed to get PriorityBandAccessor", "priority", priority)
 			continue
 		}
 		band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
 			key := queue.FlowKey()
-			mq, err := sp.registry.ManagedQueue(key)
+			mq, err := p.registry.ManagedQueue(key)
 			if err != nil {
 				logger.V(logutil.DEBUG).Info("Skipping queue; ManagedQueue no longer resolvable",
 					"flowKey", key, "err", err)
@@ -598,6 +942,7 @@ func (sp *Processor) processAllQueuesConcurrently(
 	var wg sync.WaitGroup
 	for range numWorkers {
 		wg.Go(func() {
+			defer utilruntime.HandleCrashWithLogger(logger)
 			for task := range tasks {
 				processFn(task.mq, task.logger)
 			}

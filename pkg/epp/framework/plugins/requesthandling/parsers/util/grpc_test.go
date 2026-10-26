@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package grpcutil
+package parserutil
 
 import (
 	"encoding/binary"
@@ -65,6 +65,12 @@ func TestParseGrpcPayload(t *testing.T) {
 			}(),
 			want:    []byte("hello"),
 			wantErr: "",
+		},
+		{
+			name:    "length header overflows uint32",
+			data:    []byte{0, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB, 0xCC, 0xDD},
+			want:    nil,
+			wantErr: "incomplete gRPC payload: header indicates 4294967295 bytes, but only 4 bytes are available",
 		},
 	}
 

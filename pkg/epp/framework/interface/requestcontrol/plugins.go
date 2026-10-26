@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +27,8 @@ import (
 )
 
 const (
-	PreAdmissionExtensionPoint      = "PreAdmission"
+	RequestHeaderExtensionPoint     = "RequestHeader"
+	ScreenerExtensionPoint          = "Screener"
 	AdmissionExtensionPoint         = "Admission"
 	DataProducerExtensionPoint      = "DataProducer"
 	PreRequestExtensionPoint        = "PreRequest"
@@ -35,11 +37,39 @@ const (
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
 )
 
+// ConditionalDecodeHandledAttributeKey is the request-attribute key a
+// PreRequest plugin sets when it has evaluated the "Prefer: if-available"
+// preference for a request. The director consults this after PreRequest
+// plugins run: a conditional-decode request that no plugin claimed is
+// rejected with 412 so misconfigurations (gate plugin forgotten) surface as a
+// fast fallback rather than a silent forward.
+var ConditionalDecodeHandledAttributeKey = plugin.NewDataKey("conditional-decode.handled", "")
+
+// Screener performs preliminary filtering of located endpoints before data
+// production, admission, and scheduling profiles run. Every screener sees the
+// same input set, and the framework intersects their results.
+type Screener interface {
+	plugin.Plugin
+	Screen(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint
+}
+
 // PreRequest is called by the director after a getting result from scheduling layer and
 // before a request is sent to the selected model server.
+// A non-nil error indicates the plugin could not complete its work; the director runs
+// every registered PreRequest plugin and aggregates their errors before failing the request.
+//
+// Return a github.com/llm-d/llm-d-router/pkg/common/error.Error so the director can map
+// the failure to the intended HTTP status; any other error type is reported to the client
+// as an Internal error.
+//
+// Every registered plugin runs even when a peer has already failed the request, so any
+// side effect published here outlives the failure. Plugins must ensure such state is
+// cleaned up by HandleResponseBody, which the director invokes on abort for every
+// request that picked a pod but never marked the response complete. Otherwise the
+// plugin must not have side effects at this extension point.
 type PreRequest interface {
 	plugin.Plugin
-	PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult)
+	PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error
 }
 
 // ResponseHeaderProcessor is called by the director after the response headers are successfully received
@@ -59,10 +89,12 @@ type ResponseHeaderProcessor interface {
 //   - For non-streaming: Invoked once with response.EndOfStream set to true.
 //   - Plugins must treat the call where response.EndOfStream == true as the final lifecycle hook
 //     to perform cleanup or final logging.
+//   - The end-of-stream call carries response.TerminationCause; earlier calls leave it empty.
 //
 // TODO(https://github.com/kubernetes-sigs/gateway-api-inference-extension/issues/2079):
-// Update signature to pass error/termination state. This is a breaking change required for plugins to distinguish
-// between success, errors, and disconnects.
+// Upstream proposes passing error/termination state through the signature. Response.TerminationCause
+// carries the termination state without a signature change; it does not distinguish success from
+// an error response.
 type ResponseBodyProcessor interface {
 	plugin.Plugin
 	ResponseBody(ctx context.Context, request *fwksched.InferenceRequest, response *Response, targetEndpoint *datalayer.EndpointMetadata)
@@ -92,9 +124,40 @@ type Admitter interface {
 	Admit(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error
 }
 
-// PreAdmitter runs after InferenceRequest creation but before admission control.
-// It can mutate InferenceRequest fields such as FairnessID and Headers.
-type PreAdmitter interface {
+// RequestHeaderProcessor runs after InferenceRequest creation but before admission control.
+// It processes request metadata (headers, path, method) to attach attributes to the request
+// via request.PutAttribute().
+type RequestHeaderProcessor interface {
 	plugin.Plugin
-	PreAdmit(ctx context.Context, request *fwksched.InferenceRequest) error
+	RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error
+}
+
+// RequestLine identifies a request before any endpoint has been selected. It carries what
+// the ext-proc request headers phase provides, which is all a Responder can rely on: a
+// request answered here may have no body.
+type RequestLine struct {
+	Method string
+	// Path excludes the query string.
+	Path string
+}
+
+// LocalResponse is a complete HTTP response produced by a Responder.
+type LocalResponse struct {
+	// StatusCode is the HTTP status code. Zero means http.StatusOK.
+	StatusCode int
+	Headers    map[string]string
+	Body       []byte
+}
+
+// Responder answers a request before it is matched to a model server. The first non-nil
+// response wins. Responders are asked in the order of the slice supplied to the handler.
+// The order in which plugins are discovered is not guaranteed. The handler offers only GET
+// requests to responders.
+type Responder interface {
+	plugin.Plugin
+	// Respond returns a non-nil LocalResponse to answer the request directly; the request
+	// is never routed and no endpoint is selected. Return nil to decline, deferring to the
+	// remaining Responders and to normal routing once all decline. A non-nil error fails
+	// the request through the standard error path.
+	Respond(ctx context.Context, request *RequestLine, endpoints []datalayer.Endpoint) (*LocalResponse, error)
 }

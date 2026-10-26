@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +18,7 @@ limitations under the License.
 package requesthandling
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,30 +26,34 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
 	"google.golang.org/protobuf/proto"
 )
 
 const nilStr = "<nil>"
 
-// Modality identifies the type of multimodal content in a prompt.
-type Modality string
-
-// Modality values match the model-server's multimodal hash keys so labels agree
-// across backends.
-const (
-	ModalityImage Modality = "image"
-	ModalityAudio Modality = "audio"
-	ModalityVideo Modality = "video"
-)
-
 // RequestPayload represents a strongly-typed unmarshaled request payload or raw bytes.
 type RequestPayload interface {
 	isRequestPayload()
 	IsParsed() bool
-	// AsMap returns the parsed JSON map
+	// AsMap returns the JSON envelope. Content may be opaque json.RawMessage;
+	// use the protocol projections to inspect it.
 	AsMap() (PayloadMap, bool)
+}
+
+// Marshaler is implemented by payloads that serialize themselves back to the bytes
+// forwarded downstream. Payloads that do not are forwarded unchanged.
+type Marshaler interface {
+	Marshal() ([]byte, error)
+}
+
+// MarshalablePayload is a RequestPayload that can serialize itself back to bytes.
+// Only such payloads are worth mutating, since only they are re-marshaled on repackage.
+type MarshalablePayload interface {
+	RequestPayload
+	Marshaler
 }
 
 // PayloadMap represents a JSON request body unmarshaled into a map.
@@ -56,6 +62,7 @@ type PayloadMap map[string]any
 func (p PayloadMap) isRequestPayload()         {}
 func (p PayloadMap) IsParsed() bool            { return true }
 func (p PayloadMap) AsMap() (PayloadMap, bool) { return p, p != nil }
+func (p PayloadMap) Marshal() ([]byte, error)  { return json.Marshal(map[string]any(p)) }
 
 // PayloadProto represents a gRPC request body unmarshaled into a proto.Message.
 type PayloadProto struct {
@@ -75,7 +82,8 @@ func (RawPayload) AsMap() (PayloadMap, bool) { return nil, false }
 
 // InferenceRequestBody contains the request-body fields that we parse out as user input,
 // to be used in forming scheduling decisions.
-// An InferenceRequestBody must contain exactly one of CompletionsRequest, ChatCompletionsRequest, ResponsesRequest, ConversationsRequest, EmbeddingsRequest, GenerateRequest, or MessagesRequest.
+// An InferenceRequestBody must contain exactly one of CompletionsRequest, ChatCompletionsRequest, ResponsesRequest,
+// TextToSpeechRequest, ConversationsRequest, EmbeddingsRequest, GenerateRequest, ImagesGenerationsRequest, or MessagesRequest.
 type InferenceRequestBody struct {
 	// CompletionsRequest is the representation of the OpenAI /v1/completions request body.
 	Completions *CompletionsRequest `json:"completions,omitempty"`
@@ -85,19 +93,31 @@ type InferenceRequestBody struct {
 	Messages *MessagesRequest `json:"messages,omitempty"`
 	// ResponsesRequest is the representation of the OpenAI /v1/responses request body.
 	Responses *ResponsesRequest `json:"responses,omitempty"`
+	// TextToSpeechRequest is the representation of the OpenAI /v1/audio/speech request body.
+	TextToSpeech *TextToSpeechRequest `json:"text_to_speech,omitempty"`
 	// ConversationsRequest is the representation of the OpenAI /v1/conversations request body.
 	Conversations *ConversationsRequest `json:"conversations,omitempty"`
 	// EmbeddingsRequest is the representation of the OpenAI /v1/embeddings request body.
 	Embeddings *EmbeddingsRequest `json:"embeddings,omitempty"`
-	// GenerateRequest is the representation of the vLLM /inference/v1/generate request body.
+	// Generate holds pre-tokenized input for native generate endpoints
+	// (vLLM /inference/v1/generate and SGLang /generate).
 	Generate *GenerateRequest `json:"generate,omitempty"`
+	// ImagesGenerationsRequest is the representation of the OpenAI /v1/images/generations
+	// or /v1/images/edits request body.
+	Images *ImagesGenerationsRequest `json:"images,omitempty"`
 	// Payload contains the unmarshaled request payload or raw bytes.
 	// If the payload is unmarshaled, we can perform advanced processing (like prefix cache aware routing).
 	// If it remains as raw bytes, such processing may not be supported.
 	Payload RequestPayload `json:"-"`
-	// TokenizedPrompt contains parser-derived tokenization results when available.
+	// RawBody retains the parser's JSON input for rendering: handlers.Request.RawBody
+	// for HTTP, or embedded HttpBody.Data for Vertex AI. Repackaging updates the
+	// handler body while this snapshot remains unchanged.
+	RawBody []byte `json:"-"`
+	// RenderRequest bypasses token production while retaining model routing.
+	RenderRequest bool `json:"-"`
+	// TokenizedRequest contains parser-derived tokenization results when available.
 	// It is nil when the request was not already tokenized.
-	TokenizedPrompt *TokenizedPrompt `json:"-"`
+	TokenizedRequest *TokenizedRequest `json:"-"`
 
 	// Stream indicates whether the request specifies a streaming response (e.g., via a stream field).
 	// This typically implies the model server's response will be streamed.
@@ -109,16 +129,47 @@ type InferenceRequestBody struct {
 	// It is nil when the client did not specify a cap. Consumers such as output
 	// token estimators use it as an upper bound. Derived, not round-tripped.
 	MaxOutputTokens *int64 `json:"-"`
+
+	// Model is the incoming client-facing model name extracted by the parser, empty
+	// if absent. Not round-tripped; the forwarded model lives in Payload.
+	Model string `json:"-"`
+
+	// Mutated marks that Payload's content has changed since the parser produced it, so
+	// repackage knows it must re-serialize instead of forwarding the original bytes. Callers
+	// that replace or edit Payload after parsing (e.g. a model-name rewrite) must set this to
+	// true themselves; it is not inferred or enforced -- see MutatePayloadMap for the one
+	// in-place-edit case the codebase needs today.
+	Mutated bool
+}
+
+// WirePayload is the body used for both rendering and forwarding.
+func (b *InferenceRequestBody) WirePayload() RequestPayload {
+	if !b.Mutated && b.RawBody != nil {
+		return RawPayload(b.RawBody)
+	}
+	return b.Payload
+}
+
+// MutatePayloadMap edits Payload in place via fn when Payload is a PayloadMap, and marks the
+// body Mutated in the same call so the two can't be separated by an omitted follow-up write.
+// No-op (Mutated left untouched) when Payload is not a PayloadMap.
+func (b *InferenceRequestBody) MutatePayloadMap(fn func(PayloadMap)) {
+	m, ok := b.Payload.(PayloadMap)
+	if !ok {
+		return
+	}
+	fn(m)
+	b.Mutated = true
 }
 
 // MaxOutputTokensFromPayload returns the client-requested output-token cap read
 // from a decoded JSON request body. The keys are tried in order and the first one
 // holding a valid value wins, so callers express per-API precedence (e.g. chat
 // completions: max_completion_tokens then the legacy max_tokens). JSON numbers
-// decode as float64; json.Number is also accepted. A present key whose value is
-// the wrong type, negative, or non-integral is treated as absent and the next key
-// is tried. An explicit non-negative whole number (including 0) is returned; if no
-// key holds a valid value the result is nil ("no cap").
+// may decode as float64 or json.Number; both are accepted. A present key whose
+// value is the wrong type, negative, or non-integral is treated as absent and the
+// next key is tried. An explicit non-negative whole number (including 0) is
+// returned; if no key holds a valid value the result is nil ("no cap").
 func MaxOutputTokensFromPayload(m PayloadMap, keys ...string) *int64 {
 	for _, k := range keys {
 		v, ok := m[k]
@@ -148,62 +199,99 @@ func MaxOutputTokensFromPayload(m PayloadMap, keys ...string) *int64 {
 	return nil
 }
 
-// TokenizedPrompt contains the result of tokenizing the request prompt.
+// BytesPerToken is the average number of request bytes per prompt token, used
+// to estimate token counts without a tokenizer. The tokenizer's estimate
+// backend packs this many bytes into each pseudo-token, so its counts agree
+// with byte-based estimates.
+const BytesPerToken = 4
+
+// TokenizedRequest contains the result of tokenizing the request prompt.
 // It is consumed by scheduling and request-control plugins that benefit from
 // actual token data such as prefix-cache awareness.
-type TokenizedPrompt struct {
-	// PerPromptTokens holds the token IDs for each prompt in the request.
-	// Single-prompt requests (chat, generate, single-string completions) use a
-	// length-1 outer slice. Multi-string completions use one inner slice per
-	// prompt string.
-	PerPromptTokens [][]uint32
-	// MultiModalFeatures holds one entry per multimodal item in prompt order.
-	// Nil if the prompt contains no multimodal content. Offsets are relative
-	// to PerPromptTokens[0] (always single-prompt when multimodal content is
-	// present).
-	MultiModalFeatures []MultiModalFeature
+type TokenizedRequest struct {
+	// Prompts holds the per-prompt token data. Single-prompt requests (chat,
+	// generate, single-string completions) use a length-1 slice. Multi-string
+	// completions use one entry per prompt string.
+	Prompts []PromptTokens
 	// CacheSalt isolates prefix caches across requests. Populated by the token-producer.
 	CacheSalt string
 }
 
+// PromptTokens bundles the token IDs and multimodal features for a single
+// prompt in the request.
+type PromptTokens struct {
+	// TokenIDs holds the token IDs for this prompt.
+	TokenIDs []uint32
+	// MultiModalFeatures holds multimodal items for this prompt, ordered by
+	// token position. Nil if the prompt contains no multimodal content.
+	MultiModalFeatures []MultiModalFeature
+}
+
+// NewTokenizedRequest builds one PromptTokens entry per token-ID array.
+func NewTokenizedRequest(arrays [][]uint32) *TokenizedRequest {
+	prompts := make([]PromptTokens, len(arrays))
+	for i, ids := range arrays {
+		prompts[i] = PromptTokens{TokenIDs: ids}
+	}
+	return &TokenizedRequest{Prompts: prompts}
+}
+
 // TokenCount returns the total number of tokens across all prompts.
-func (tp *TokenizedPrompt) TokenCount() int {
+func (tp *TokenizedRequest) TokenCount() int {
 	if tp == nil {
 		return 0
 	}
 	n := 0
-	for _, pp := range tp.PerPromptTokens {
-		n += len(pp)
+	for _, p := range tp.Prompts {
+		n += len(p.TokenIDs)
 	}
 	return n
 }
 
 // MultiModalFeature holds all data needed for prefix-cache scoring of a single
 // multimodal item. Items are ordered by token position within the prompt.
-// Currently only ModalityImage is supported.
+// Currently only reqcommon.ModalityImage is supported.
 type MultiModalFeature struct {
 	// Modality identifies the type of content.
-	Modality Modality
+	Modality reqcommon.Modality
 	// Hash is the content hash of the item, used for KV-cache reuse across requests.
 	Hash string
-	// Offset is the index of the first placeholder token for this item in TokenIDs.
+	// Offset is the index of the first placeholder token for this item
+	// in the owning PromptTokens.TokenIDs slice.
 	Offset int
-	// Length is the number of placeholder tokens this item occupies in TokenIDs.
+	// Length is the number of placeholder tokens this item occupies.
 	Length int
 }
 
 // Prompt represents the prompt field in a /v1/completions request.
-// Per the OpenAI spec it can be a string or an array of strings.
+// Per the OpenAI spec it can be a string, an array of strings, an array of
+// integers (token IDs), or an array of arrays of integers (multiple prompts
+// as token IDs).
 // See https://platform.openai.com/docs/api-reference/completions/create#completions-create-prompt
 type Prompt struct {
 	Raw      string
 	Strings  []string
-	TokenIDs []uint32
+	TokenIDs [][]uint32
 }
 
 type arrayInputResult struct {
 	Strings  []string
-	TokenIDs []uint32
+	TokenIDs [][]uint32
+}
+
+func parseTokenIDs(v []any, errorPrefix string) ([]uint32, error) {
+	ids := make([]uint32, len(v))
+	for i, val := range v {
+		flt, ok := val.(float64)
+		if !ok {
+			return nil, fmt.Errorf("%s: mixed types in array", errorPrefix)
+		}
+		if flt != float64(uint32(flt)) {
+			return nil, fmt.Errorf("%s: floating-point number %f is not a valid token ID", errorPrefix, flt)
+		}
+		ids[i] = uint32(flt)
+	}
+	return ids, nil
 }
 
 func parseArrayInput(v []any, errorPrefix string) (arrayInputResult, error) {
@@ -222,24 +310,40 @@ func parseArrayInput(v []any, errorPrefix string) (arrayInputResult, error) {
 		}
 		return arrayInputResult{Strings: strings}, nil
 	case float64:
-		uint32s := make([]uint32, len(v))
-		for i, val := range v {
-			flt, ok := val.(float64)
+		ids, err := parseTokenIDs(v, errorPrefix)
+		if err != nil {
+			return arrayInputResult{}, err
+		}
+		return arrayInputResult{TokenIDs: [][]uint32{ids}}, nil
+	case []any:
+		arrays := make([][]uint32, len(v))
+		for i, elem := range v {
+			inner, ok := elem.([]any)
 			if !ok {
 				return arrayInputResult{}, fmt.Errorf("%s: mixed types in array", errorPrefix)
 			}
-			if flt != float64(uint32(flt)) {
-				return arrayInputResult{}, fmt.Errorf("%s: floating-point number %f is not a valid token ID", errorPrefix, flt)
+			if len(inner) == 0 {
+				return arrayInputResult{}, fmt.Errorf("%s: empty sub-array at index %d", errorPrefix, i)
 			}
-			uint32s[i] = uint32(flt)
+			ids, err := parseTokenIDs(inner, errorPrefix)
+			if err != nil {
+				return arrayInputResult{}, err
+			}
+			arrays[i] = ids
 		}
-		return arrayInputResult{TokenIDs: uint32s}, nil
+		return arrayInputResult{TokenIDs: arrays}, nil
 	default:
 		return arrayInputResult{}, fmt.Errorf("%s: unsupported array element type", errorPrefix)
 	}
 }
 
 func (p *Prompt) UnmarshalJSON(data []byte) error {
+	if tokenIDs, ok := parseCanonicalTokenIDArrays(data); ok {
+		p.Strings = nil
+		p.TokenIDs = tokenIDs
+		return nil
+	}
+
 	var raw any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -264,7 +368,11 @@ func (p *Prompt) UnmarshalJSON(data []byte) error {
 
 func (p Prompt) TokenCountHint() int {
 	if len(p.TokenIDs) > 0 {
-		return len(p.TokenIDs)
+		n := 0
+		for _, ids := range p.TokenIDs {
+			n += len(ids)
+		}
+		return n
 	}
 	return -1
 }
@@ -275,6 +383,9 @@ func (p Prompt) MarshalJSON() ([]byte, error) {
 	}
 	if p.Strings != nil {
 		return json.Marshal(p.Strings)
+	}
+	if p.TokenIDs != nil {
+		return json.Marshal(p.TokenIDs)
 	}
 	return json.Marshal("")
 }
@@ -295,7 +406,7 @@ func (p Prompt) IsEmpty() bool {
 // This struct includes fields usable for plugins and scheduling decisions - and not the entire
 // API spec.
 type CompletionsRequest struct {
-	// Prompt is the prompt(s) sent in the request body; can be a string or an array of strings.
+	// Prompt is the prompt(s) sent in the request body.
 	Prompt Prompt `json:"prompt"`
 	// CacheSalt is an optional request parameter to isolate prefix caches for security reasons.
 	CacheSalt string `json:"cache_salt,omitempty"`
@@ -359,6 +470,19 @@ func (r *ResponsesRequest) String() string {
 	return fmt.Sprintf("{InputType: %T, InstructionsType: %T}", r.Input, r.Instructions)
 }
 
+// TextToSpeechRequest represents the fields parsed from an OpenAI /v1/audio/speech request.
+type TextToSpeechRequest struct {
+	// Input is the text to synthesize.
+	Input string `json:"input"`
+}
+
+func (r *TextToSpeechRequest) String() string {
+	if r == nil {
+		return nilStr
+	}
+	return fmt.Sprintf("{InputLength: %d}", len(r.Input))
+}
+
 // ConversationsRequest represents the OpenAI /v1/conversations request body structure
 type ConversationsRequest struct {
 	// Items is the array of conversation items (messages, files, etc.)
@@ -377,14 +501,21 @@ func (c *ConversationsRequest) String() string {
 }
 
 // EmbeddingsInput represents the input field in a /v1/embeddings request.
-// Per the OpenAI spec it can be a string, an array of strings, or an array of integers.
+// Per the OpenAI spec it can be a string, an array of strings, an array of
+// integers (token IDs), or an array of arrays of integers.
 type EmbeddingsInput struct {
 	Raw      string
 	Strings  []string
-	TokenIDs []uint32
+	TokenIDs [][]uint32
 }
 
 func (e *EmbeddingsInput) UnmarshalJSON(data []byte) error {
+	if tokenIDs, ok := parseCanonicalTokenIDArrays(data); ok {
+		e.Strings = nil
+		e.TokenIDs = tokenIDs
+		return nil
+	}
+
 	var raw any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -409,7 +540,11 @@ func (e *EmbeddingsInput) UnmarshalJSON(data []byte) error {
 
 func (e EmbeddingsInput) TokenCountHint() int {
 	if len(e.TokenIDs) > 0 {
-		return len(e.TokenIDs)
+		n := 0
+		for _, ids := range e.TokenIDs {
+			n += len(ids)
+		}
+		return n
 	}
 	return -1
 }
@@ -441,19 +576,75 @@ func (e *EmbeddingsRequest) String() string {
 	return fmt.Sprintf("{InputType: %T}", e.Input)
 }
 
-// GenerateRequest is a structured representation of the fields we parse out of the vLLM
-// request at /inference/v1/generate.
-// Unlike the OpenAI-compatible endpoints, this API accepts pre-tokenized input (token IDs).
+// ImagesGenerationsRequest represents the OpenAI /v1/images/generations and /v1/images/edits request body
+// structure.
+type ImagesGenerationsRequest struct {
+	// Prompt is the text description of the desired image(s).
+	Prompt string `json:"prompt"`
+	// N is the number of images to generate. Nil means the server default (1).
+	N *int64 `json:"n,omitempty"`
+	// Size is the requested image size as "WIDTHxHEIGHT" (e.g. "1024x1024").
+	Size string `json:"size,omitempty"`
+	// NumInferenceSteps is the number of denoising steps. Nil means the server default.
+	NumInferenceSteps *int64 `json:"num_inference_steps,omitempty"`
+}
+
+func (i *ImagesGenerationsRequest) String() string {
+	if i == nil {
+		return nilStr
+	}
+	return fmt.Sprintf("{PromptLength: %d, Size: %s, N: %v, NumInferenceSteps: %v}",
+		len(i.Prompt), i.Size, i.N, i.NumInferenceSteps)
+}
+
+// GenerateRequest holds pre-tokenized input for native generate endpoints
+// (vLLM /inference/v1/generate and SGLang /generate). Unlike OpenAI-compatible
+// endpoints, these APIs accept pre-tokenized input (token IDs).
 // This struct includes fields usable for plugins and scheduling decisions.
 type GenerateRequest struct {
 	// TokenIDs are the pre-tokenized input token IDs.
-	TokenIDs []uint32 `json:"token_ids"`
+	TokenIDs []uint32 `json:"token_ids,omitempty"`
+	// Text is the prompt text when pre-tokenized token IDs are not provided.
+	Text string `json:"text,omitempty"`
 	// Features carries multimodal metadata (per-modality content hashes and
 	// placeholder ranges) parsed out of the wire `features` block. Populated
 	// by UnmarshalJSON; not itself a JSON-tagged field.
 	Features *tokenization.MultiModalFeatures `json:"-"`
 	// CacheSalt is an optional request parameter to isolate prefix caches for security reasons.
 	CacheSalt string `json:"cache_salt,omitempty"`
+}
+
+type wirePlaceholder struct {
+	Offset int `json:"offset"`
+	Length int `json:"length"`
+}
+
+type wireFeatures struct {
+	MMHashes       map[string][]string          `json:"mm_hashes"`
+	MMPlaceholders map[string][]wirePlaceholder `json:"mm_placeholders"`
+}
+
+var errNonCanonicalTokenIDs = errors.New("non-canonical token IDs")
+
+type generateRequestCanonicalTokenIDs struct {
+	Values []uint32
+	Seen   bool
+}
+
+func (t *generateRequestCanonicalTokenIDs) UnmarshalJSON(data []byte) error {
+	t.Seen = true
+	tokenIDs, ok := ParseCanonicalTokenIDs(data)
+	if !ok {
+		return errNonCanonicalTokenIDs
+	}
+	t.Values = tokenIDs
+	return nil
+}
+
+type generateRequestFastWire struct {
+	TokenIDs  generateRequestCanonicalTokenIDs `json:"token_ids"`
+	CacheSalt string                           `json:"cache_salt,omitempty"`
+	Features  *wireFeatures                    `json:"features,omitempty"`
 }
 
 func (r *GenerateRequest) String() string {
@@ -482,17 +673,21 @@ func (r *GenerateRequest) String() string {
 }
 
 func (r *GenerateRequest) UnmarshalJSON(data []byte) error {
-	type wirePlaceholder struct {
-		Offset int `json:"offset"`
-		Length int `json:"length"`
+	var raw generateRequestFastWire
+	if err := json.Unmarshal(data, &raw); err == nil && raw.TokenIDs.Seen {
+		r.CacheSalt = raw.CacheSalt
+		r.TokenIDs = raw.TokenIDs.Values
+		r.setGenerateRequestFeatures(raw.Features)
+		return nil
 	}
+	return r.unmarshalJSONFallback(data)
+}
+
+func (r *GenerateRequest) unmarshalJSONFallback(data []byte) error {
 	var raw struct {
-		TokenIDs  []float64 `json:"token_ids"`
-		CacheSalt string    `json:"cache_salt,omitempty"`
-		Features  *struct {
-			MMHashes       map[string][]string          `json:"mm_hashes"`
-			MMPlaceholders map[string][]wirePlaceholder `json:"mm_placeholders"`
-		} `json:"features,omitempty"`
+		TokenIDs  []float64     `json:"token_ids"`
+		CacheSalt string        `json:"cache_salt,omitempty"`
+		Features  *wireFeatures `json:"features,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -505,21 +700,26 @@ func (r *GenerateRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.TokenIDs[i] = uint32(v)
 	}
-	if raw.Features != nil {
-		ranges := make(map[string][]kvblock.PlaceholderRange, len(raw.Features.MMPlaceholders))
-		for modality, ws := range raw.Features.MMPlaceholders {
-			out := make([]kvblock.PlaceholderRange, len(ws))
-			for i, w := range ws {
-				out[i] = kvblock.PlaceholderRange{Offset: w.Offset, Length: w.Length}
-			}
-			ranges[modality] = out
-		}
-		r.Features = &tokenization.MultiModalFeatures{
-			MMHashes:       raw.Features.MMHashes,
-			MMPlaceholders: ranges,
-		}
-	}
+	r.setGenerateRequestFeatures(raw.Features)
 	return nil
+}
+
+func (r *GenerateRequest) setGenerateRequestFeatures(features *wireFeatures) {
+	if features == nil {
+		return
+	}
+	ranges := make(map[string][]kvblock.PlaceholderRange, len(features.MMPlaceholders))
+	for modality, placeholders := range features.MMPlaceholders {
+		out := make([]kvblock.PlaceholderRange, len(placeholders))
+		for i, placeholder := range placeholders {
+			out[i] = kvblock.PlaceholderRange{Offset: placeholder.Offset, Length: placeholder.Length}
+		}
+		ranges[modality] = out
+	}
+	r.Features = &tokenization.MultiModalFeatures{
+		MMHashes:       features.MMHashes,
+		MMPlaceholders: ranges,
+	}
 }
 
 // ConversationItem represents a single item in a conversation
@@ -548,14 +748,19 @@ type Content struct {
 }
 
 type ContentBlock struct {
-	Type       string     `json:"type"`
-	Text       string     `json:"text,omitempty"`
-	ImageURL   ImageBlock `json:"image_url"`
-	InputAudio AudioBlock `json:"input_audio"`
-	VideoURL   VideoBlock `json:"video_url"`
+	Type       string        `json:"type"`
+	Text       string        `json:"text,omitempty"`
+	ImageURL   ImageBlock    `json:"image_url"`
+	AudioURL   AudioURLBlock `json:"audio_url"`
+	InputAudio AudioBlock    `json:"input_audio"`
+	VideoURL   VideoBlock    `json:"video_url"`
 }
 
 type ImageBlock struct {
+	URL string `json:"url,omitempty"`
+}
+
+type AudioURLBlock struct {
 	URL string `json:"url,omitempty"`
 }
 
@@ -568,23 +773,25 @@ type VideoBlock struct {
 	URL string `json:"url,omitempty"`
 }
 
-// UnmarshalJSON allow use both format
+// UnmarshalJSON accepts either a string or an array of content blocks. The first
+// byte selects the format because each json.Unmarshal rescans the whole value,
+// which is costly for content blocks carrying base64 media.
 func (mc *Content) UnmarshalJSON(data []byte) error {
-	// Raw format
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		mc.Raw = str
-		return nil
-	}
-
-	// Block format
-	var blocks []ContentBlock
-	if err := json.Unmarshal(data, &blocks); err == nil {
+	if trimmed := bytes.TrimLeft(data, " \t\r\n"); len(trimmed) > 0 && trimmed[0] == '[' {
+		var blocks []ContentBlock
+		if err := json.Unmarshal(data, &blocks); err != nil {
+			return errors.New("content format not supported")
+		}
 		mc.Structured = blocks
 		return nil
 	}
 
-	return errors.New("content format not supported")
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return errors.New("content format not supported")
+	}
+	mc.Raw = str
+	return nil
 }
 
 func (mc Content) MarshalJSON() ([]byte, error) {
@@ -620,6 +827,8 @@ type Usage struct {
 }
 
 type PromptTokenDetails struct {
+	// CachedTokens is the prompt-cache read count, counted inside PromptTokens
+	// rather than added to it.
 	CachedTokens int `json:"cached_tokens"`
 }
 
@@ -634,9 +843,19 @@ type MessagesRequest struct {
 	// not a message with role "system".
 	System AnthropicContent `json:"system,omitempty"`
 	// Tools field for tool use capabilities.
-	Tools []any `json:"tools,omitempty"`
+	Tools []AnthropicTool `json:"tools,omitempty"`
 	// CacheSalt isolates prefix caches for security.
 	CacheSalt string `json:"cache_salt,omitempty"`
+}
+
+// AnthropicTool is a tool definition in the Anthropic schema. InputSchema keeps
+// the raw JSON bytes so the wire key order survives downstream re-serialization.
+type AnthropicTool struct {
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+	Strict       *bool           `json:"strict,omitempty"`
+	DeferLoading *bool           `json:"defer_loading,omitempty"`
 }
 
 func (r *MessagesRequest) String() string {
@@ -662,20 +881,24 @@ type AnthropicContent struct {
 	Structured []AnthropicContentBlock
 }
 
+// UnmarshalJSON accepts either a string or an array of content blocks. The first
+// byte selects the format, as in Content.UnmarshalJSON. A malformed block returns
+// its own decode error unwrapped, so nested content does not repeat a prefix.
 func (ac *AnthropicContent) UnmarshalJSON(data []byte) error {
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		ac.Raw = str
-		return nil
-	}
-
-	var blocks []AnthropicContentBlock
-	if err := json.Unmarshal(data, &blocks); err == nil {
+	if trimmed := bytes.TrimLeft(data, " \t\r\n"); len(trimmed) > 0 && trimmed[0] == '[' {
+		var blocks []AnthropicContentBlock
+		if err := json.Unmarshal(data, &blocks); err != nil {
+			return err
+		}
 		ac.Structured = blocks
 		return nil
 	}
-
-	return errors.New("anthropic content: must be a string or an array of content blocks")
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return errors.New("anthropic content: must be a string or an array of content blocks")
+	}
+	ac.Raw = str
+	return nil
 }
 
 func (ac AnthropicContent) MarshalJSON() ([]byte, error) {
@@ -701,11 +924,30 @@ func (ac AnthropicContent) textLen() int {
 	return n
 }
 
+// AnthropicContentBlock is one block of an Anthropic content array. Field sets
+// are disjoint per Type; Input and InputSchema keep raw JSON bytes to preserve
+// the wire key order for token-faithful re-serialization.
 type AnthropicContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
-	// image source fields (base64 or URL)
-	Source *AnthropicImageSource `json:"source,omitempty"`
+	// Source keeps raw JSON bytes because its shape depends on Type: an object
+	// for image and document blocks, a URL string for search_result blocks.
+	// Read an image block's source with ImageSource.
+	Source json.RawMessage `json:"source,omitempty"`
+	// tool_use fields (assistant messages): the model's request to call a tool.
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// tool_result fields (user messages): the outcome of a tool_use call.
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// Content keeps raw JSON bytes because its shape depends on Type: a string
+	// or an array of blocks on tool_result and mcp_tool_result, an object on
+	// the server tool results (web_search_tool_result_error,
+	// bash_code_execution_result). Read a tool_result block's content with
+	// ToolResultContent.
+	Content json.RawMessage `json:"content,omitempty"`
+	// thinking field (assistant messages): extended-thinking replay.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type AnthropicImageSource struct {
@@ -713,4 +955,34 @@ type AnthropicImageSource struct {
 	MediaType string `json:"media_type,omitempty"`
 	Data      string `json:"data,omitempty"`
 	URL       string `json:"url,omitempty"`
+}
+
+// ImageSource decodes the source of an image block. It returns nil for other
+// block types, and for an image block whose source is absent or is not an
+// image-source object. Each call decodes Source again, which can hold megabytes
+// of base64, so call it once per block rather than inside a loop.
+func (b AnthropicContentBlock) ImageSource() *AnthropicImageSource {
+	if b.Type != "image" {
+		return nil
+	}
+	var src *AnthropicImageSource
+	if err := json.Unmarshal(b.Source, &src); err != nil {
+		return nil
+	}
+	return src
+}
+
+// ToolResultContent decodes the content of a tool_result block, a string or
+// an array of blocks. It returns the zero value for other block types and for
+// a tool_result whose content is absent or does not decode. Each call decodes
+// Content again, so call it once per block.
+func (b AnthropicContentBlock) ToolResultContent() AnthropicContent {
+	if b.Type != reqcommon.BlockTypeToolResult {
+		return AnthropicContent{}
+	}
+	var content AnthropicContent
+	if err := json.Unmarshal(b.Content, &content); err != nil {
+		return AnthropicContent{}
+	}
+	return content
 }

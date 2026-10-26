@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,8 +35,9 @@ type EndpointPickerConfig struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// +optional
-	// FeatureGates is a set of flags that enable various experimental features with the EPP.
-	// If omitted none of these experimental features will be enabled.
+	// FeatureGates is a set of flags that toggle optional EPP features. Each entry is a gate name,
+	// optionally suffixed with "=true" or "=false" (a bare name means "=true"). Gates carry
+	// per-gate defaults that apply when omitted; some default to enabled.
 	FeatureGates FeatureGates `json:"featureGates,omitempty"`
 
 	// +required
@@ -61,20 +63,6 @@ type EndpointPickerConfig struct {
 	// +optional
 	// RequestHandler specifies the handling logic used by the EPP to process incoming requests.
 	RequestHandler *RequestHandlerConfig `json:"requestHandler,omitempty"`
-
-	// +optional
-	// SaturationDetector specifies which saturation detector plugin to use.
-	//
-	// Deprecated: use flowControl.saturationDetector instead. If both are set, the new field is used.
-	// Tracked in https://github.com/llm-d/llm-d-router/issues/1308
-	SaturationDetector *SaturationDetectorConfig `json:"saturationDetector,omitempty"`
-
-	// +optional
-	// Parser specifies the parsing logic used by the EPP to process protocol messages.
-	//
-	// Deprecated: use requestHandler.parser instead. If both are set, the new field is used.
-	// Tracked in https://github.com/llm-d/llm-d-router/issues/1308
-	Parser *ParserConfig `json:"parser,omitempty"`
 }
 
 func (cfg EndpointPickerConfig) String() string {
@@ -96,12 +84,6 @@ func (cfg EndpointPickerConfig) String() string {
 	}
 	if cfg.RequestHandler != nil {
 		parts = append(parts, fmt.Sprintf("RequestHandler: %v", cfg.RequestHandler))
-	}
-	if cfg.SaturationDetector != nil {
-		parts = append(parts, fmt.Sprintf("SaturationDetector: %v", cfg.SaturationDetector))
-	}
-	if cfg.Parser != nil {
-		parts = append(parts, fmt.Sprintf("Parser: %v", cfg.Parser))
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -186,7 +168,8 @@ func (sp SchedulingPlugin) String() string {
 	return "{" + strings.Join(parts, ", ") + "}"
 }
 
-// FeatureGates is a set of flags that enable various experimental features with the EPP
+// FeatureGates is a set of flags that toggle optional EPP features ("name", "name=true", or
+// "name=false"); omitted gates use their registered defaults.
 type FeatureGates []string
 
 func (fg FeatureGates) String() string {
@@ -232,23 +215,65 @@ type DataLayerConfig struct {
 	// Sources is the list of sources to define to the DataLayer
 	Sources []DataLayerSource `json:"sources,omitempty"`
 	// +optional
-	// Discovery specifies which EndpointDiscovery plugin to use for populating the
-	// endpoint datastore. When set, the EPP bypasses Kubernetes CRD reconcilers and
-	// relies entirely on the referenced plugin to enumerate and track inference
-	// endpoints. This enables running the EPP without a Kubernetes cluster.
-	// If omitted, the EPP uses the default Kubernetes-based discovery.
+	// Discovery groups configuration for all discovery plugins (endpoint discovery
+	// and peer discovery). If omitted, the EPP uses Kubernetes-based discovery for
+	// endpoints and disables peer discovery.
 	Discovery *DiscoveryConfig `json:"discovery,omitempty"`
+	// +optional
+	// CrossReplicaSyncerPluginRef names the plugin instance to use as the cross-EPP
+	// cross-replica syncer. The reference is to the name of an entry in the
+	// top-level Plugins section. If omitted, no cross-replica syncer is used
+	// and plugins that read cross-replica state fall back to local data.
+	CrossReplicaSyncerPluginRef string `json:"crossReplicaSyncerPluginRef,omitempty"`
+	// +optional
+	// CrossReplicaSyncInterval is the cadence at which each replica publishes
+	// its local per-endpoint state to the cross-replica syncer. This cadence is
+	// independent of the datalayer polling interval. If omitted, a default is used.
+	CrossReplicaSyncInterval *metav1.Duration `json:"crossReplicaSyncInterval,omitempty"`
+	// +optional
+	// CrossReplicaPublishTimeout bounds one endpoint publish (shared by its
+	// concurrent contributor writes), or one batch chunk per contributor when
+	// the syncer supports batching. If omitted, a default is used.
+	CrossReplicaPublishTimeout *metav1.Duration `json:"crossReplicaPublishTimeout,omitempty"`
 }
 
 func (dlc *DataLayerConfig) String() string {
 	if dlc == nil {
 		return nilString
 	}
-	return fmt.Sprintf("{Sources: %v, Discovery: %v}", dlc.Sources, dlc.Discovery)
+	return fmt.Sprintf("{Sources: %v, Discovery: %v, CrossReplicaSyncerPluginRef: %s, CrossReplicaSyncInterval: %v, CrossReplicaPublishTimeout: %v}",
+		dlc.Sources, dlc.Discovery, dlc.CrossReplicaSyncerPluginRef, dlc.CrossReplicaSyncInterval, dlc.CrossReplicaPublishTimeout)
 }
 
-// DiscoveryConfig references the EndpointDiscovery plugin to use.
+// DiscoveryConfig groups endpoint and peer discovery plugin references.
 type DiscoveryConfig struct {
+	// +optional
+	// Endpoints specifies which EndpointDiscovery plugin to use for populating the
+	// endpoint datastore. When set, the EPP bypasses Kubernetes CRD reconcilers and
+	// relies entirely on the referenced plugin to enumerate and track inference
+	// endpoints. This enables running the EPP without a Kubernetes cluster.
+	Endpoints *EndpointDiscoveryConfig `json:"endpoints,omitempty"`
+	// +optional
+	// Peers specifies which PeerDiscovery plugin to use for discovering
+	// peer EPP replicas. If omitted, peer discovery is disabled.
+	Peers *PeerDiscoveryConfig `json:"peers,omitempty"`
+	// +optional
+	// PluginRef is the name of the plugin instance (from the Plugins list) that
+	// implements EndpointDiscovery.
+	//
+	// Deprecated: use endpoints.pluginRef instead.
+	PluginRef string `json:"pluginRef,omitempty"`
+}
+
+func (dc *DiscoveryConfig) String() string {
+	if dc == nil {
+		return nilString
+	}
+	return fmt.Sprintf("{Endpoints: %v, Peers: %v, PluginRef: %s}", dc.Endpoints, dc.Peers, dc.PluginRef)
+}
+
+// EndpointDiscoveryConfig references the EndpointDiscovery plugin to use.
+type EndpointDiscoveryConfig struct {
 	// +required
 	// +kubebuilder:validation:Required
 	// PluginRef is the name of the plugin instance (from the Plugins list) that
@@ -256,11 +281,27 @@ type DiscoveryConfig struct {
 	PluginRef string `json:"pluginRef"`
 }
 
-func (dc *DiscoveryConfig) String() string {
-	if dc == nil {
+func (edc *EndpointDiscoveryConfig) String() string {
+	if edc == nil {
 		return nilString
 	}
-	return fmt.Sprintf("{PluginRef: %s}", dc.PluginRef)
+	return fmt.Sprintf("{PluginRef: %s}", edc.PluginRef)
+}
+
+// PeerDiscoveryConfig references the PeerDiscovery plugin to use.
+type PeerDiscoveryConfig struct {
+	// +required
+	// +kubebuilder:validation:Required
+	// PluginRef is the name of the plugin instance (from the Plugins list) that
+	// implements PeerDiscovery.
+	PluginRef string `json:"pluginRef"`
+}
+
+func (pdc *PeerDiscoveryConfig) String() string {
+	if pdc == nil {
+		return nilString
+	}
+	return fmt.Sprintf("{PluginRef: %s}", pdc.PluginRef)
 }
 
 // DataLayerSource contains the configuration of a DataSource of the DataLayer feature
@@ -309,6 +350,13 @@ type RequestHandlerConfig struct {
 	// Parsers specifies the parsing plugins used by the EPP to process protocol messages.
 	// If unspecified, default parsing behavior will be applied.
 	Parsers []ParserConfig `json:"parsers,omitempty"`
+
+	// +optional
+	// PropagatePriority, when true, lets the EPP inject the resolved request
+	// priority into the outbound request body's top-level "priority" field so the
+	// backend's native priority scheduler can consume it. It is off by default:
+	// when disabled the request body is forwarded unchanged.
+	PropagatePriority bool `json:"propagatePriority,omitempty"`
 }
 
 func (rhc *RequestHandlerConfig) String() string {
@@ -322,6 +370,9 @@ func (rhc *RequestHandlerConfig) String() string {
 			parserStrs[i] = rhc.Parsers[i].String()
 		}
 		parts = append(parts, fmt.Sprintf("Parsers: [%s]", strings.Join(parserStrs, ", ")))
+	}
+	if rhc.PropagatePriority {
+		parts = append(parts, "PropagatePriority: true")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -351,7 +402,7 @@ type FlowControlConfig struct {
 	// levels. If this limit is exceeded, new requests will be rejected even if their specific
 	// priority band has capacity.
 	// Accepts standard Kubernetes resource quantities (e.g., "1Gi", "500M").
-	// If omitted, no global byte limit is enforced.
+	// If omitted or "0", no global byte limit is enforced.
 	MaxBytes *resource.Quantity `json:"maxBytes,omitempty"`
 
 	// +optional
@@ -359,16 +410,38 @@ type FlowControlConfig struct {
 	// levels. If this limit is exceeded, new requests will be rejected even if their specific
 	// priority band has capacity.
 	// Accepts standard Kubernetes resource quantities (e.g., "100", "1k").
-	// If omitted, no global request limit is enforced.
+	// If omitted or "0", no global request limit is enforced.
 	MaxRequests *resource.Quantity `json:"maxRequests,omitempty"`
 
 	// +optional
-	// DefaultRequestTTL serves as a fallback timeout for requests that do not specify their own
-	// deadline.
-	// It ensures that requests do not hang indefinitely in the queue.
-	// If 0 or omitted, it defaults to the client context deadline, meaning requests may wait
-	// indefinitely unless cancelled by the client.
+	// DefaultRequestTTL bounds how long a request may wait in the queue while the candidate pool has
+	// endpoints; NoEndpointRequestTTL bounds that wait while it has none.
+	// If omitted, it defaults to 60s. This is a queue-wait budget: a request that cannot dispatch
+	// within it is shed with a retryable backpressure error rather than served late, and with no
+	// client or gateway deadline it is the only bound on waiting against a pool that has endpoints.
+	// Where such deadlines exist and fire sooner, they evict the request first (client disconnect).
+	// An explicit "0s" disables eviction while the pool has endpoints, and, unless NoEndpointRequestTTL
+	// overrides it, while the pool is empty as well: such requests then wait until client disconnect or
+	// controller shutdown.
 	DefaultRequestTTL *metav1.Duration `json:"defaultRequestTTL,omitempty"`
+
+	// +optional
+	// NoEndpointRequestTTL bounds queue wait while the candidate pool has no endpoints, replacing
+	// DefaultRequestTTL for as long as that holds. The two regimes want opposite budgets: with no
+	// endpoint to dispatch to, waiting is the only path to success and the budget should cover a cold
+	// start (image pull plus weight load), whereas a saturated pool should shed early enough to keep
+	// time-to-first-token within an SLO. A request that exhausts this budget is evicted as genuine
+	// unavailability rather than as backpressure.
+	// The budget in force is re-evaluated while the request is queued, so a pool that scales from zero
+	// moves its queued requests onto DefaultRequestTTL, and each regime change starts a fresh budget.
+	// Total queue wait stays bounded by the longer of the two budgets, plus a short expiry-sweep margin;
+	// a regime change grants a fresh budget but does not extend that bound, so a request that changes
+	// regime near the bound may be evicted before the fresh budget elapses.
+	// If omitted, it follows DefaultRequestTTL, so splitting the regimes is opt-in and a configuration that
+	// sets only DefaultRequestTTL keeps that bound in both; it defaults to 60s when neither is set. An
+	// explicit "0s" disables eviction while the pool is empty: requests then wait until an endpoint
+	// appears, the client disconnects, or the controller shuts down.
+	NoEndpointRequestTTL *metav1.Duration `json:"noEndpointRequestTTL,omitempty"`
 
 	// +optional
 	// DefaultPriorityBand allows you to define a template for handling traffic with priority levels
@@ -382,7 +455,10 @@ type FlowControlConfig struct {
 	// +optional
 	// DefaultNegativePriorityBand allows you to define a separate template for priority levels
 	// strictly below zero. This enables designating negative-priority traffic as sheddable by
-	// setting lower capacity limits (e.g., maxBytes: "0" to drop immediately).
+	// setting lower capacity limits (e.g., a small maxRequests, so that under saturation the band
+	// fills quickly and subsequent requests are rejected immediately rather than queued).
+	// Note that a value of "0" is treated as unset and receives the system default, not zero
+	// capacity.
 	// If not specified, negative priorities fall back to DefaultPriorityBand.
 	DefaultNegativePriorityBand *PriorityBandConfig `json:"defaultNegativePriorityBand,omitempty"`
 
@@ -398,9 +474,24 @@ type FlowControlConfig struct {
 	UsageLimitPolicyPluginRef string `json:"usageLimitPolicyPluginRef,omitempty"`
 
 	// +optional
+	// BandSelectionPolicyPluginRef specifies the BandSelectionPolicy plugin that orders priority bands
+	// within a dispatch cycle.
+	// Must reference a named plugin instance defined in the top-level Plugins section.
+	// If omitted, bands are offered a dispatch opportunity from highest to lowest priority.
+	BandSelectionPolicyPluginRef string `json:"bandSelectionPolicyPluginRef,omitempty"`
+
+	// +optional
 	// SaturationDetector specifies which saturation detector plugin to use for both Admission and
 	// Flow Control. If omitted, "utilization-detector" is used by default.
 	SaturationDetector *SaturationDetectorConfig `json:"saturationDetector,omitempty"`
+
+	// +optional
+	// EnableEviction enables demand-driven in-flight eviction. When higher-priority requests are
+	// blocked by pool saturation, lower-priority in-flight requests (priority < 0) may be
+	// terminated to reclaim capacity. Pacing and sizing self-configure from the selected
+	// saturation detector. See docs/flow-control-eviction.md.
+	// Defaults to false.
+	EnableEviction bool `json:"enableEviction,omitempty"`
 }
 
 func (fcc *FlowControlConfig) String() string {
@@ -425,6 +516,10 @@ func (fcc *FlowControlConfig) String() string {
 		parts = append(parts, fmt.Sprintf("DefaultRequestTTL: %s", fcc.DefaultRequestTTL.Duration))
 	}
 
+	if fcc.NoEndpointRequestTTL != nil {
+		parts = append(parts, fmt.Sprintf("NoEndpointRequestTTL: %s", fcc.NoEndpointRequestTTL.Duration))
+	}
+
 	if fcc.DefaultPriorityBand != nil {
 		parts = append(parts, fmt.Sprintf("DefaultPriorityBand: %v", fcc.DefaultPriorityBand))
 	}
@@ -441,8 +536,16 @@ func (fcc *FlowControlConfig) String() string {
 		parts = append(parts, "UsageLimitPolicyRef: "+fcc.UsageLimitPolicyPluginRef)
 	}
 
+	if fcc.BandSelectionPolicyPluginRef != "" {
+		parts = append(parts, "BandSelectionPolicyRef: "+fcc.BandSelectionPolicyPluginRef)
+	}
+
 	if fcc.SaturationDetector != nil {
 		parts = append(parts, fmt.Sprintf("SaturationDetector: %v", fcc.SaturationDetector))
+	}
+
+	if fcc.EnableEviction {
+		parts = append(parts, "EnableEviction: true")
 	}
 
 	return "{" + strings.Join(parts, ", ") + "}"
@@ -457,14 +560,23 @@ type PriorityBandConfig struct {
 	// +optional
 	// MaxBytes is the maximum number of bytes allowed for this priority band.
 	// Accepts standard Kubernetes resource quantities (e.g., "1Gi", "500M").
-	// If omitted, the system default is used.
+	// If omitted or "0", the system default (1G) is used. Per-band limits are always bounded; to
+	// effectively remove the bound, set an explicit large value.
 	MaxBytes *resource.Quantity `json:"maxBytes,omitempty"`
 
 	// +optional
 	// MaxRequests is the maximum number of concurrent requests allowed for this priority band.
 	// Accepts standard Kubernetes resource quantities (e.g., "100", "1k").
-	// If omitted, no request limit is enforced.
+	// If omitted or "0", the system default (5000) is used. Per-band limits are always bounded; to
+	// effectively remove the bound, set an explicit large value.
 	MaxRequests *resource.Quantity `json:"maxRequests,omitempty"`
+
+	// +optional
+	// DefaultRequestTTL replaces the global DefaultRequestTTL for this priority band: the queue-wait bound
+	// while the candidate pool has endpoints. NoEndpointRequestTTL is not band-scoped and still governs
+	// queue wait while the pool is empty. If omitted, the global DefaultRequestTTL is used; "0s" disables
+	// eviction in this band while the pool has endpoints.
+	DefaultRequestTTL *metav1.Duration `json:"defaultRequestTTL,omitempty"`
 
 	// +optional
 	// FairnessPolicyRef specifies the name of the policy that governs flow selection.
@@ -487,6 +599,10 @@ func (pbc PriorityBandConfig) String() string {
 
 	if pbc.MaxRequests != nil {
 		parts = append(parts, fmt.Sprintf("MaxRequests: %d", pbc.MaxRequests.Value()))
+	}
+
+	if pbc.DefaultRequestTTL != nil {
+		parts = append(parts, fmt.Sprintf("DefaultRequestTTL: %s", pbc.DefaultRequestTTL.Duration))
 	}
 
 	if pbc.FairnessPolicyRef != "" {

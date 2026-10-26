@@ -1,5 +1,6 @@
 /*
 Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,10 +28,6 @@ import (
 // SheddableFilterType only admits sheddable requests (priority < 0) into the eviction queue.
 // This uses the project-wide definition of sheddable from requtil.IsSheddable.
 const SheddableFilterType = "sheddable-eviction-filter"
-
-func init() {
-	plugin.Register(SheddableFilterType, SheddableFilterFactory)
-}
 
 // SheddableFilterFactory creates a SheddableFilter plugin.
 func SheddableFilterFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {

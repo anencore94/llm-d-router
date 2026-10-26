@@ -17,14 +17,13 @@ A **plugin** is a component that:
   repository).
 - **Implements `plugin.Plugin`** (specifically the `TypedName()` method),
   allowing the framework to identify and instantiate it from config.
-- **Is registered** via `plugin.Register(type, factory)` so the config parser
-  can look it up by type name.
+- **Is registered** via `plugin.Register(type, stability, factory)` (with stability level `plugin.StabilityAlpha`, `plugin.StabilityBeta`, or `plugin.StabilityStable`) so the config parser can look it up by type name.
 
 ### Examples of plugins
 
-- **Scheduling filters**: `bylabel`, `bylabelselector`, `encoderole`, etc.
+- **Scheduling filters**: `label-selector-filter`, `encode-filter`, `prefill-filter`, `decode-filter`, etc.
 - **Scheduling scorers**: `prefix`, `sessionaffinity`, `loadaware`, `loraaffinity`, etc.
-- **Profile handlers**: `DataParallelProfileHandler`, `DisaggProfileHandler`, etc.
+- **Profile handlers**: `SingleProfileHandler`, `DisaggProfileHandler`, etc.
 - **Eviction policies**: `EvictionOrderingPolicy` (e.g. `eviction-priority-then-time-ordering`),
   `EvictionFilterPolicy` (e.g. `eviction-sheddable-filter`).
 

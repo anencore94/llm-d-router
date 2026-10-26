@@ -1,12 +1,30 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package e2e
 
+import "fmt"
+
 // Simple EPP configuration for running without P/D
-const simpleConfig = `apiVersion: llm-d.ai/v1alpha1
+const simpleConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: decode-filter
@@ -21,55 +39,35 @@ schedulingProfiles:
     weight: 2
 `
 
-// EPP configuration for running with P/D
-// Uses deprecated pd-profile-handler
-const deprecatedPdConfig = `apiVersion: llm-d.ai/v1alpha1
+// modelRolloutConfig adds models-responder, which screens requests by the model
+// lists the Pods report.
+const modelRolloutConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
-- type: prefill-header-handler
-- type: approx-prefix-cache-producer
-  parameters:
-    blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
-    lruCapacityPerServer: 256
-- type: prefix-cache-scorer
-- type: prefill-filter
+- type: models-responder
 - type: decode-filter
 - type: max-score-picker
-- type: prefix-based-pd-decider
-  parameters:
-    nonCachedTokens: 16
-- type: pd-profile-handler
-  parameters:
-    deciderPluginName: prefix-based-pd-decider
+- type: single-profile-handler
 schedulingProfiles:
-- name: prefill
-  plugins:
-  - pluginRef: prefill-filter
-  - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
-    weight: 2
-- name: decode
+- name: default
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
-    weight: 2
 `
 
 // epdEncodeDecodeConfig configures E/PD (encode + P/D) using disagg-profile-handler.
 // The encode stage is triggered only for multimodal requests (image_url / video_url / input_audio).
-const epdEncodeDecodeConfig = `apiVersion: llm-d.ai/v1alpha1
+const epdEncodeDecodeConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: encode-filter
 - type: decode-filter
 - type: max-score-picker
-- type: always-disagg-multimodal-decider
 - type: disagg-profile-handler
   parameters:
     deciders:
       encode: always-disagg-multimodal-decider
+- type: always-disagg-multimodal-decider
 schedulingProfiles:
 - name: encode
   plugins:
@@ -81,7 +79,7 @@ schedulingProfiles:
 
 // epdConfig configures E/P/D (encode + prefill + decode) using disagg-profile-handler.
 // The encode stage is triggered only for multimodal requests (image_url / video_url / input_audio).
-const epdConfig = `apiVersion: llm-d.ai/v1alpha1
+const epdConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: encode-filter
@@ -90,19 +88,19 @@ plugins:
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: max-score-picker
-- type: always-disagg-multimodal-decider
-- type: prefix-based-pd-decider
-  parameters:
-    nonCachedTokens: 16
 - type: disagg-profile-handler
   parameters:
     deciders:
       encode: always-disagg-multimodal-decider
       prefill: prefix-based-pd-decider
+- type: always-disagg-multimodal-decider
+- type: prefix-based-pd-decider
+  parameters:
+    nonCachedTokens: 16
 schedulingProfiles:
 - name: encode
   plugins:
@@ -121,14 +119,59 @@ schedulingProfiles:
     weight: 2
 `
 
-// EPP configuration for running with P/D using the unified disagg-profile-handler
-const pdConfig = `apiVersion: llm-d.ai/v1alpha1
+// generateEncodeConfig is the encode-only EPP config for /inference/v1/generate.
+// Uses single-profile-handler so the EPP routes directly to encode pods without
+// requiring a decode stage.
+const generateEncodeConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
+- type: vllmhttp-parser
+- type: encode-filter
+- type: max-score-picker
+- type: single-profile-handler
+requestHandler:
+  parsers:
+   - pluginRef: vllmhttp-parser 
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: encode-filter
+  - pluginRef: max-score-picker
+`
+
+// generatePrefillConfig is the prefill-only EPP config for /inference/v1/generate.
+// Uses single-profile-handler so the EPP routes directly to prefill pods without
+// requiring a decode stage.
+const generatePrefillConfig = `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: vllmhttp-parser
+- type: prefill-filter
+- type: max-score-picker
+- type: single-profile-handler
+requestHandler:
+  parsers:
+   - pluginRef: vllmhttp-parser 
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: max-score-picker
+`
+
+// EPP configuration for running with P/D using the unified disagg-profile-handler
+// pdConfig uses vllmhttp-parser as the request handler so the EPP can parse
+// both OpenAI-style and /inference/v1/generate (token-in) traffic. The parser
+// delegates non-generate paths to the embedded OpenAI parser, so existing
+// chat/completions tests are unaffected.
+const pdConfig = `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: vllmhttp-parser
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: prefill-filter
@@ -157,12 +200,12 @@ schedulingProfiles:
 `
 
 // EPP configuration for running decode-only using disagg-profile-handler (no prefill, no encode)
-const decodeOnlyConfig = `apiVersion: llm-d.ai/v1alpha1
+const decodeOnlyConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: encode-filter
@@ -179,26 +222,38 @@ schedulingProfiles:
     weight: 2
 `
 
-// EPP config for running with precise prefix scoring (i.e. KV events).
-const kvConfig = `apiVersion: llm-d.ai/v1alpha1
+// renderURL is the vllm-render Service URL for the token-producer plugin. The
+// renderer is shared across parallel processes and lives in the base namespace,
+// so the URL has to be fully qualified: a bare hostname resolves against the
+// EPP's own per-process namespace, which has no renderer.
+func renderURL() string {
+	return fmt.Sprintf("http://vllm-render.%s.svc:%s", baseNsName, vllmRenderPort)
+}
+
+// kvConfig returns the EPP config for precise prefix scoring with KV events.
+func kvConfig() string {
+	return fmt.Sprintf(`apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: token-producer
   parameters:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
-      url: http://localhost:8000
-- type: precise-prefix-cache-scorer
+      url: %s
+- type: precise-prefix-cache-producer
   parameters:
     tokenProcessorConfig:
-      blockSize: 16
+      blockSizeTokens: 16
       hashSeed: "42"
     kvEventsConfig:
       zmqEndpoint: tcp://0.0.0.0:5557
     indexerConfig:
       kvBlockIndexConfig:
         enableMetrics: false                  # enable kv-block index metrics (prometheus)
-        metricsLoggingInterval: 6000000000    # log kv-block metrics as well (1m in nanoseconds)
+        metricsLoggingInterval: 60000000000   # log kv-block metrics as well (1m in nanoseconds)
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: precise-prefix-cache-producer
 - type: decode-filter
 - type: max-score-picker
 - type: disagg-profile-handler
@@ -207,29 +262,35 @@ schedulingProfiles:
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
-  - pluginRef: precise-prefix-cache-scorer
+  - pluginRef: prefix-cache-scorer
     weight: 10
-`
+`, renderURL())
+}
 
-// Alias of kvConfig retained for tests that reference the external-tokenizer name.
-const kvExternalTokenizerConfig = `apiVersion: llm-d.ai/v1alpha1
+// kvExternalTokenizerConfig returns the EPP config for the KV-events test that
+// covers both completions and chat completions.
+func kvExternalTokenizerConfig() string {
+	return fmt.Sprintf(`apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: token-producer
   parameters:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
-      url: http://localhost:8000
-- type: precise-prefix-cache-scorer
+      url: %s
+- type: precise-prefix-cache-producer
   parameters:
     tokenProcessorConfig:
-      blockSize: 16
+      blockSizeTokens: 16
       hashSeed: "42"
     kvEventsConfig:
       zmqEndpoint: tcp://0.0.0.0:5557
     indexerConfig:
       kvBlockIndexConfig:
         enableMetrics: false
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: precise-prefix-cache-producer
 - type: decode-filter
 - type: max-score-picker
 - type: disagg-profile-handler
@@ -238,12 +299,13 @@ schedulingProfiles:
   plugins:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
-  - pluginRef: precise-prefix-cache-scorer
+  - pluginRef: prefix-cache-scorer
     weight: 10
-`
+`, renderURL())
+}
 
 // EPP configuration for running scale model server test
-const scaleConfig = `apiVersion: llm-d.ai/v1alpha1
+const scaleConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: max-score-picker
@@ -255,12 +317,12 @@ schedulingProfiles:
 `
 
 // EPP configuration for running with vLLM Data Parallel support
-const dataParallelConfig = `apiVersion: llm-d.ai/v1alpha1
+const dataParallelConfig = `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: decode-filter
 - type: max-score-picker
-- type: data-parallel-profile-handler
+- type: single-profile-handler
 schedulingProfiles:
 - name: default
   plugins:

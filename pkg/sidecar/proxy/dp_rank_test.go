@@ -22,6 +22,61 @@ import (
 	"testing"
 )
 
+// Shared test IP literals, factored out so repeated use across the proxy test
+// package does not trip the goconst linter.
+const (
+	testDecodeHostIP   = "10.0.1.1"
+	testDecodeHostIP2  = "10.0.1.2"
+	testDecodeHostIP3  = "10.0.1.3"
+	testPrefillHostIP1 = "10.0.0.1"
+	testPrefillHostIP2 = "10.0.0.2"
+	testLocalHostname  = "localhost"
+	testLoopbackIP     = "127.0.0.1"
+	testLoopbackIPv6   = "::1"
+)
+
+// TestResolveDecodeDPRank covers rank propagation from the prefill response:
+// a valid in-range returned rank is used; an omitted, non-numeric, or
+// out-of-range value falls back to the deterministic hash. This guards against
+// the header and decode body targeting different DP ranks (which hangs the
+// MoRI-IO KV transfer).
+func TestResolveDecodeDPRank(t *testing.T) {
+	const dpSize = 8
+	const rid = "cmpl-rank-test"
+	hashFallback := pickDPRank(rid, dpSize)
+
+	cases := []struct {
+		name         string
+		prefillKV    any
+		dpSize       int
+		wantRank     int
+		wantReturned bool
+	}{
+		{name: "valid returned rank", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(3)}, dpSize: dpSize, wantRank: 3, wantReturned: true},
+		{name: "valid returned rank as int", prefillKV: map[string]any{requestFieldRemoteDPRank: 5}, dpSize: dpSize, wantRank: 5, wantReturned: true},
+		{name: "zero is valid", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(0)}, dpSize: dpSize, wantRank: 0, wantReturned: true},
+		{name: "omitted falls back to hash", prefillKV: map[string]any{}, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "nil kv falls back to hash", prefillKV: nil, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "non-numeric falls back to hash", prefillKV: map[string]any{requestFieldRemoteDPRank: "two"}, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "fractional falls back to hash (no truncation)", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(3.5)}, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "out-of-range high falls back to hash", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(8)}, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "negative falls back to hash", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(-1)}, dpSize: dpSize, wantRank: hashFallback, wantReturned: false},
+		{name: "single-DP always rank 0", prefillKV: map[string]any{requestFieldRemoteDPRank: float64(0)}, dpSize: 1, wantRank: 0, wantReturned: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotRank, gotReturned := resolveDecodeDPRank(c.prefillKV, rid, c.dpSize)
+			if gotRank != c.wantRank || gotReturned != c.wantReturned {
+				t.Errorf("resolveDecodeDPRank(%v, %q, %d) = (%d, %t); want (%d, %t)",
+					c.prefillKV, rid, c.dpSize, gotRank, gotReturned, c.wantRank, c.wantReturned)
+			}
+			if gotRank < 0 || gotRank >= max(c.dpSize, 1) {
+				t.Errorf("resolveDecodeDPRank returned out-of-range rank %d for dpSize %d", gotRank, c.dpSize)
+			}
+		})
+	}
+}
+
 // TestPickDPRankSingleDP verifies dpSize <= 1 short-circuits to 0 without
 // hashing.
 func TestPickDPRankSingleDP(t *testing.T) {
@@ -32,9 +87,42 @@ func TestPickDPRankSingleDP(t *testing.T) {
 	}
 }
 
+func TestFoldDPRankToLocal(t *testing.T) {
+	cases := []struct {
+		name        string
+		dpRank      int
+		dpSize      int
+		dpSizeLocal int
+		want        int
+	}{
+		{name: "multi-pod global rank", dpRank: 11, dpSize: 16, dpSizeLocal: 8, want: 3},
+		{name: "multi-pod local rank", dpRank: 7, dpSize: 16, dpSizeLocal: 8, want: 7},
+		{name: "single-pod fallback", dpRank: 11, dpSize: 16, dpSizeLocal: 0, want: 11},
+		{name: "unset sizes", dpRank: 0, dpSize: 0, dpSizeLocal: 0, want: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := foldDPRankToLocal(c.dpRank, c.dpSize, c.dpSizeLocal); got != c.want {
+				t.Errorf("foldDPRankToLocal(%d, %d, %d) = %d; want %d",
+					c.dpRank, c.dpSize, c.dpSizeLocal, got, c.want)
+			}
+		})
+	}
+}
+
+func TestPickDPRanksSeparatesGlobalAndLocalRanks(t *testing.T) {
+	global, local := pickDPRanks("cmpl-foo-0", 16, 8)
+	if global != 13 {
+		t.Errorf("pickDPRanks global rank = %d; want 13", global)
+	}
+	if local != 5 {
+		t.Errorf("pickDPRanks local rank = %d; want 5", local)
+	}
+}
+
 // TestPickDPRankDeterministic verifies the core invariant: the same
 // requestID + dpSize always returns the same rank. Without this, the
-// prefill and decode legs of one disagg pair would land on different
+// prefill and decode requests of one disagg pair would land on different
 // DP ranks and the MoRI-IO handshake would deadlock.
 func TestPickDPRankDeterministic(t *testing.T) {
 	for i := 0; i < 64; i++ {

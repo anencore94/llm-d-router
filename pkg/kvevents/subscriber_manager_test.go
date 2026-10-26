@@ -1,0 +1,444 @@
+/*
+Copyright 2025 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kvevents_test
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvevents"
+	"github.com/llm-d/llm-d-router/pkg/kvevents/engineadapter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSubscriberManager_EnsureSubscriber(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	podID := "default/test-pod-0"
+	endpoint := "tcp://127.0.0.1:5557"
+	topicFilter := "kv@"
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "", topicFilter, true)
+	assert.NoError(t, err)
+
+	identifiers, endpoints := sm.GetActiveSubscribers()
+	assert.Contains(t, identifiers, podID)
+	assert.Len(t, identifiers, 1)
+	assert.Contains(t, endpoints, endpoint)
+
+	// Ensure with same endpoint should be no-op
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "", topicFilter, true)
+	assert.NoError(t, err)
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 1)
+
+	sm.Shutdown(ctx)
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 0)
+}
+
+func TestSubscriberManager_RemoveSubscriber(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	podID := "default/test-pod-0"
+	endpoint := "tcp://127.0.0.1:5557"
+	topicFilter := "kv@"
+	assert.False(t, sm.RemoveSubscriber(ctx, podID))
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "", topicFilter, true)
+	require.NoError(t, err)
+
+	assert.True(t, sm.RemoveSubscriber(ctx, podID))
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 0)
+
+	// Remove again should be no-op
+	assert.False(t, sm.RemoveSubscriber(ctx, podID))
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 0)
+}
+
+func TestSubscriberManager_MultipleSubscribers(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	pods := []struct {
+		id       string
+		endpoint string
+	}{
+		{"default/pod-0", "tcp://10.0.0.1:5557"},
+		{"default/pod-1", "tcp://10.0.0.2:5557"},
+		{"default/pod-2", "tcp://10.0.0.3:5557"},
+	}
+
+	for _, pod := range pods {
+		err := sm.EnsureSubscriber(ctx, pod.id, "", pod.endpoint, "", "", "kv@", true)
+		require.NoError(t, err)
+	}
+
+	identifiers, endpoints := sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 3)
+	for _, pod := range pods {
+		assert.Contains(t, identifiers, pod.id)
+	}
+	assert.Len(t, endpoints, 3)
+	for _, pod := range pods {
+		assert.Contains(t, endpoints, pod.endpoint)
+	}
+
+	sm.RemoveSubscriber(ctx, "default/pod-1")
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 2)
+	assert.NotContains(t, identifiers, "default/pod-1")
+
+	sm.Shutdown(ctx)
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 0)
+}
+
+func TestSubscriberManager_EndpointChange(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	podID := "default/test-pod-0"
+	endpoint1 := "tcp://10.0.0.1:5557"
+	endpoint2 := "tcp://10.0.0.2:5557"
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "", "kv@", true)
+	require.NoError(t, err)
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 1)
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "", "kv@", true)
+	require.NoError(t, err)
+
+	identifiers, endpoints := sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 1)
+	assert.Contains(t, identifiers, podID)
+	assert.Len(t, endpoints, 1)
+	assert.Contains(t, endpoints, endpoint2)
+
+	sm.Shutdown(ctx)
+	identifiers, _ = sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 0)
+}
+
+func TestSubscriberManager_ConcurrentOperations(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	done := make(chan bool, 10)
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			defer func() { done <- true }()
+			podID := fmt.Sprintf("default/pod-%d", id)
+			endpoint := fmt.Sprintf("tcp://10.0.0.%d:5557", id)
+			if err := sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "", "kv@", true); err != nil {
+				t.Errorf("failed to add subscriber %s: %v", podID, err)
+			}
+		}(i)
+	}
+
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Len(t, identifiers, 10)
+
+	sm.Shutdown(ctx)
+}
+
+func TestSubscriberManager_Shutdown_ReleasesSocket(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	endpoint := availableEndpoint(t, ctx)
+	err = sm.EnsureSubscriber(ctx, "test-pod-releases-socket", "", endpoint, "", "", "kv@", false)
+	require.NoError(t, err)
+
+	shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	sm.Shutdown(shutdownCtx)
+
+	assert.NoError(t, shutdownCtx.Err())
+
+	// Since Shutdown waits for the subscriber goroutine to exit, the socket must
+	// be closed and the port immediately available for reuse without address conflicts.
+	l, err := net.Listen("tcp", strings.TrimPrefix(endpoint, "tcp://"))
+	require.NoError(t, err, "port must be immediately available after Shutdown returns")
+	_ = l.Close()
+
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Empty(t, identifiers)
+}
+
+func TestSubscriberManager_Shutdown_HonorsContextCancellation(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	endpoint := availableEndpoint(t, ctx)
+	err = sm.EnsureSubscriber(ctx, "test-pod-canceled", "", endpoint, "", "", "kv@", false)
+	require.NoError(t, err)
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	sm.Shutdown(canceledCtx)
+
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Empty(t, identifiers)
+}
+
+func TestSubscriberManager_EndpointChange_EventuallyReleasesOldSubscriberSocket(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr1 := l1.Addr().String()
+	require.NoError(t, l1.Close())
+
+	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr2 := l2.Addr().String()
+	require.NoError(t, l2.Close())
+
+	endpoint1 := fmt.Sprintf("tcp://%s", addr1)
+	endpoint2 := fmt.Sprintf("tcp://%s", addr2)
+
+	podID := "default/test-pod-0"
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "", "kv@", false)
+	require.NoError(t, err)
+
+	// Wait for subscriber to bind to addr1.
+	require.Eventually(t, func() bool {
+		conn, err := net.Dial("tcp", addr1)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond)
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "", "kv@", false)
+	require.NoError(t, err)
+
+	// The retired subscriber releases its socket asynchronously.
+	require.Eventually(t, func() bool {
+		newL, err := net.Listen("tcp", addr1)
+		if err != nil {
+			return false
+		}
+		_ = newL.Close()
+		return true
+	}, 2*time.Second, 10*time.Millisecond)
+
+	sm.Shutdown(ctx)
+}
+
+func TestSubscriberManager_EndpointChange_HonorsContextCancellation(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	podID := "default/test-pod-0"
+	endpoint1 := "tcp://10.0.0.1:5557"
+	endpoint2 := "tcp://10.0.0.2:5557"
+
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "", "kv@", true)
+	require.NoError(t, err)
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "", "kv@", true)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Empty(t, identifiers)
+}
+
+func TestSubscriberManager_EndpointChange_BothChannelsReady_HonorsContextCancellation(t *testing.T) {
+	ctx := context.Background()
+
+	indexConfig := kvblock.DefaultIndexConfig()
+	index, err := kvblock.NewIndex(ctx, indexConfig)
+	require.NoError(t, err)
+
+	poolConfig := kvevents.DefaultConfig()
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	pool, err := kvevents.NewPool(poolConfig, index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+
+	sm := kvevents.NewSubscriberManager(pool)
+
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr1 := l1.Addr().String()
+	require.NoError(t, l1.Close())
+
+	endpoint1 := fmt.Sprintf("tcp://%s", addr1)
+	endpoint2 := "tcp://127.0.0.1:5557"
+	podID := "default/test-pod-0"
+
+	subCtx, subCancel := context.WithCancel(ctx)
+	err = sm.EnsureSubscriber(subCtx, podID, "", endpoint1, "", "", "kv@", false)
+	require.NoError(t, err)
+
+	// Wait for subscriber to bind to addr1.
+	require.Eventually(t, func() bool {
+		conn, err := net.Dial("tcp", addr1)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Cancel the subscriber and wait until its socket is released, guaranteeing
+	// that its goroutine has returned and entry.done is closed.
+	subCancel()
+	require.Eventually(t, func() bool {
+		l, err := net.Listen("tcp", addr1)
+		if err == nil {
+			_ = l.Close()
+			return true
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Create an already-canceled context so ctx.Done() is also ready.
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	// Both entry.done and canceledCtx.Done() are ready. EnsureSubscriber must
+	// honor the context cancellation, clean up, and return context.Canceled
+	// rather than creating a replacement subscriber and returning nil.
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "", "kv@", false)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	identifiers, _ := sm.GetActiveSubscribers()
+	assert.Empty(t, identifiers)
+}

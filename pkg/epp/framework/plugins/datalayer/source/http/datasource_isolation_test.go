@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,11 +28,11 @@ func TestHTTPDataSource_ClientIsolation(t *testing.T) {
 	parser := func(r io.Reader) (any, error) { return struct{}{}, nil }
 
 	// Create first HTTPS datasource, insecureSkipVerify = false
-	ds1, err := NewHTTPDataSource[any]("https", "/metrics", false, "test-type", "ds1", parser)
+	ds1, err := NewHTTPDataSource[any]("https", "/metrics", TLSOptions{}, "test-type", "ds1", parser)
 	assert.NoError(t, err)
 
 	// Create second HTTPS datasource, insecureSkipVerify = true
-	ds2, err := NewHTTPDataSource[any]("https", "/metrics", true, "test-type", "ds2", parser)
+	ds2, err := NewHTTPDataSource[any]("https", "/metrics", TLSOptions{SkipVerify: true}, "test-type", "ds2", parser)
 	assert.NoError(t, err)
 
 	// Verify ds1 uses isolated transport config

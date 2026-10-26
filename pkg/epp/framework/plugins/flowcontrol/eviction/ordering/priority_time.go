@@ -1,5 +1,6 @@
 /*
 Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,10 +27,6 @@ import (
 // PriorityThenTimeOrderingType evicts the lowest priority request first,
 // breaking ties by newest dispatch time (least KV-cache investment).
 const PriorityThenTimeOrderingType = "priority-then-time-eviction-order-policy"
-
-func init() {
-	plugin.Register(PriorityThenTimeOrderingType, PriorityThenTimeOrderingFactory)
-}
 
 // PriorityThenTimeOrderingFactory creates a PriorityThenTimeOrdering plugin.
 func PriorityThenTimeOrderingFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {

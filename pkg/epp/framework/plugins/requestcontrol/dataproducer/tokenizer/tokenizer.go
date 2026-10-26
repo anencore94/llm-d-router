@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package tokenizer provides a DataProducer plugin that tokenizes the request
-// prompt and publishes the result on InferenceRequestBody.TokenizedPrompt for
+// prompt and publishes the result on InferenceRequestBody.TokenizedRequest for
 // downstream consumers (scorers, filters, other data producers).
 package tokenizer
 
@@ -27,63 +27,103 @@ import (
 	"sort"
 	"time"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
-	tokenizerTypes "github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
+	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	mmobs "github.com/llm-d/llm-d-router/pkg/epp/framework/observability/multimodal"
+	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
+	rcplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 type tokenizer interface {
 	Render(ctx context.Context, payload fwkrh.RequestPayload) ([][]uint32, [][]tokenizerTypes.Offset, error)
 	RenderChat(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
+	RenderMessages(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
+	RenderResponses(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
 }
 
 const (
 	// PluginType is the canonical type name used to register the plugin.
 	PluginType = "token-producer"
 
-	// LegacyPluginType is the previous type name. Existing YAML configs that
-	// reference it continue to work. Will be removed in a future release.
-	//
-	// Deprecated: use PluginType ("token-producer") instead.
-	LegacyPluginType = "tokenizer"
-
 	tokenizedPromptKeyID = "TokenizedPrompt"
 )
+
+// Backend identifiers reported on the tokenize span and returned by Plugin.Backend.
+const (
+	BackendVLLM     = "vllm"
+	BackendEstimate = "estimate"
+)
+
+// resultSkippedNoTokens marks a tokenize span whose backend returned no tokens,
+// distinguishing it from a span missing attributes for any other reason.
+const resultSkippedNoTokens = "skipped_no_tokens"
 
 var TokenizedPromptDataKey = plugin.NewDataKey(tokenizedPromptKeyID, PluginType)
 
 // tokenizerPluginConfig holds the configuration for the tokenizer plugin.
 //
 // Backend selection: `vllm` or `modelName` selects the vLLM HTTP /render
-// backend; `udsTokenizerConfig` selects the deprecated gRPC-over-UDS backend;
-// `estimate` selects the tokenizer-free byte-packing backend, which is also the
-// zero-config default when no backend is set.
+// backend; `estimate` selects the tokenizer-free byte-packing backend, which is
+// also the zero-config default when no backend is set.
 type tokenizerPluginConfig struct {
-	// TokenizerConfig configures the deprecated gRPC-over-UDS backend.
-	//
-	// Deprecated: the UDS tokenizer backend is deprecated and will be removed
-	// in a future release. Migrate to the `vllm` HTTP /render backend.
-	TokenizerConfig tokenization.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
 	// VLLM configures the vLLM /render backend.
 	VLLM *vllmConfig `json:"vllm,omitempty"`
 	// Estimate selects the tokenizer-free byte-packing backend; mutually
-	// exclusive with 'vllm'/'udsTokenizerConfig' and needs no 'modelName'.
+	// exclusive with 'vllm' and needs no 'modelName'.
 	Estimate *estimateConfig `json:"estimate,omitempty"`
-	// ModelName is the name of the model whose tokenizer should be loaded.
+	// ModelName is used for startup probes, native gRPC text, and legacy Messages.
+	// Native HTTP rendering keeps the effective model, including aliases and adapters.
 	ModelName string `json:"modelName"`
 }
 
-// estimateConfig configures the estimation backend. Multimodal image estimation
-// is the only tunable; an empty config uses built-in defaults.
+// estimateConfig configures the estimation backend. Multimodal image, video,
+// and audio estimation are the only tunables; an empty config uses built-in defaults.
 type estimateConfig struct {
 	// Image tunes multimodal image placeholder-token estimation.
 	Image *imageEstimateConfig `json:"image,omitempty"`
+	// Video tunes multimodal video placeholder-token estimation.
+	Video *videoEstimateConfig `json:"video,omitempty"`
+	// Audio tunes multimodal audio placeholder-token estimation.
+	Audio *audioEstimateConfig `json:"audio,omitempty"`
+}
+
+// audioEstimateConfig tunes how an audio's placeholder-token count is estimated:
+// min(durationSeconds*tokensPerSecond, maxAudioTokens) + overheadTokens. Clip
+// duration is resolved per clip rather than configured: the
+// x-llm-d-audio-duration-seconds header wins, then the payload itself, then
+// defaultDuration.
+type audioEstimateConfig struct {
+	// TokensPerSecond is the placeholder tokens per second of audio, 25 for
+	// gemma4 and 13 for Qwen3-Omni.
+	TokensPerSecond float64 `json:"tokensPerSecond,omitempty"`
+	// OverheadTokens is the fixed prompt template + text token overhead added
+	// to every audio estimate.
+	OverheadTokens int `json:"overheadTokens,omitempty"`
+	// DefaultBytesPerSecond converts a payload length to seconds when the clip is
+	// not PCM WAV, whose own header carries an exact byte rate, and the request
+	// does not carry an x-llm-d-audio-bytes-per-second header either.
+	DefaultBytesPerSecond int `json:"defaultBytesPerSecond,omitempty"`
+	// DefaultDuration is the clip length in seconds used when neither the header
+	// nor the payload provides one, as for a clip referenced by URL.
+	DefaultDuration float64 `json:"defaultDuration,omitempty"`
+	// MaxAudioTokens caps the audio tower's tokens for a clip, before the
+	// overhead is added, so it matches the model's own limit (750 for gemma4).
+	// Zero means uncapped.
+	MaxAudioTokens int `json:"maxAudioTokens,omitempty"`
 }
 
 // imageEstimateConfig tunes how an image's placeholder-token count is estimated.
@@ -112,10 +152,87 @@ type dynamicImageConfig struct {
 	Factor int `json:"factor,omitempty"`
 }
 
-// resolution is an image width/height in pixels.
+// resolution is an image or video-frame width/height in pixels.
 type resolution struct {
 	Width  int `json:"width"`
 	Height int `json:"height"`
+}
+
+// videoEstimateConfig tunes how a video's placeholder-token count is estimated:
+// min(frames * tokensPerFrame, maxVideoTokens). Empty fields fall back to
+// built-in defaults. qwen3 is dynamic tokens-per-frame + sampled frames; gemma4
+// is static tokens-per-frame + strided frames. Duration and resolution are not
+// decoded from the video; they come from these fields.
+type videoEstimateConfig struct {
+	// DefaultResolution is the per-frame resolution used for dynamic
+	// tokens-per-frame.
+	DefaultResolution *resolution `json:"defaultResolution,omitempty"`
+	// DefaultDuration is the video length in seconds used for frame counting.
+	DefaultDuration float64 `json:"defaultDuration,omitempty"`
+	// TokensPerFrame configures the per-frame placeholder count.
+	TokensPerFrame *tokensPerFrameConfig `json:"tokensPerFrame,omitempty"`
+	// Frames configures how many frames are sampled from the video.
+	Frames *framesConfig `json:"frames,omitempty"`
+	// MaxVideoTokens caps the total placeholder count. Zero means uncapped.
+	MaxVideoTokens int `json:"maxVideoTokens,omitempty"`
+}
+
+// tokensPerFrameConfig configures the per-frame placeholder count.
+type tokensPerFrameConfig struct {
+	// Mode selects "dynamic" (width*height/factor) or "static" (a constant count).
+	Mode string `json:"mode,omitempty"`
+	// Static configures the static (constant per-frame) mode.
+	Static *tokensPerFrameStaticMode `json:"static,omitempty"`
+	// Dynamic configures the dynamic (pixels/factor) mode.
+	Dynamic *tokensPerFrameDynamicMode `json:"dynamic,omitempty"`
+}
+
+// tokensPerFrameStaticMode is the static-mode parameter.
+type tokensPerFrameStaticMode struct {
+	// NumTokensPerFrame is the per-frame placeholder count.
+	NumTokensPerFrame int `json:"numTokensPerFrame,omitempty"`
+}
+
+// tokensPerFrameDynamicMode is the dynamic-mode parameter.
+type tokensPerFrameDynamicMode struct {
+	// Factor maps a frame's pixels to placeholder tokens (width*height/factor).
+	Factor int `json:"factor,omitempty"`
+}
+
+// framesConfig configures how many frames are counted from a video. MinFrames
+// and MaxFrames clamp the count in both modes; the mode sub-structs hold the
+// mode-specific knobs.
+type framesConfig struct {
+	// Mode selects "sampled" (duration*sampleFPS) or "strided"
+	// (duration*sourceFPS/frameStride).
+	Mode string `json:"mode,omitempty"`
+	// MinFrames floors the frame count. Zero means no floor.
+	MinFrames int `json:"minFrames,omitempty"`
+	// MaxFrames caps the frame count. Zero means uncapped.
+	MaxFrames int `json:"maxFrames,omitempty"`
+	// Sampled configures the sampled (duration*sampleFPS) mode.
+	Sampled *framesSampledMode `json:"sampled,omitempty"`
+	// Strided configures the strided (duration*sourceFPS/frameStride) mode.
+	Strided *framesStridedMode `json:"strided,omitempty"`
+}
+
+// framesSampledMode configures the sampled frame-count mode.
+type framesSampledMode struct {
+	// SampleFPS is the sampling rate.
+	SampleFPS float64 `json:"sampleFPS,omitempty"`
+	// TemporalPatchSize merges every N sampled frames into one token group,
+	// modeling temporal patch merging (e.g. qwen3-vl uses 2). Values < 2 apply
+	// no merging.
+	TemporalPatchSize int `json:"temporalPatchSize,omitempty"`
+}
+
+// framesStridedMode configures the strided frame-count mode.
+type framesStridedMode struct {
+	// DefaultSourceFPS is the fallback source frame rate, used when the
+	// x-llm-d-video-fps header is absent.
+	DefaultSourceFPS float64 `json:"defaultSourceFPS,omitempty"`
+	// FrameStride keeps every Nth source frame.
+	FrameStride int `json:"frameStride,omitempty"`
 }
 
 // PluginFactory is the factory function for the tokenizer plugin.
@@ -129,19 +246,31 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	}
 
 	estimate := config.Estimate != nil
-	uds := config.TokenizerConfig.IsEnabled()
 	vllm := config.VLLM != nil || config.ModelName != ""
-	if (estimate && (uds || vllm)) || (uds && vllm) {
-		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate', 'vllm', or 'udsTokenizerConfig' may be set", PluginType)
+	if estimate && vllm {
+		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate' or 'vllm' may be set", PluginType)
 	}
-	// modelName is required only by the real-tokenizer backends; the zero-config
+	// modelName is required only by the real-tokenizer backend; the zero-config
 	// path selects the estimate backend, which needs none.
-	if (uds || vllm) && config.ModelName == "" {
+	if vllm && config.ModelName == "" {
 		return nil, fmt.Errorf("invalid configuration for '%s' plugin: 'modelName' must be specified", PluginType)
 	}
 	if config.Estimate != nil && config.Estimate.Image != nil {
 		if m := config.Estimate.Image.Mode; m != "" && m != imageModeDynamic && m != imageModeStatic {
 			return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.image.mode must be %q or %q", PluginType, imageModeDynamic, imageModeStatic)
+		}
+	}
+	if config.Estimate != nil && config.Estimate.Video != nil {
+		vid := config.Estimate.Video
+		if vid.TokensPerFrame != nil {
+			if m := vid.TokensPerFrame.Mode; m != "" && m != videoTPFModeDynamic && m != videoTPFModeStatic {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.tokensPerFrame.mode must be %q or %q", PluginType, videoTPFModeDynamic, videoTPFModeStatic)
+			}
+		}
+		if vid.Frames != nil {
+			if m := vid.Frames.Mode; m != "" && m != videoFramesModeSampled && m != videoFramesModeStrided {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.frames.mode must be %q or %q", PluginType, videoFramesModeSampled, videoFramesModeStrided)
+			}
 		}
 	}
 
@@ -153,53 +282,57 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	return p, nil
 }
 
-// LegacyPluginFactory wraps PluginFactory for the deprecated `tokenizer` type
-// name. It logs a one-time-per-instantiation deprecation warning and delegates
-// to PluginFactory. Will be removed when LegacyPluginType is removed.
-//
-// Deprecated: register PluginType ("token-producer") instead.
-func LegacyPluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
-	log.FromContext(handle.Context()).Info(
-		"DEPRECATION: plugin type '"+LegacyPluginType+"' is deprecated; use '"+PluginType+"' instead",
-		"pluginName", name,
-	)
-	return PluginFactory(name, rawParameters, handle)
-}
-
-// NewPlugin constructs the configured backend: udsTokenizerConfig (deprecated),
-// vllm /render (selected by 'vllm' or 'modelName'), or estimate byte-packing
-// (the default when no backend is set).
+// NewPlugin constructs the configured backend: vllm /render (selected by
+// 'vllm' or 'modelName'), or estimate byte-packing (the default when no
+// backend is set).
 func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) (*Plugin, error) {
 	var backend tokenInputProducer
+	var backendName string
+	var endpointPicker *discoveredEndpointPicker
 	switch {
-	case config.TokenizerConfig.IsEnabled():
-		log.FromContext(ctx).Info(
-			"DEPRECATION: the 'udsTokenizerConfig' parameter is deprecated and will be removed in a future release; set the 'vllm' parameter instead (see plugin README)",
-			"pluginType", PluginType,
-		)
-		uds, err := newUDSTokenizer(ctx, &config.TokenizerConfig, config.ModelName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize UDS tokenizer for '%s' plugin - %w", PluginType, err)
-		}
-		backend = renderBackend{tk: uds}
 	case config.VLLM != nil || config.ModelName != "":
 		cfg := config.VLLM
 		if cfg == nil {
 			cfg = &vllmConfig{}
 		}
-		renderer, err := newVLLMHTTPRenderer(cfg, config.ModelName)
+		renderer, err := newVLLMHTTPRenderer(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize vLLM HTTP renderer for '%s' plugin - %w", PluginType, err)
 		}
-		backend = renderBackend{tk: renderer}
+		renderer.pluginName = name
+		registerRenderMetrics()
+		legacyMessages, err := configureLegacyMessages(ctx, name, cfg.MessagesRenderMode)
+		if err != nil {
+			return nil, err
+		}
+		legacyResponses, err := configureLegacyResponses(ctx, name, cfg.ResponsesRenderMode)
+		if err != nil {
+			return nil, err
+		}
+		backend = renderBackend{
+			tk: renderer, modelName: config.ModelName,
+			legacyMessages: legacyMessages, legacyResponses: legacyResponses,
+			warmupAuth: vllmWarmupAuthHeader(),
+		}
+		backendName = BackendVLLM
+		endpointPicker, _ = renderer.endpointPicker.(*discoveredEndpointPicker)
+		if endpointPicker != nil && endpointPicker.config.DiscoverModelLimits {
+			go endpointPicker.watchModelLimits(ctx, renderer.client, config.ModelName)
+		}
 	default:
-		backend = estimateBackend{img: newImageEstimator(config.Estimate)}
+		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate), aud: newAudioEstimator(config.Estimate)}
+		backendName = BackendEstimate
 	}
 
+	typedName := plugin.TypedName{Type: PluginType, Name: name}
 	p := &Plugin{
-		typedName: plugin.TypedName{Type: PluginType, Name: name},
-		backend:   backend,
-		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+		typedName:   typedName,
+		backend:     backend,
+		backendName: backendName,
+		dk:          TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+	}
+	if endpointPicker != nil {
+		p.endpointDiscovery = newEndpointDiscoveryHandler(typedName, endpointPicker)
 	}
 	if w, ok := backend.(warmer); ok {
 		go w.warmup(ctx)
@@ -208,17 +341,21 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 }
 
 // Plugin tokenizes the prompt in the incoming request and writes the result to
-// InferenceRequestBody.TokenizedPrompt for downstream DataProducer / scoring plugins.
+// InferenceRequestBody.TokenizedRequest for downstream DataProducer / scoring plugins.
 type Plugin struct {
 	typedName plugin.TypedName
 	backend   tokenInputProducer
-	dk        plugin.DataKey
+	// backendName identifies the configured backend on the tokenize span.
+	backendName       string
+	dk                plugin.DataKey
+	endpointDiscovery *endpointDiscoveryHandler
 }
 
 // compile-time assertions.
 var (
 	_ requestcontrol.DataProducer         = &Plugin{}
 	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
+	_ datalayer.Registrant                = &Plugin{}
 )
 
 // TypedName returns the typed name of the plugin.
@@ -226,9 +363,34 @@ func (p *Plugin) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
-// Produces returns the data keys this plugin produces.
+// Backend returns the configured backend identifier (BackendVLLM or BackendEstimate).
+func (p *Plugin) Backend() string {
+	return p.backendName
+}
+
+// Produces returns the data keys this plugin produces, along with the
+// configured tokenization backend attribute ("backend": BackendVLLM or BackendEstimate)
+// for Level-2 consumer dependency validation.
 func (p *Plugin) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+	return map[plugin.DataKey]any{
+		p.dk: plugin.ProducedData{
+			Type:       fwkrh.TokenizedRequest{},
+			Attributes: map[string]string{"backend": p.backendName},
+		},
+	}
+}
+
+// RegisterDependencies wires discovery-backed renderers to endpoint lifecycle events.
+func (p *Plugin) RegisterDependencies(r datalayer.Registrar) error {
+	if p.endpointDiscovery == nil {
+		return nil
+	}
+	return r.Register(datalayer.PendingRegistration{
+		Owner:         p.TypedName(),
+		SourceType:    sourcenotifications.EndpointNotificationSourceType,
+		Extractor:     p.endpointDiscovery,
+		DefaultSource: sourcenotifications.NewEndpointDataSource(sourcenotifications.EndpointNotificationSourceType, sourcenotifications.EndpointNotificationSourceType),
+	})
 }
 
 // ProduceTimeout surfaces the backend's render timeout when it manages one, so
@@ -241,69 +403,78 @@ func (p *Plugin) ProduceTimeout() time.Duration {
 	return 0
 }
 
-// Produce derives the request's TokenizedPrompt via the configured backend and
+// Produce derives the request's TokenizedRequest via the configured backend and
 // stores it on the body. Skips when one is already present; errors propagate to
 // the Director, which logs and continues.
+//
+// The tokenize span opens below the already-tokenized skip path, so it is
+// emitted only when the backend is actually invoked.
 func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceRequest, _ []scheduling.Endpoint) error {
 	if request.Body == nil {
 		return errors.New("request body is nil")
 	}
-	if request.Body.TokenizedPrompt != nil {
+	if request.Body.RenderRequest {
+		return nil
+	}
+	if request.Body.TokenizedRequest != nil {
 		// A parser (e.g. vLLM gRPC) may pre-populate tokens without a salt;
 		// ensure cache-salt isolation still applies on the skip path.
-		if request.Body.TokenizedPrompt.CacheSalt == "" {
-			request.Body.TokenizedPrompt.CacheSalt = CacheSaltFromBody(request.Body)
+		if request.Body.TokenizedRequest.CacheSalt == "" {
+			request.Body.TokenizedRequest.CacheSalt = CacheSaltFromBody(request.Body)
 		}
 		return nil
+	}
+
+	ctx = withMMMetadata(ctx, parseMMMetadataHeaders(request.Headers))
+	if auth, ok := metadata.GetLowerCaseHeaderValue(request.Headers, "authorization"); ok {
+		ctx = withAuthHeader(ctx, auth)
+	}
+
+	ctx, span := tracing.Tracer(rcplugins.TracerScope).Start(ctx, "tokenize",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer span.End()
+	// On the default (tracing-disabled) path Start returns a non-recording span;
+	// skip attribute construction, which walks the request's multimodal features.
+	tracingActive := span.IsRecording()
+	if tracingActive {
+		attrs := []attribute.KeyValue{
+			semconv.LLMDEPPTokenProducerBackend(p.backendName),
+		}
+		if request.TargetModel != "" {
+			attrs = append(attrs, semconv.GenAIRequestModel(request.TargetModel))
+		}
+		if clientRequestID := request.Headers[reqcommon.RequestIDHeaderKey]; clientRequestID != "" {
+			attrs = append(attrs, semconv.GenAIRequestID(clientRequestID))
+		}
+		span.SetAttributes(attrs...)
 	}
 
 	tp, err := p.backend.produce(ctx, request.Body)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	if tp == nil || tp.TokenCount() == 0 {
+		if tracingActive {
+			span.SetAttributes(semconv.LLMDEPPTokenProducerResult(resultSkippedNoTokens))
+		}
 		return nil
 	}
 	tp.CacheSalt = CacheSaltFromBody(request.Body)
-	request.Body.TokenizedPrompt = tp
+	request.Body.TokenizedRequest = tp
+
+	if tracingActive {
+		span.SetAttributes(append(mmobs.SpanAttributes(request),
+			semconv.LLMDEPPTokenProducerTokenCount(tp.TokenCount()),
+		)...)
+	}
 	return nil
 }
 
-// ChatCompletionsToRenderChatRequest converts a ChatCompletionsRequest to a
-// tokenization RenderChatRequest, including multimodal content blocks.
-func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tokenizerTypes.RenderChatRequest {
-	conversation := make([]tokenizerTypes.Conversation, 0, len(chat.Messages))
-	for _, msg := range chat.Messages {
-		conv := tokenizerTypes.Conversation{
-			Role:      msg.Role,
-			Content:   tokenizerTypes.Content{Raw: msg.Content.Raw},
-			ToolCalls: msg.ToolCalls,
-		}
-		for _, block := range msg.Content.Structured {
-			conv.Content.Structured = append(conv.Content.Structured, tokenizerTypes.ContentBlock{
-				Type:     block.Type,
-				Text:     block.Text,
-				ImageURL: tokenizerTypes.ImageBlock{URL: block.ImageURL.URL},
-			})
-		}
-		conversation = append(conversation, conv)
-	}
-
-	return &tokenizerTypes.RenderChatRequest{
-		Conversation:              conversation,
-		Tools:                     chat.Tools,
-		Documents:                 chat.Documents,
-		ChatTemplate:              chat.ChatTemplate,
-		ReturnAssistantTokensMask: chat.ReturnAssistantTokensMask,
-		ContinueFinalMessage:      chat.ContinueFinalMessage,
-		AddGenerationPrompt:       chat.AddGenerationPrompt,
-		ChatTemplateKWArgs:        chat.ChatTemplateKWArgs,
-	}
-}
-
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal
-// metadata into the upstream flat list, sorted by placeholder offset so
-// consumers see items in prompt order. Returns nil when no content is present.
+// metadata into a flat list sorted by placeholder offset so consumers see
+// items in prompt order. Returns nil when no content is present.
 func convertMMFeaturesToUpstream(src *tokenization.MultiModalFeatures) []fwkrh.MultiModalFeature {
 	if src == nil || len(src.MMHashes) == 0 {
 		return nil
@@ -321,7 +492,7 @@ func convertMMFeaturesToUpstream(src *tokenization.MultiModalFeatures) []fwkrh.M
 		}
 		for i := 0; i < n; i++ {
 			items = append(items, fwkrh.MultiModalFeature{
-				Modality: fwkrh.Modality(modality),
+				Modality: reqcommon.Modality(modality),
 				Hash:     hashes[i],
 				Offset:   ranges[i].Offset,
 				Length:   ranges[i].Length,

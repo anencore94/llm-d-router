@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
@@ -32,6 +31,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
+	parserutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/util"
 )
 
 const (
@@ -43,7 +43,11 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &VllmHTTPParser{}
+var (
+	_ fwkrh.Parser            = &VllmHTTPParser{}
+	_ fwkrh.ModelNameRewriter = &VllmHTTPParser{}
+	_ fwkrh.PriorityRewriter  = &VllmHTTPParser{}
+)
 
 // VllmHTTPParser implements fwkrh.Parser for vLLM HTTP endpoints. It handles
 // /inference/v1/generate and delegates response parsing to an embedded
@@ -65,8 +69,18 @@ func NewVllmHTTPParser() *VllmHTTPParser {
 }
 
 // VllmHTTPParserPluginFactory is the factory function used to register the plugin.
-func VllmHTTPParserPluginFactory(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	return NewVllmHTTPParser().WithName(name), nil
+func VllmHTTPParserPluginFactory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	plugin, err := openai.OpenAIParserPluginFactory(name, parameters, nil)
+	if err != nil {
+		return nil, err
+	}
+	openAIParser, ok := plugin.(*openai.OpenAIParser)
+	if !ok {
+		return nil, fmt.Errorf("openai parser factory returned %T, want *openai.OpenAIParser", plugin)
+	}
+	parser := NewVllmHTTPParser().WithName(name)
+	parser.openai = openAIParser
+	return parser, nil
 }
 
 // TypedName returns the type and name tuple of this plugin instance.
@@ -87,10 +101,10 @@ func (p *VllmHTTPParser) Claims() fwkrh.Claims {
 	}
 }
 
-// ParseRequest handles /inference/v1/generate locally and delegates everything
-// else to the embedded OpenAI parser.
+// ParseRequest handles /inference/v1/generate with an optional trailing slash
+// and rejects other paths.
 func (p *VllmHTTPParser) ParseRequest(ctx context.Context, body []byte, headers map[string]string) (*fwkrh.ParseResult, error) {
-	if strings.HasSuffix(request.GetRequestPath(headers), generatePathSuffix) {
+	if request.MatchPathSuffix(request.GetRequestPath(headers), generatePathSuffix) {
 		return p.parseGenerateRequest(body)
 	}
 	return nil, fmt.Errorf("unsupported path: %s", request.GetRequestPath(headers))
@@ -102,11 +116,22 @@ func (p *VllmHTTPParser) ParseResponse(ctx context.Context, body []byte, headers
 	return p.openai.ParseResponse(ctx, body, headers, isStreaming)
 }
 
+// RewriteModelName delegates to the OpenAI parser; the generate body shares the payload map format.
+func (p *VllmHTTPParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	return p.openai.RewriteModelName(payload, model)
+}
+
+// RewritePriority delegates to the OpenAI-compatible map rewriter; the generate
+// body shares the same top-level priority field.
+func (p *VllmHTTPParser) RewritePriority(ctx fwkrh.PriorityRewriteContext, payload fwkrh.MarshalablePayload, priority int) (fwkrh.MarshalablePayload, bool, error) {
+	return p.openai.RewritePriority(ctx, payload, priority)
+}
+
 // parseGenerateRequest decodes a /inference/v1/generate body into an
 // InferenceRequestBody. Token IDs are required; everything else is optional.
 func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResult, error) {
-	bodyMap := make(map[string]any)
-	if err := json.Unmarshal(rawBody, &bodyMap); err != nil {
+	bodyMap, err := parserutil.UnmarshalMapWithRawField(rawBody, "token_ids")
+	if err != nil {
 		return nil, err
 	}
 
@@ -121,6 +146,9 @@ func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResul
 	body := &fwkrh.InferenceRequestBody{
 		Generate: &generate,
 		Payload:  fwkrh.PayloadMap(bodyMap),
+	}
+	if model, ok := bodyMap["model"].(string); ok {
+		body.Model = model
 	}
 	// max_tokens lives under sampling_params in the generate wire format.
 	if sp, ok := bodyMap["sampling_params"].(map[string]any); ok {

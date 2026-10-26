@@ -1,6 +1,23 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package e2e
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,10 +29,16 @@ import (
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
+
+	infextv1a2 "github.com/llm-d/llm-d-router/apix/v1alpha2"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
+	"github.com/llm-d/llm-d-router/test/e2e/utils/k8s"
+	"github.com/llm-d/llm-d-router/test/e2e/utils/metrics"
+	"github.com/llm-d/llm-d-router/test/e2e/utils/response"
 )
 
 func newOpenAIClient() *openai.Client {
-	c := openai.NewClient(option.WithBaseURL(fmt.Sprintf("http://localhost:%s/v1", port)))
+	c := openai.NewClient(option.WithBaseURL(fmt.Sprintf("http://localhost:%d/v1", getPort())))
 	return &c
 }
 
@@ -26,8 +49,9 @@ func extractInferenceHeaders(httpResp *http.Response) (string, string, string) {
 }
 
 func generateAndCheckLoad(count int) {
+	nsName := getNamespace()
 	for range count {
-		prefillPods, decodePods := getModelServerPods(podSelector, prefillSelector, decodeSelector)
+		prefillPods, decodePods := k8s.GetModelServerPods(testConfig, podSelector, prefillSelector, decodeSelector, nsName)
 		gomega.Expect(prefillPods).Should(gomega.BeEmpty())
 		gomega.Expect(decodePods).Should(gomega.HaveLen(1))
 
@@ -52,7 +76,7 @@ func generateAndCheckLoad(count int) {
 // doPost sends a POST request with a JSON body to the given path, asserts HTTP 200,
 // and returns the x-inference-namespace, x-inference-pod headers and the response body.
 func doPost(path, body string, extraHeaders map[string]string) (string, string, []byte) {
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%s%s", port, path), strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d%s", getPort(), path), strings.NewReader(body))
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range extraHeaders {
@@ -74,7 +98,7 @@ func doPost(path, body string, extraHeaders map[string]string) (string, string, 
 // doPostWithError sends a POST request with a JSON body to the given path
 // and returns the status code and the response body.
 func doPostWithError(path, body string, extraHeaders map[string]string) (int, []byte) {
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%s%s", port, path), strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d%s", getPort(), path), strings.NewReader(body))
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range extraHeaders {
@@ -102,7 +126,7 @@ func runCompletion(prompt string, theModel openai.CompletionNewParamsModel) (str
 		Model: theModel,
 	}
 
-	ginkgo.By(fmt.Sprintf("Sending Completion Request: (port %s) %#v", port, completionParams))
+	ginkgo.By(fmt.Sprintf("Sending Completion Request: (port %d) %#v", getPort(), completionParams))
 
 	resp, err := newOpenAIClient().Completions.New(testConfig.Context, completionParams, option.WithResponseInto(&httpResp), option.WithRequestTimeout(readyTimeout))
 
@@ -116,9 +140,30 @@ func runCompletion(prompt string, theModel openai.CompletionNewParamsModel) (str
 	return extractInferenceHeaders(httpResp)
 }
 
+// runCompletionWithModelRewrite POSTs a raw completion request carrying incomingModel in the
+// body. When targetModel is non-empty it is sent as the x-llm-d-model-name-rewrite header,
+// forcing EPP to rewrite the body's model field before forwarding. incomingModel is not a
+// name the model server recognizes on its own, so a 200 response with the rewritten model
+// echoed back proves EPP actually rewrote the body rather than passing it through.
+func runCompletionWithModelRewrite(prompt, incomingModel, targetModel string) string {
+	body := fmt.Sprintf(`{"model":%q,"prompt":%q,"max_tokens":%d}`, incomingModel, prompt, echoOutputTokens)
+	headers := map[string]string{}
+	if targetModel != "" {
+		headers[metadata.ModelNameRewriteKey] = targetModel
+	}
+	_, _, respBody := doPost("/v1/completions", body, headers)
+
+	var resp struct {
+		Model string `json:"model"`
+	}
+	gomega.Expect(json.Unmarshal(respBody, &resp)).ShouldNot(gomega.HaveOccurred())
+
+	return resp.Model
+}
+
 // tryCompletion is like runCompletion but returns an error instead of asserting,
 // intended for use inside Eventually blocks where transient failures are acceptable.
-func tryCompletion(prompt string, theModel openai.CompletionNewParamsModel) (string, string, string, error) {
+func tryCompletion(prompt string, theModel openai.CompletionNewParamsModel) (string, string, error) {
 	var httpResp *http.Response
 	completionParams := openai.CompletionNewParams{
 		Prompt: openai.CompletionNewParamsPromptUnion{OfString: openai.String(prompt)},
@@ -131,16 +176,61 @@ func tryCompletion(prompt string, theModel openai.CompletionNewParamsModel) (str
 		option.WithRequestTimeout(readyTimeout),
 	)
 	if err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
 	if httpResp == nil {
-		return "", "", "", errors.New("missing http response")
+		return "", "", errors.New("missing http response")
 	}
 	if len(resp.Choices) != 1 {
-		return "", "", "", fmt.Errorf("expected 1 choice, got %d", len(resp.Choices))
+		return "", "", fmt.Errorf("expected 1 choice, got %d", len(resp.Choices))
 	}
-	ns, pod, p := extractInferenceHeaders(httpResp)
-	return ns, pod, p, nil
+	if resp.Choices[0].FinishReason != openai.CompletionChoiceFinishReasonStop {
+		return "", "", fmt.Errorf("expected finish reason %q, got %q",
+			openai.CompletionChoiceFinishReasonStop, resp.Choices[0].FinishReason)
+	}
+	if resp.Choices[0].Text != prompt {
+		return "", "", fmt.Errorf("expected echoed prompt, got %q", resp.Choices[0].Text)
+	}
+	ns, pod, _ := extractInferenceHeaders(httpResp)
+	return ns, pod, nil
+}
+
+// By Hoeffding's inequality, in a batch of rolloutBatchSize independent selections at
+// fixed weights, a target's share strays more than rolloutTolerance from
+// weight/totalWeight with probability at most
+// 2*exp(-2*rolloutBatchSize*rolloutTolerance^2), about 3e-8.
+const (
+	rolloutBatchSize = 400
+	rolloutTolerance = 0.15
+)
+
+// expectRolloutSplit checks the share of completions that each target's Pods serve.
+// podModels maps a Pod name to the model it serves. Batches are retried because the
+// EPP observes a rewrite update asynchronously.
+func expectRolloutSplit(podModels map[string]string, targets []infextv1a2.TargetModel) {
+	var totalWeight int32
+	weights := make([]string, len(targets))
+	for i, target := range targets {
+		totalWeight += *target.Weight
+		weights[i] = fmt.Sprintf("%s=%d", target.ModelRewrite, *target.Weight)
+	}
+	ginkgo.By("Sending completions until the split matches " + strings.Join(weights, ", "))
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		served := map[string]int{}
+		for range rolloutBatchSize {
+			_, pod, err := tryCompletion(simplePrompt, simModelName)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			served[podModels[pod]]++
+		}
+		g.Expect(served).To(gomega.HaveLen(len(targets)), "served by model: %v", served)
+		for _, target := range targets {
+			g.Expect(served).To(gomega.HaveKey(target.ModelRewrite), "served by model: %v", served)
+			share := float64(served[target.ModelRewrite]) / rolloutBatchSize
+			want := float64(*target.Weight) / float64(totalWeight)
+			g.Expect(share).To(gomega.BeNumerically("~", want, rolloutTolerance), "served by model: %v", served)
+		}
+	}, testConfig.ReadyTimeout, testConfig.Interval).Should(gomega.Succeed())
 }
 
 func runChatCompletion(prompt, modelName string) (string, string, string) {
@@ -189,6 +279,42 @@ func runRawChatCompletion(body string) (string, string) {
 	return ns, pod
 }
 
+// imageItemJSON builds the JSON fragment for one image_url content block.
+func imageItemJSON(url string, i int) string {
+	return fmt.Sprintf(`{"type":"image_url","image_url":{"url":%q},"uuid":"image-%d"}`, url, i)
+}
+
+// videoItemJSON builds the JSON fragment for one video_url content block.
+func videoItemJSON(url string) string {
+	return fmt.Sprintf(`{"type":"video_url","video_url":{"url":%q}}`, url)
+}
+
+// inlineAudioItemJSON builds the JSON fragment for one input_audio content block.
+func inlineAudioItemJSON(data string) string {
+	return fmt.Sprintf(`{"type":"input_audio","input_audio":{"data":%q,"format":"wav"}}`, data)
+}
+
+// imageEmbedsItemJSON builds the JSON fragment for one image_embeds content block.
+func imageEmbedsItemJSON(embeds string, i int) string {
+	return fmt.Sprintf(`{"type":"image_embeds","image_embeds":%q,"uuid":"embedded-image-%d"}`, embeds, i)
+}
+
+// chatCompletionBody assembles a chat-completions request body from pre-built
+// content-item JSON fragments plus a trailing text prompt. maxTokens is
+// omitted when zero.
+func chatCompletionBody(prompt string, maxTokens int, items []string) string {
+	prefix := strings.Join(items, ",")
+	if len(items) > 0 {
+		prefix += ","
+	}
+	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":[%s{"type":"text","text":%q}]}]`,
+		simModelName, prefix, prompt)
+	if maxTokens > 0 {
+		body += fmt.Sprintf(`,"max_tokens":%d`, maxTokens)
+	}
+	return body + "}"
+}
+
 // runChatCompletionWithImages sends a multimodal chat completion request with one or more image_url
 // content blocks. When called with no arguments it defaults to testImageURL (single image).
 // Each image is assigned a uuid derived from its index.
@@ -198,22 +324,11 @@ func runChatCompletionWithImages(imageURLs ...string) (string, string) {
 		imageURLs = []string{testImageURL}
 	}
 	ginkgo.By(fmt.Sprintf("Sending Multimodal Chat Completion Request with %d images", len(imageURLs)))
-	var sb strings.Builder
-	for i, url := range imageURLs {
-		sb.WriteString(fmt.Sprintf(`{"type":"image_url","image_url":{"url":%q},"uuid":"image-%d"},`, url, i))
+	items := make([]string, len(imageURLs))
+	for i, u := range imageURLs {
+		items[i] = imageItemJSON(u, i)
 	}
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":[%s{"type":"text","text":"Describe what you see."}]}],"max_tokens":150}`,
-		simModelName, sb.String())
-	return runRawChatCompletion(body)
-}
-
-// runChatCompletionWithVideo sends a multimodal chat completion request with a video_url content block.
-// Returns the namespace and pod name from the response headers.
-func runChatCompletionWithVideo() (string, string) {
-	ginkgo.By("Sending Multimodal Chat Completion Request with video: " + testVideoURL)
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":[{"type":"text","text":"What is happening in this video?"},{"type":"video_url","video_url":{"url":%q}}]}]}`,
-		simModelName, testVideoURL)
-	return runRawChatCompletion(body)
+	return runRawChatCompletion(chatCompletionBody("Describe what you see.", 150, items))
 }
 
 // runChatCompletionWithImageEmbeds sends a chat completion request with an image_embeds content block
@@ -222,23 +337,60 @@ func runChatCompletionWithVideo() (string, string) {
 // Returns the namespace and pod name from the response headers.
 func runChatCompletionWithImageEmbeds() (string, string) {
 	ginkgo.By("Sending Chat Completion Request with image_embeds")
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":[{"type":"text","text":"Describe this embedded image:"},{"type":"image_embeds","image_embeds":%q,"uuid":"embedded-image-1"}]}]}`,
-		simModelName, testImageEmbeds)
-	return runRawChatCompletion(body)
+	return runRawChatCompletion(chatCompletionBody("Describe this embedded image:", 0, []string{imageEmbedsItemJSON(testImageEmbeds, 1)}))
 }
 
-// runChatCompletionWithAudio sends a chat completion request with an input_audio content block.
-// input_audio is a recognised multimodal type so it triggers the encode stage.
+// runChatCompletionWithVideos sends a multimodal chat completion request with one or more
+// video_url content blocks. When called with no arguments it defaults to testVideoURL.
 // Returns the namespace and pod name from the response headers.
-func runChatCompletionWithAudio() (string, string) {
-	ginkgo.By("Sending Chat Completion Request with input_audio")
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":[{"type":"text","text":"What is being said in this audio clip?"},{"type":"input_audio","input_audio":{"data":%q,"format":"wav"}}]}],"max_tokens":100}`,
-		simModelName, testAudioData)
-	return runRawChatCompletion(body)
+func runChatCompletionWithVideos(videoURLs ...string) (string, string) {
+	if len(videoURLs) == 0 {
+		videoURLs = []string{testVideoURL}
+	}
+	ginkgo.By(fmt.Sprintf("Sending Multimodal Chat Completion Request with %d videos", len(videoURLs)))
+	items := make([]string, len(videoURLs))
+	for i, u := range videoURLs {
+		items[i] = videoItemJSON(u)
+	}
+	return runRawChatCompletion(chatCompletionBody("What is happening in these videos?", 0, items))
+}
+
+// runChatCompletionWithAudios sends a multimodal chat completion request with one or more
+// input_audio content blocks. When called with no arguments it defaults to testAudioData.
+// Returns the namespace and pod name from the response headers.
+func runChatCompletionWithAudios(audioClips ...string) (string, string) {
+	if len(audioClips) == 0 {
+		audioClips = []string{testAudioData}
+	}
+	ginkgo.By(fmt.Sprintf("Sending Multimodal Chat Completion Request with %d audio clips", len(audioClips)))
+	items := make([]string, len(audioClips))
+	for i, d := range audioClips {
+		items[i] = inlineAudioItemJSON(d)
+	}
+	return runRawChatCompletion(chatCompletionBody("What is being said in these audio clips?", 100, items))
+}
+
+// runChatCompletionWithMixedMedia sends a multimodal chat completion request combining
+// image_url, input_audio, and video_url content blocks in a single request.
+// Returns the namespace and pod name from the response headers.
+func runChatCompletionWithMixedMedia(imageURLs, audioClips, videoURLs []string) (string, string) {
+	ginkgo.By(fmt.Sprintf("Sending Mixed-Media Chat Completion Request: %d images + %d audio + %d video",
+		len(imageURLs), len(audioClips), len(videoURLs)))
+	items := make([]string, 0, len(imageURLs)+len(audioClips)+len(videoURLs))
+	for i, u := range imageURLs {
+		items = append(items, imageItemJSON(u, i))
+	}
+	for _, d := range audioClips {
+		items = append(items, inlineAudioItemJSON(d))
+	}
+	for _, u := range videoURLs {
+		items = append(items, videoItemJSON(u))
+	}
+	return runRawChatCompletion(chatCompletionBody("Describe everything you see and hear.", 150, items))
 }
 
 func runStreamingCompletion(prompt string, theModel openai.CompletionNewParamsModel) (string, string) {
-	ginkgo.By(fmt.Sprintf("Sending Streaming Completion Request: (port %s) model=%s", port, theModel))
+	ginkgo.By(fmt.Sprintf("Sending Streaming Completion Request: (port %d) model=%s", getPort(), theModel))
 	body := fmt.Sprintf(`{"model":"%s","prompt":"%s","max_tokens":50,"stream":true}`, theModel, prompt)
 	ns, pod, respBody := doPost("/v1/completions", body, nil)
 	ginkgo.By(fmt.Sprintf("Streaming Completion received response length: %d bytes", len(respBody)))
@@ -246,7 +398,7 @@ func runStreamingCompletion(prompt string, theModel openai.CompletionNewParamsMo
 }
 
 func runStreamingChatCompletion(prompt string) (string, string) {
-	ginkgo.By(fmt.Sprintf("Sending Streaming Chat Completion Request: (port %s)", port))
+	ginkgo.By(fmt.Sprintf("Sending Streaming Chat Completion Request: (port %d)", getPort()))
 	body := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"%s"}],"stream":true}`, simModelName, prompt)
 	ns, pod, respBody := doPost("/v1/chat/completions", body, nil)
 	ginkgo.By(fmt.Sprintf("Streaming Chat Completion received response length: %d bytes", len(respBody)))
@@ -258,10 +410,10 @@ func runStreamingChatCompletion(prompt string) (string, string) {
 // Returns namespace header, pod header, and the finish reason from the response.
 func runCompletionWithCacheThreshold(prompt string, cacheHitThreshold float64, forceCacheThresholdFinishReason bool) (string, string, string) {
 	ginkgo.By(fmt.Sprintf("Sending Completion Request with cache_hit_threshold=%v, forceCacheThreshold=%v", cacheHitThreshold, forceCacheThresholdFinishReason))
-	body := fmt.Sprintf(`{"model":"%s","prompt":"%s","max_tokens":10,"cache_hit_threshold":%v}`, simModelName, prompt, cacheHitThreshold)
+	body := fmt.Sprintf(`{"model":"%s","prompt":"%s","max_tokens":%d,"cache_hit_threshold":%v}`, simModelName, prompt, echoOutputTokens, cacheHitThreshold)
 	extraHeaders := cacheThresholdHeaders(forceCacheThresholdFinishReason)
 	ns, pod, respBody := doPost("/v1/completions", body, extraHeaders)
-	finishReason := extractFinishReason(string(respBody))
+	finishReason := response.ExtractFinishReason(string(respBody))
 	ginkgo.By(fmt.Sprintf("Completion Response: ns=%s, pod=%s, finish_reason=%s", ns, pod, finishReason))
 	return ns, pod, finishReason
 }
@@ -269,10 +421,10 @@ func runCompletionWithCacheThreshold(prompt string, cacheHitThreshold float64, f
 // runStreamingCompletionWithCacheThreshold sends a streaming completion request with cache_hit_threshold.
 func runStreamingCompletionWithCacheThreshold(prompt string, cacheHitThreshold float64, forceCacheThresholdFinishReason bool) (string, string, string) {
 	ginkgo.By(fmt.Sprintf("Sending Streaming Completion Request with cache_hit_threshold=%v, forceCacheThreshold=%v", cacheHitThreshold, forceCacheThresholdFinishReason))
-	body := fmt.Sprintf(`{"model":"%s","prompt":"%s","max_tokens":10,"stream":true,"cache_hit_threshold":%v}`, simModelName, prompt, cacheHitThreshold)
+	body := fmt.Sprintf(`{"model":"%s","prompt":"%s","max_tokens":%d,"stream":true,"cache_hit_threshold":%v}`, simModelName, prompt, echoOutputTokens, cacheHitThreshold)
 	extraHeaders := cacheThresholdHeaders(forceCacheThresholdFinishReason)
 	ns, pod, respBody := doPost("/v1/completions", body, extraHeaders)
-	finishReason := extractFinishReasonFromStreaming(string(respBody))
+	finishReason := response.ExtractFinishReasonFromStreaming(string(respBody))
 	ginkgo.By(fmt.Sprintf("Streaming Completion Response: ns=%s, pod=%s, finish_reason=%s", ns, pod, finishReason))
 	return ns, pod, finishReason
 }
@@ -294,36 +446,12 @@ func verifyMetrics(infPoolName string, numTargetPorts int) {
 		doPostWithError("/v1/chat/completions", "an invalid body", nil)
 	}
 
-	metricsURL := fmt.Sprintf("http://localhost:%s/metrics", metricsPort)
+	metricsURL := fmt.Sprintf("http://localhost:%d/metrics", getMetricsPort())
 
-	if k8sContext != "" {
-		// Use port-forward to access the EPP pod's metrics endpoint.
-		startEPPMetricsPortForward()
-	}
-
-	theMetrics := getMetrics(metricsURL)
-	gomega.Expect(theMetrics).ShouldNot(gomega.BeEmpty())
-	metricsAsString := strings.Join(theMetrics, "\n")
-
-	_, decodePods := getModelServerPods(podSelector, prefillSelector, decodeSelector)
+	_, decodePods := k8s.GetModelServerPods(testConfig, podSelector, prefillSelector, decodeSelector, getNamespace())
 
 	// Define the metrics we expect to see
-	preset := []string{ //nolint:prealloc
-		"inference_objective_request_total",
-		"inference_objective_request_error_total",
-		"inference_objective_request_duration_seconds",
-		"inference_objective_normalized_time_per_output_token_seconds",
-		"inference_objective_request_sizes",
-		"inference_objective_response_sizes",
-		"inference_objective_input_tokens",
-		"inference_objective_output_tokens",
-		"inference_pool_average_kv_cache_utilization",
-		"inference_pool_average_queue_size",
-		"inference_pool_per_pod_queue_size",
-		"inference_objective_running_requests",
-		"inference_pool_ready_pods",
-		"inference_extension_info",
-
+	preset := []string{
 		// llm_d metrics
 		"llm_d_epp_request_total",
 		"llm_d_epp_request_error_total",
@@ -339,19 +467,14 @@ func verifyMetrics(infPoolName string, numTargetPorts int) {
 		"llm_d_epp_request_running",
 		"llm_d_epp_ready_endpoints",
 		"llm_d_epp_info",
+		"llm_d_epp_request_processing_duration_seconds",
+		"llm_d_epp_response_processing_duration_seconds",
 	}
 	expectedMetrics := make([]string, 0, len(preset)+len(decodePods)*numTargetPorts*2)
 	expectedMetrics = append(expectedMetrics, preset...)
 
 	for _, modelServerPodName := range decodePods {
 		for rank := range numTargetPorts {
-			metricQueueSize := fmt.Sprintf(
-				"inference_pool_per_pod_queue_size{model_server_pod=\"%s-rank-%d\",name=\"%s\"}",
-				modelServerPodName,
-				rank,
-				infPoolName)
-			expectedMetrics = append(expectedMetrics, metricQueueSize)
-
 			metricQueueSizeNew := fmt.Sprintf(
 				"llm_d_epp_per_endpoint_queue_size{model_server_endpoint=\"%s-rank-%d\",name=\"%s\"}",
 				modelServerPodName,
@@ -362,8 +485,12 @@ func verifyMetrics(infPoolName string, numTargetPorts int) {
 		}
 	}
 
-	// Check if all expected metrics are present in the metrics output.
-	for _, metric := range expectedMetrics {
-		gomega.Expect(metricsAsString).Should(gomega.ContainSubstring(metric))
-	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		theMetrics := metrics.GetMetrics(metricsURL)
+		g.Expect(theMetrics).ShouldNot(gomega.BeEmpty())
+		metricsAsString := strings.Join(theMetrics, "\n")
+		for _, metric := range expectedMetrics {
+			g.Expect(metricsAsString).Should(gomega.ContainSubstring(metric))
+		}
+	}, testConfig.ReadyTimeout, testConfig.Interval).Should(gomega.Succeed())
 }

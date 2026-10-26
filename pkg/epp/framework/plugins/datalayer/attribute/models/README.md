@@ -6,13 +6,21 @@ This package defines the data structures for models served by an endpoint, as re
 
 A collection of `ModelData` entries describing the models exposed by an endpoint.
 
-- **Key**: `ModelsAttributeKey` (`/v1/models`)
+- **Key**: `ModelsAttributeKey`; its string form is `/v1/models/models-data-extractor` (the data type `/v1/models` plus the producer name `models-data-extractor`).
 - **Fields** (per `ModelData`):
   - `ID`: Model identifier.
-  - `Parent`: Parent model identifier (optional, e.g. for adapters).
+  - `Object`: Object type as reported by the model server (i.e. `model`).
+  - `Created`: Unix timestamp reported by the model server.
+  - `OwnedBy`: Owner reported by the model server (e.g. `vllm`, `sglang`).
+  - `ShutdownDate`: Optional `YYYY-MM-DD` date when the model will no longer be available. Invalid
+    or non-string values are ignored.
+  - `Parent`: Parent model identifier for internal use (e.g. for LoRA adapters).
 
 ## Producers
 
 The following plugins produce this attribute:
 
 - **`models-data-extractor`** (Data Layer): Extracts the list of served models from the endpoint's `/v1/models` API response.
+
+The `models-responder` consumes the per-endpoint collection for the pool-wide `GET /v1/models`
+response and inference screening.

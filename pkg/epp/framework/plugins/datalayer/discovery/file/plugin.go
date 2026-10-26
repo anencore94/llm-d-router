@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright 2025 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,6 +48,15 @@ type EndpointEntry struct {
 	Address   string            `json:"address"             yaml:"address"`
 	Port      string            `json:"port"                yaml:"port"`
 	Labels    map[string]string `json:"labels,omitempty"    yaml:"labels,omitempty"`
+	// Attributes declares string attributes to stamp onto the endpoint's
+	// attribute map at construction (keyed with
+	// fwkdl.DiscoveryAttributesProducer) — e.g. routing hints a downstream
+	// plugin reads, without going through label-to-attribute mapping.
+	Attributes map[string]string `json:"attributes,omitempty" yaml:"attributes,omitempty"`
+	// RankIndex is the endpoint's pod-local rank, used to offset well-known
+	// ports (for example the KV-events socket) when multiple engines are
+	// co-located on the same address. Defaults to 0.
+	RankIndex int `json:"rankIndex,omitempty" yaml:"rankIndex,omitempty"`
 }
 
 // EndpointsFile is the top-level structure of the endpoints YAML/JSON file.
@@ -72,6 +81,9 @@ type FileDiscovery struct {
 	typedName fwkplugin.TypedName
 	path      string
 	watchFile bool
+	// validateAddress checks an endpoint address. Injected at construction so a
+	// variant can loosen it without load() branching on the plugin type.
+	validateAddress func(string) error
 	// mu guards endpoints, which DumpState reads concurrently with load.
 	mu sync.RWMutex
 	// endpoints is the set of endpoint identities applied to the datastore
@@ -89,9 +101,15 @@ var (
 	_ fwkplugin.StateDumper   = (*FileDiscovery)(nil)
 )
 
-// Factory is the plugin factory for file-discovery.
+// Factory is the plugin factory for file-discovery. Endpoint addresses must be IPv4.
 func Factory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	p := &params{WatchFile: false}
+	return newFileDiscovery(PluginType, name, parameters, validateIPv4Address)
+}
+
+// newFileDiscovery decodes the shared file-discovery parameters and builds a
+// FileDiscovery with the given address validator. name defaults to pluginType.
+func newFileDiscovery(pluginType, name string, parameters *json.Decoder, validateAddress func(string) error) (*FileDiscovery, error) {
+	p := &params{}
 	if parameters != nil {
 		if err := parameters.Decode(p); err != nil {
 			return nil, fmt.Errorf("file-discovery: failed to parse parameters: %w", err)
@@ -101,15 +119,25 @@ func Factory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplug
 		return nil, errors.New("file-discovery: 'path' parameter is required")
 	}
 	if name == "" {
-		name = PluginType
+		name = pluginType
 	}
 	return &FileDiscovery{
-		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
-		path:      p.Path,
-		watchFile: p.WatchFile,
-		endpoints: make(map[types.NamespacedName]struct{}),
-		ready:     make(chan struct{}),
+		typedName:       fwkplugin.TypedName{Type: pluginType, Name: name},
+		path:            p.Path,
+		watchFile:       p.WatchFile,
+		validateAddress: validateAddress,
+		endpoints:       make(map[types.NamespacedName]struct{}),
+		ready:           make(chan struct{}),
 	}, nil
+}
+
+// validateIPv4Address requires the address to be an IPv4 literal, matching the pod
+// discovery contract.
+func validateIPv4Address(address string) error {
+	if ip := net.ParseIP(address); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("invalid IPv4 address %q", address)
+	}
+	return nil
 }
 
 func (f *FileDiscovery) TypedName() fwkplugin.TypedName { return f.typedName }
@@ -237,28 +265,43 @@ func (f *FileDiscovery) load(notifier fwkdl.DiscoveryNotifier) error {
 
 	incoming := make(map[types.NamespacedName]struct{}, len(ef.Endpoints))
 	var errs []error
-	for _, e := range ef.Endpoints {
-		if ip := net.ParseIP(e.Address); ip == nil || ip.To4() == nil {
-			errs = append(errs, fmt.Errorf("endpoint %q: invalid IPv4 address %q", e.Name, e.Address))
+	for i, e := range ef.Endpoints {
+		if e.Name == "" {
+			errs = append(errs, fmt.Errorf("endpoints[%d]: name is required", i))
+			continue
+		}
+		if err := f.validateAddress(e.Address); err != nil {
+			errs = append(errs, fmt.Errorf("endpoint %q: %w", e.Name, err))
 			continue
 		}
 		if portNum, err := strconv.Atoi(e.Port); err != nil || portNum < 1 || portNum > 65535 {
 			errs = append(errs, fmt.Errorf("endpoint %q: invalid port %q", e.Name, e.Port))
 			continue
 		}
+		if e.RankIndex < 0 {
+			errs = append(errs, fmt.Errorf("endpoint %q: invalid rankIndex %d", e.Name, e.RankIndex))
+			continue
+		}
 		ns := e.Namespace
 		if ns == "" {
 			ns = "default"
 		}
-		meta := &fwkdl.EndpointMetadata{
-			NamespacedName: types.NamespacedName{Name: e.Name, Namespace: ns},
-			PodName:        e.Name,
-			Address:        e.Address,
-			Port:           e.Port,
-			MetricsHost:    net.JoinHostPort(e.Address, e.Port),
-			Labels:         e.Labels,
+		id := types.NamespacedName{Name: e.Name, Namespace: ns}
+		if _, exists := incoming[id]; exists {
+			errs = append(errs, fmt.Errorf("endpoint %q: duplicate name in namespace %q", e.Name, ns))
+			continue
 		}
-		incoming[meta.NamespacedName] = struct{}{}
+		meta := &fwkdl.EndpointMetadata{
+			ID:          id,
+			Name:        e.Name,
+			Address:     e.Address,
+			Port:        e.Port,
+			MetricsHost: net.JoinHostPort(e.Address, e.Port),
+			Labels:      e.Labels,
+			Attributes:  e.Attributes,
+			RankIndex:   e.RankIndex,
+		}
+		incoming[meta.ID] = struct{}{}
 		notifier.Upsert(meta)
 	}
 

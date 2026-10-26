@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright 2025 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -188,7 +188,7 @@ func TestInferenceModelRewriteReconciler(t *testing.T) {
 					WithScheme(scheme).
 					WithObjects(initObjs...).
 					Build()
-				ds := datastore.NewDatastore(t.Context(), epf, 0)
+				ds := datastore.NewDatastore(t.Context(), epf)
 				for _, r := range test.rewritesInStore {
 					ds.ModelRewriteSet(r)
 				}

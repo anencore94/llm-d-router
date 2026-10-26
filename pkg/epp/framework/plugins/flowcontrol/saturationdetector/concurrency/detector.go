@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +25,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,15 +63,19 @@ func ConcurrencyDetectorFactory(
 }
 
 var (
-	_ fwksched.Filter                = &detector{}
-	_ flowcontrol.SaturationDetector = &detector{}
+	_ fwksched.Filter                        = &detector{}
+	_ flowcontrol.SaturationDetector         = &detector{}
+	_ flowcontrol.DispatchReservationTracker = &detector{}
 )
 
 // detector implements a saturation detector and scheduling filter based on active request concurrency.
 type detector struct {
-	config              config
-	typedName           fwkplugin.TypedName
-	inFlightLoadDataKey fwkplugin.DataKey
+	config                       config
+	typedName                    fwkplugin.TypedName
+	inFlightLoadDataKey          fwkplugin.DataKey
+	uncachedRequestTokensDataKey fwkplugin.DataKey
+	dispatchReservations         sync.Map
+	pendingDispatches            atomic.Int64
 }
 
 // newDetector creates a new instance of the Concurrency Detector.
@@ -83,7 +90,8 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 		"mode", cfg.mode,
 		"maxConcurrency", cfg.maxConcurrency,
 		"maxTokenConcurrency", cfg.maxTokenConcurrency,
-		"headroom", cfg.headroom)
+		"headroom", cfg.headroom,
+		"failOpen", !cfg.failClosed)
 
 	if cfg.headroom > 1.0 {
 		pluginLogger.Info("Unusually high headroom configured; verify value is a fraction, not a percentage",
@@ -92,9 +100,10 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 	}
 
 	return &detector{
-		config:              cfg,
-		typedName:           typedName,
-		inFlightLoadDataKey: attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		config:                       cfg,
+		typedName:                    typedName,
+		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
 	}
 }
 
@@ -104,13 +113,19 @@ func (d *detector) TypedName() fwkplugin.TypedName {
 }
 
 func (d *detector) Consumes() fwkplugin.DataDependencies {
+	required := map[fwkplugin.DataKey]any{
+		d.inFlightLoadDataKey: attrconcurrency.InFlightLoad{},
+	}
+	if d.config.mode == modeTokens || d.config.mode == modeHybrid {
+		required[d.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
+	}
 	return fwkplugin.DataDependencies{
-		Required: map[fwkplugin.DataKey]any{d.inFlightLoadDataKey: attrconcurrency.InFlightLoad{}},
+		Required: required,
 	}
 }
 
 func (d *detector) getLoad(m datalayer.AttributeMap) *attrconcurrency.InFlightLoad {
-	if val, ok := m.Get(d.inFlightLoadDataKey.String()); ok {
+	if val, ok := m.Get(d.inFlightLoadDataKey); ok {
 		if load, ok := val.(*attrconcurrency.InFlightLoad); ok {
 			return load
 		}
@@ -119,51 +134,118 @@ func (d *detector) getLoad(m datalayer.AttributeMap) *attrconcurrency.InFlightLo
 	return &attrconcurrency.InFlightLoad{}
 }
 
+// ReserveDispatch accounts for a request in the interval after flow-control dispatch and before
+// the in-flight load producer publishes it through PreRequest.
+func (d *detector) ReserveDispatch(requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	if _, loaded := d.dispatchReservations.LoadOrStore(requestID, struct{}{}); loaded {
+		return false
+	}
+	d.pendingDispatches.Add(1)
+	return true
+}
+
+// ReleaseDispatch removes a dispatch reservation. Duplicate and unknown releases are no-ops.
+func (d *detector) ReleaseDispatch(requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	if _, loaded := d.dispatchReservations.LoadAndDelete(requestID); !loaded {
+		return false
+	}
+	d.pendingDispatches.Add(-1)
+	return true
+}
+
+// getIncomingTokens returns the uncached tokens the current request would add to the endpoint.
+func (d *detector) getIncomingTokens(m datalayer.AttributeMap) int64 {
+	if val, ok := m.Get(d.uncachedRequestTokensDataKey); ok {
+		if tokens, ok := val.(*attrconcurrency.UncachedRequestTokens); ok && tokens.Tokens > 0 {
+			return tokens.Tokens
+		}
+	}
+	return 0
+}
+
 // Saturation calculates the saturation level of the pool.
 //
-// It returns an aggregate saturation signal where:
+// In "requests" and "tokens" mode it returns an aggregate signal, evaluated as:
 //
-//	Saturation = Total Inflight Requests / Total MaxConcurrency Capacity.
+//	Saturation = Total Inflight / Total Capacity.
+//
+// In "hybrid" mode saturation is instead evaluated per endpoint as
+// max(requestRatio, tokenRatio) and averaged across endpoints. Evaluating each
+// endpoint independently ensures an endpoint saturated on either dimension is
+// reflected in the pool signal.
+//
+// The inflight counts are read from the InFlightLoad attribute, which the
+// InFlightLoadProducer increments at dispatch and decrements on request
+// completion, so the signal already reflects completions with no scrape lag.
 func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint) float64 {
 	if len(endpoints) == 0 {
 		return 1.0
 	}
 
-	var totalInflight, totalCapacity int64
+	var reqInflight, reqCapacity, tokInflight, tokCapacity int64
+	var endpointCount int
+	var hybridSatSum float64
 	for _, e := range endpoints {
 		if e == nil {
 			continue
 		}
 
-		if d.config.mode == modeTokens {
-			totalCapacity += d.config.maxTokenConcurrency
-		} else {
-			totalCapacity += d.config.maxConcurrency
-		}
+		endpointCount++
+		reqCapacity += d.config.maxConcurrency
+		tokCapacity += d.config.maxTokenConcurrency
 
 		if e.GetMetadata() == nil {
 			continue
 		}
 
 		load := d.getLoad(e.GetAttributes())
+		reqInflight += load.Requests
+		tokInflight += load.Tokens
+		hybridSatSum += max(
+			ratio(load.Requests, d.config.maxConcurrency),
+			ratio(load.Tokens, d.config.maxTokenConcurrency),
+		)
+	}
+	pendingDispatches := d.pendingDispatches.Load()
 
-		if d.config.mode == modeTokens {
-			totalInflight += load.Tokens
-		} else {
-			totalInflight += load.Requests
+	switch d.config.mode {
+	case modeTokens:
+		return ratio(tokInflight, tokCapacity)
+	case modeHybrid:
+		if endpointCount == 0 {
+			return 1.0
 		}
+		return max(
+			hybridSatSum/float64(endpointCount),
+			ratio(reqInflight+pendingDispatches, reqCapacity),
+		)
+	default:
+		return ratio(reqInflight+pendingDispatches, reqCapacity)
 	}
-
-	if totalCapacity == 0 {
-		return 1.0
-	}
-
-	return float64(totalInflight) / float64(totalCapacity)
 }
 
-// Filter blocks traffic to specific endpoints that are physically saturated or exceeding their safety limits.
+// ratio computes inflight/capacity, failing closed (1.0) when capacity is zero.
+func ratio(inflight, capacity int64) float64 {
+	if capacity == 0 {
+		return 1.0
+	}
+	return float64(inflight) / float64(capacity)
+}
+
+// Filter blocks traffic to specific endpoints that would exceed their safety limits.
 //
-// It applies a relaxed limit (MaxConcurrency * (1 + Headroom)) to allow for scheduling flexibility and burst tolerance.
+// It applies a relaxed limit (Capacity * (1 + Headroom)) to allow for scheduling flexibility and burst tolerance.
+// In "tokens" and "hybrid" mode the endpoint's token load includes the uncached tokens this request would add
+// to it, so an endpoint is dropped when admitting the request would take it over the limit. An endpoint with no
+// in-flight tokens always passes the token check: it is the best placement the pool can offer a request that
+// is larger than the limit. In "hybrid" mode an endpoint is also dropped when its request load reaches the limit.
+// If all endpoints are filtered out, the filter fails open and returns all endpoints, unless FailOpen is false.
 func (d *detector) Filter(
 	_ context.Context,
 	_ *fwksched.InferenceRequest,
@@ -172,28 +254,45 @@ func (d *detector) Filter(
 	// Pre-allocate assuming most endpoints will pass the filter to minimize allocations.
 	filtered := make([]fwksched.Endpoint, 0, len(endpoints))
 
-	var limit int64
-	if d.config.mode == modeTokens {
-		limit = int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
-	} else {
-		limit = int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
-	}
+	reqLimit := int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
+	tokLimit := int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
+	countIncoming := d.config.mode == modeTokens || d.config.mode == modeHybrid
 
 	for _, e := range endpoints {
 		if e == nil {
 			continue
 		}
 		load := d.getLoad(e)
+		var incomingTokens int64
+		if countIncoming {
+			incomingTokens = d.getIncomingTokens(e)
+		}
 
-		if d.config.mode == modeTokens {
-			if load.Tokens < limit {
-				filtered = append(filtered, e)
-			}
-		} else {
-			if load.Requests < limit {
+		if d.admits(load, incomingTokens, reqLimit, tokLimit) {
+			filtered = append(filtered, e)
+		}
+	}
+	if len(filtered) == 0 && !d.config.failClosed {
+		for _, e := range endpoints {
+			if e != nil {
 				filtered = append(filtered, e)
 			}
 		}
 	}
 	return filtered
+}
+
+// admits reports whether an endpoint can take the request within its safety limit for the active mode.
+// An endpoint must be below each limit, and its token load plus the request's tokens must fit within
+// the token limit unless the endpoint has no in-flight tokens.
+func (d *detector) admits(load *attrconcurrency.InFlightLoad, incomingTokens, reqLimit, tokLimit int64) bool {
+	tokensFit := load.Tokens < tokLimit && (load.Tokens == 0 || load.Tokens+incomingTokens <= tokLimit)
+	switch d.config.mode {
+	case modeTokens:
+		return tokensFit
+	case modeHybrid:
+		return load.Requests < reqLimit && tokensFit
+	default:
+		return load.Requests < reqLimit
+	}
 }

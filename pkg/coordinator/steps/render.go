@@ -1,0 +1,500 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package steps
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+
+	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
+	coordmetrics "github.com/llm-d/llm-d-router/pkg/coordinator/metrics"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
+)
+
+const RenderStepName = "render"
+
+func init() {
+	pipeline.Register(RenderStepName, NewRenderStep)
+}
+
+type RenderStep struct {
+	serviceAddress            string
+	maxTotalTokens            int
+	maxTotalPlaceholderTokens int
+	client                    *http.Client
+}
+
+func NewRenderStep(_ *gateway.Client, params map[string]any) (pipeline.Step, error) {
+	timeout := 30 * time.Second
+	if v, ok, err := paramDuration(params, "timeout"); err != nil {
+		return nil, err
+	} else if ok {
+		timeout = v
+	}
+
+	maxIdleConnsPerHost := 100
+	if v, ok, err := paramInt(params, "max_idle_conns_per_host"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 0 {
+			return nil, fmt.Errorf("max_idle_conns_per_host must be non-negative, got %d", v)
+		}
+		maxIdleConnsPerHost = v
+	}
+
+	idleConnTimeout := 90 * time.Second
+	if v, ok, err := paramDuration(params, "idle_conn_timeout"); err != nil {
+		return nil, err
+	} else if ok {
+		idleConnTimeout = v
+	}
+
+	address, err := paramString(params, "address")
+	if err != nil {
+		return nil, err
+	}
+
+	maxTokens := 0
+	if v, ok, err := paramInt(params, "max_total_tokens"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 0 {
+			return nil, fmt.Errorf("max_total_tokens must be non-negative, got %d", v)
+		}
+		maxTokens = v
+	}
+
+	maxPlaceholders := 0
+	if v, ok, err := paramInt(params, "max_total_placeholder_tokens"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 0 {
+			return nil, fmt.Errorf("max_total_placeholder_tokens must be non-negative, got %d", v)
+		}
+		maxPlaceholders = v
+	}
+
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		IdleConnTimeout:     idleConnTimeout,
+		ForceAttemptHTTP2:   true,
+	}
+
+	return &RenderStep{
+		serviceAddress:            address,
+		maxTotalTokens:            maxTokens,
+		maxTotalPlaceholderTokens: maxPlaceholders,
+		client:                    &http.Client{Timeout: timeout, Transport: transport},
+	}, nil
+}
+
+func (s *RenderStep) SetServiceAddress(addr string) {
+	s.serviceAddress = addr
+}
+
+func (s *RenderStep) Name() string { return RenderStepName }
+
+func (s *RenderStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContext) error {
+	// The pipeline's only check of this invariant: this is the first step to
+	// pair on Modality (see modIndex in applyRenderResponse), replace-media-urls
+	// entries are already in place, and the later readers take whatever this
+	// accepted. The generate path arrives with an empty slice and fills it in
+	// executeGenerate below, where extractMultimodalEntries guards itself.
+	if err := validateEntryModalities(reqCtx.MultimodalEntries); err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+	switch reqcommon.DetectAPIType(reqCtx.OriginalPath) {
+	case reqcommon.APITypeVLLMGenerate:
+		return s.executeGenerate(ctx, reqCtx)
+	case reqcommon.APITypeCompletions:
+		return s.executeCompletions(ctx, reqCtx)
+	case reqcommon.APITypeChatCompletions:
+		return s.executeRender(ctx, reqCtx, reqcommon.PathChatCompletions)
+	case reqcommon.APITypeResponses:
+		return s.executeRender(ctx, reqCtx, reqcommon.PathResponses)
+	case reqcommon.APITypeMessages:
+		return s.executeRender(ctx, reqCtx, reqcommon.PathMessages)
+	default:
+		logger := log.FromContext(ctx).WithName(RenderStepName)
+		logger.V(logutil.DEFAULT).Info("skipping render step", "path", reqCtx.OriginalPath)
+		return nil
+	}
+}
+
+// executeGenerate handles the tokens-in generate path. It does not tokenize:
+// the client supplies token_ids and features directly. It normalizes them into
+// reqCtx.TokenIDs and reqCtx.MultimodalEntries, the typed fields every
+// downstream step (encode/prefill/decode) reads instead of the raw body, and
+// enforces the generate-only bounds vLLM does not (validatePlaceholderBounds,
+// token/placeholder limits) before EncodeStep indexes token_ids[offset] and
+// allocates from length.
+func (s *RenderStep) executeGenerate(ctx context.Context, reqCtx *pipeline.RequestContext) error {
+	logger := log.FromContext(ctx).WithName(RenderStepName)
+
+	tokenIDs, err := extractTokenIDs(reqCtx.Body["token_ids"])
+	if err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+	if err := s.checkTokenLimit(len(tokenIDs)); err != nil {
+		return err
+	}
+	reqCtx.TokenIDs = tokenIDs
+
+	if rawSampling := reqCtx.Body["sampling_params"]; rawSampling != nil {
+		if _, ok := rawSampling.(map[string]any); !ok {
+			return fmt.Errorf("render: sampling_params must be an object, got %T: %w", rawSampling, pipeline.ErrBadRequest)
+		}
+	}
+
+	rawFeatures := reqCtx.Body["features"]
+	var features map[string]any
+	if rawFeatures != nil {
+		var ok bool
+		features, ok = rawFeatures.(map[string]any)
+		if !ok {
+			return fmt.Errorf("render: features must be an object, got %T: %w", rawFeatures, pipeline.ErrBadRequest)
+		}
+	}
+	entries, err := extractMultimodalEntries(features)
+	if err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+	// The client supplies placeholder geometry directly on this path, so bound
+	// every span to the prompt before EncodeStep allocates from length. Unlike
+	// checkPlaceholderLimit, this guard is unconditional: it does not depend on
+	// the optional max_total_placeholder_tokens knob.
+	if err := validatePlaceholderBounds(entries, len(tokenIDs)); err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+	if err := s.checkPlaceholderLimit(entries); err != nil {
+		return err
+	}
+	reqCtx.MultimodalEntries = entries
+
+	// Counted per modality: a token-in features map names its own modalities,
+	// so attributing every entry to image would mislabel an audio or video
+	// one. boundMediaType folds anything but image into MediaTypeOther.
+	var imageItems, otherItems int
+	for _, entry := range entries {
+		if entry.Modality == reqcommon.ModalityImage {
+			imageItems++
+			continue
+		}
+		otherItems++
+	}
+	coordmetrics.RecordMediaItems(coordmetrics.MediaTypeImage, imageItems)
+	coordmetrics.RecordMediaItems(coordmetrics.MediaTypeOther, otherItems)
+
+	logger.V(logutil.DEFAULT).Info("complete", "token_ids_len", len(tokenIDs), "mm_entries", len(entries))
+	return nil
+}
+
+func (s *RenderStep) executeCompletions(ctx context.Context, reqCtx *pipeline.RequestContext) error {
+	logger := log.FromContext(ctx).WithName(RenderStepName)
+
+	prompt := reqCtx.Body["prompt"]
+
+	switch p := prompt.(type) {
+	case string:
+		// /v1/completions/render returns an array with one element per prompt.
+		// We reject batched prompts above, so we always expect length 1. We
+		// decode into a minimal struct so completions stays decoupled from the
+		// chat-completions response shape.
+		var renderResp []completionsRenderResponse
+		if err := s.postRender(ctx, reqCtx, reqcommon.PathCompletions, &renderResp); err != nil {
+			return err
+		}
+		if len(renderResp) != 1 {
+			return fmt.Errorf("render: expected 1 response element, got %d", len(renderResp))
+		}
+		tokenIDs := renderResp[0].TokenIDs
+		reqCtx.TokenIDs = tokenIDs
+		if err := s.checkTokenLimit(len(reqCtx.TokenIDs)); err != nil {
+			return err
+		}
+		reqCtx.Body["prompt"] = tokenIDs
+		logger.V(logutil.DEFAULT).Info("complete", "token_ids_len", len(tokenIDs))
+		return nil
+
+	case []any:
+		// OpenAI /v1/completions accepts four prompt shapes: string, []string,
+		// []int (token IDs), [][]int (batched token IDs). The first three are
+		// covered here; only single-sequence variants are supported downstream
+		// because RequestContext.TokenIDs is []int.
+		if len(p) == 0 {
+			reqCtx.TokenIDs = []int{}
+			logger.V(logutil.DEFAULT).Info("prompt is empty array, skipping render", "token_ids_len", 0)
+			return nil
+		}
+		switch p[0].(type) {
+		case float64, json.Number:
+			// Reject oversized arrays before iterating: toIntSlice does an
+			// O(n) type-assert per element, so for a runaway prompt the
+			// length check saves real work.
+			if err := s.checkTokenLimit(len(p)); err != nil {
+				return err
+			}
+			// Convert to []int for downstream steps and validate every element
+			// is numeric; a heterogeneous array fails fast here rather than
+			// reaching vLLM as garbage tokens.
+			tokenIDs, err := toIntSlice(p)
+			if err != nil {
+				return fmt.Errorf("render: %w", err)
+			}
+			reqCtx.TokenIDs = tokenIDs
+			logger.V(logutil.DEFAULT).Info("prompt is token array, skipping render", "token_ids_len", len(tokenIDs))
+			return nil
+		case string:
+			return fmt.Errorf("render: batched string prompts ([]string) are not supported: %w", pipeline.ErrBadRequest)
+		case []any:
+			return fmt.Errorf("render: batched token prompts ([][]int) are not supported: %w", pipeline.ErrBadRequest)
+		default:
+			return fmt.Errorf("render: invalid prompt array element: %T: %w", p[0], pipeline.ErrBadRequest)
+		}
+
+	default:
+		return fmt.Errorf("render: prompt must be a string or token array, got %T: %w", prompt, pipeline.ErrBadRequest)
+	}
+}
+
+// executeRender posts the client body to the render service under path and
+// applies the token_ids and per-image features it returns. The render service
+// tokenizes whatever shape the prompt field holds, so this step does not
+// inspect it.
+//
+// Chat completions and responses share this path because vLLM's renderer
+// declares the same response model for both. /v1/completions/render returns
+// one object per prompt instead, so executeCompletions decodes and applies its
+// own shape.
+func (s *RenderStep) executeRender(ctx context.Context, reqCtx *pipeline.RequestContext, path string) error {
+	var renderResp renderResponse
+	if err := s.postRender(ctx, reqCtx, path, &renderResp); err != nil {
+		return err
+	}
+	return s.applyRenderResponse(ctx, reqCtx, renderResp)
+}
+
+// applyRenderResponse stores a renderResponse's token_ids and reconciles its
+// per-image features onto reqCtx.MultimodalEntries.
+func (s *RenderStep) applyRenderResponse(ctx context.Context, reqCtx *pipeline.RequestContext, renderResp renderResponse) error {
+	logger := log.FromContext(ctx).WithName(RenderStepName)
+
+	reqCtx.TokenIDs = renderResp.TokenIDs
+	if err := s.checkTokenLimit(len(reqCtx.TokenIDs)); err != nil {
+		return err
+	}
+
+	// Length check: sum of per-modality slice lengths must match len(entries).
+	totalHashes, totalPlaceholders, totalKwargs, totalMetadata := 0, 0, 0, 0
+	for _, hashes := range renderResp.Features.MMHashes {
+		totalHashes += len(hashes)
+	}
+	for _, placeholders := range renderResp.Features.MMPlaceholders {
+		totalPlaceholders += len(placeholders)
+	}
+	for _, kwargs := range renderResp.Features.KwargsData {
+		totalKwargs += len(kwargs)
+	}
+	for _, metadata := range renderResp.Features.MMMetadata {
+		totalMetadata += len(metadata)
+	}
+	expected := len(reqCtx.MultimodalEntries)
+	if totalHashes != expected {
+		return fmt.Errorf("render returned %d mm_hashes but expected %d", totalHashes, expected)
+	}
+	if totalPlaceholders != expected {
+		return fmt.Errorf("render returned %d mm_placeholders but expected %d", totalPlaceholders, expected)
+	}
+	if totalKwargs != expected {
+		return fmt.Errorf("render returned %d kwargs_data but expected %d", totalKwargs, expected)
+	}
+	// mm_metadata is optional for backward compatibility with older renderers.
+	// An absent field means the renderer predates it and the request simply
+	// takes the kwargs_data path. But once the renderer emits the field, its
+	// slices are part of the contract: a length mismatch, aggregate or
+	// per-modality, means a broken renderer and no entry trusts it — the
+	// whole map is dropped so a misfiled slice cannot leak into any modality.
+	// The request still succeeds: kwargs_data (validated just above) is on
+	// the same response. mm_hashes/mm_placeholders/kwargs_data stay strict
+	// because they have no fallback.
+	if totalMetadata > 0 && totalMetadata != expected {
+		logger.V(logutil.DEFAULT).Info("render returned mismatched mm_metadata; degrading to kwargs_data",
+			"got", totalMetadata, "expected", expected)
+		renderResp.Features.MMMetadata = nil
+	}
+	// Per-modality pairing, checked before any entry takes its slice: a
+	// renderer that files every item under one modality passes the aggregate
+	// check, and the misfiled extras would pair an entry with another
+	// modality's blob.
+	if renderResp.Features.MMMetadata != nil {
+		seenModality := make(map[reqcommon.Modality]bool)
+		for i := range reqCtx.MultimodalEntries {
+			mod := reqCtx.MultimodalEntries[i].Modality
+			if seenModality[mod] {
+				continue
+			}
+			seenModality[mod] = true
+			metadata := renderResp.Features.MMMetadata[mod]
+			if len(metadata) != len(renderResp.Features.MMHashes[mod]) {
+				logger.V(logutil.DEFAULT).Info("render returned mismatched mm_metadata for modality; degrading to kwargs_data",
+					"modality", mod, "got", len(metadata),
+					"expected", len(renderResp.Features.MMHashes[mod]))
+				renderResp.Features.MMMetadata = nil
+				break
+			}
+		}
+	}
+
+	// Entries in order, each pulling its hash/placeholder/kwargs from the
+	// response slot at its per-modality position. For an image-only request
+	// that is plain positional pairing: modIndex[image] counts 0, 1, 2...
+	modIndex := make(map[reqcommon.Modality]int)
+	for i := range reqCtx.MultimodalEntries {
+		mod := reqCtx.MultimodalEntries[i].Modality
+		idx := modIndex[mod]
+		modIndex[mod]++
+		hashes := renderResp.Features.MMHashes[mod]
+		placeholders := renderResp.Features.MMPlaceholders[mod]
+		kwargs := renderResp.Features.KwargsData[mod]
+		metadata := renderResp.Features.MMMetadata[mod]
+		if idx >= len(hashes) || idx >= len(placeholders) || idx >= len(kwargs) {
+			return fmt.Errorf("render response missing slot %d for modality %s", idx, mod)
+		}
+		reqCtx.MultimodalEntries[i].Hash = hashes[idx]
+		reqCtx.MultimodalEntries[i].KwargsData = kwargs[idx]
+		reqCtx.MultimodalEntries[i].Placeholder = placeholders[idx]
+		if idx < len(metadata) {
+			reqCtx.MultimodalEntries[i].MMMetadata = metadata[idx]
+		}
+	}
+
+	if err := s.checkPlaceholderLimit(reqCtx.MultimodalEntries); err != nil {
+		return err
+	}
+
+	logger.V(logutil.DEBUG).Info("response",
+		"mm_hashes", renderResp.Features.MMHashes,
+		"mm_placeholders", renderResp.Features.MMPlaceholders,
+		"kwargs_data_len", totalKwargs,
+		"mm_metadata_len", totalMetadata)
+	logger.V(logutil.DEFAULT).Info("complete", "token_ids_len", len(renderResp.TokenIDs), "mm_entries", totalHashes)
+	return nil
+}
+
+// postRender marshals reqCtx.Body, POSTs it to <serviceAddress><basePath>/render,
+// and decodes the JSON response into out.
+func (s *RenderStep) postRender(ctx context.Context, reqCtx *pipeline.RequestContext, basePath string, out any) error {
+	if s.serviceAddress == "" {
+		return errors.New("render: service address not configured (set 'address' in render step params)")
+	}
+
+	logger := log.FromContext(ctx).WithName(RenderStepName)
+
+	body, err := json.Marshal(reqCtx.Body)
+	if err != nil {
+		return fmt.Errorf("marshaling request for render: %w", err)
+	}
+
+	url := s.serviceAddress + basePath + "/render"
+	logger.V(logutil.DEFAULT).Info("sending request", "url", url)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating render request: %w", err)
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set(gateway.ContentTypeHeader, reqcommon.ContentTypeJSON)
+	for k, v := range reqCtx.ForwardedHeaders() {
+		req.Header.Set(k, v)
+	}
+
+	call := coordmetrics.StartUpstreamCall(coordmetrics.UpstreamRender)
+	resp, err := s.client.Do(req)
+	call.Done()
+	if err != nil {
+		return fmt.Errorf("render request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := checkStatus(RenderStepName, resp); err != nil {
+		return err
+	}
+	reqCtx.CaptureResponseHeaders(resp.Header)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decoding render response: %w", err)
+	}
+	return nil
+}
+
+type renderResponse struct {
+	TokenIDs []int          `json:"token_ids"`
+	Features renderFeatures `json:"features"`
+}
+
+type renderFeatures struct {
+	MMHashes       map[reqcommon.Modality][]string                    `json:"mm_hashes"`
+	MMPlaceholders map[reqcommon.Modality][]pipeline.PlaceholderRange `json:"mm_placeholders"`
+	KwargsData     map[reqcommon.Modality][]string                    `json:"kwargs_data"`
+	MMMetadata     map[reqcommon.Modality][]string                    `json:"mm_metadata"`
+}
+
+// completionsRenderResponse is a minimal view of the per-prompt object returned
+// by /v1/completions/render. Only token_ids is consumed; other fields
+// (request_id, sampling_params, model, etc.) are ignored.
+type completionsRenderResponse struct {
+	TokenIDs []int `json:"token_ids"`
+}
+
+func (s *RenderStep) checkTokenLimit(tokenCount int) error {
+	if s.maxTotalTokens > 0 && tokenCount > s.maxTotalTokens {
+		return fmt.Errorf("too many total tokens: got %d, max %d: %w", tokenCount, s.maxTotalTokens, pipeline.ErrBadRequest)
+	}
+	return nil
+}
+
+func (s *RenderStep) checkPlaceholderLimit(entries []pipeline.MultimodalEntry) error {
+	if s.maxTotalPlaceholderTokens <= 0 {
+		return nil
+	}
+	total := 0
+	for _, e := range entries {
+		total += e.Placeholder.Length
+		// total < 0 catches int overflow: lengths are non-negative, so a sum
+		// past MaxInt wraps negative and would otherwise slip past the
+		// total > max check, silently bypassing the limit. On the generate path
+		// lengths come straight from the client, so this must not be evadable.
+		if total < 0 || total > s.maxTotalPlaceholderTokens {
+			return fmt.Errorf("too many placeholder tokens: got %d, max %d: %w", total, s.maxTotalPlaceholderTokens, pipeline.ErrBadRequest)
+		}
+	}
+	return nil
+}

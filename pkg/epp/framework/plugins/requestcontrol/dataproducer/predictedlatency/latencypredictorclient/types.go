@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright 2025 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -145,7 +145,7 @@ func ConfigFromEnv() *Config {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
 			cfg.MaxConcurrentDispatches = n
 		} else {
-			log.Printf("WARNING: LATENCY_MAX_CONCURRENT_DISPATCHES=%q is invalid (must be > 0), using default %d", s, cfg.MaxConcurrentDispatches)
+			log.Printf("WARNING: LATENCY_MAX_CONCURRENT_DISPATCHES=%q is invalid (must be > 0), using default %d", s, cfg.MaxConcurrentDispatches) //#nosec -- %q escapes control chars; env-var is operator-supplied
 		}
 	}
 	return cfg
@@ -162,14 +162,24 @@ type PredictorInterface interface {
 // --- Data Models ---
 
 type TrainingEntry struct {
-	KVCachePercentage     float64   `json:"kv_cache_percentage"`
-	InputTokenLength      int       `json:"input_token_length"`
-	NumRequestWaiting     int       `json:"num_request_waiting"`
-	NumRequestRunning     int       `json:"num_request_running"`
-	NumTokensGenerated    int       `json:"num_tokens_generated"`
-	ActualTTFT            float64   `json:"actual_ttft_ms"`
-	ActualTPOT            float64   `json:"actual_tpot_ms"`
-	PrefixCacheScore      float64   `json:"prefix_cache_score"`
+	KVCachePercentage  float64 `json:"kv_cache_percentage"`
+	InputTokenLength   int     `json:"input_token_length"`
+	NumRequestWaiting  int     `json:"num_request_waiting"`
+	NumRequestRunning  int     `json:"num_request_running"`
+	NumTokensGenerated int     `json:"num_tokens_generated"`
+	ActualTTFT         float64 `json:"actual_ttft_ms"`
+	ActualTPOT         float64 `json:"actual_tpot_ms"`
+	// PredictedTTFT and PredictedTPOT are the selected-endpoint predictions
+	// paired with the matching actual for live drift detection. Omitted when
+	// no valid selected prediction was available for that sample.
+	PredictedTTFT    *float64 `json:"predicted_ttft_ms,omitempty"`
+	PredictedTPOT    *float64 `json:"predicted_tpot_ms,omitempty"`
+	PrefixCacheScore float64  `json:"prefix_cache_score"`
+	// EncoderInputSize is the total size of the request's multimodal encoder
+	// items; EncoderMatchedSize is the portion likely present in the target
+	// pod's encoder cache. Both are 0 for text-only requests.
+	EncoderInputSize      int       `json:"encoder_input_size"`
+	EncoderMatchedSize    int       `json:"encoder_matched_size"`
 	PodType               string    `json:"pod_type,omitempty"` // "prefill", "decode", or "" for monolithic
 	PrefillTokensInFlight int64     `json:"prefill_tokens_in_flight"`
 	DecodeTokensInFlight  int64     `json:"decode_tokens_in_flight"`
@@ -181,15 +191,20 @@ type BulkTrainingRequest struct {
 }
 
 type PredictionRequest struct {
-	KVCachePercentage     float64 `json:"kv_cache_percentage"`
-	InputTokenLength      int     `json:"input_token_length"`
-	NumRequestWaiting     int     `json:"num_request_waiting"`
-	NumRequestRunning     int     `json:"num_request_running"`
-	NumTokensGenerated    int     `json:"num_tokens_generated"`
-	PrefixCacheScore      float64 `json:"prefix_cache_score"`
-	PodType               string  `json:"pod_type,omitempty"` // "prefill", "decode", or "" for monolithic
-	PrefillTokensInFlight int64   `json:"prefill_tokens_in_flight"`
-	DecodeTokensInFlight  int64   `json:"decode_tokens_in_flight"`
+	KVCachePercentage  float64 `json:"kv_cache_percentage"`
+	InputTokenLength   int     `json:"input_token_length"`
+	NumRequestWaiting  int     `json:"num_request_waiting"`
+	NumRequestRunning  int     `json:"num_request_running"`
+	NumTokensGenerated int     `json:"num_tokens_generated"`
+	PrefixCacheScore   float64 `json:"prefix_cache_score"`
+	// EncoderInputSize is the total size of the request's multimodal encoder
+	// items; EncoderMatchedSize is the portion likely present in the target
+	// pod's encoder cache. Both are 0 for text-only requests.
+	EncoderInputSize      int    `json:"encoder_input_size"`
+	EncoderMatchedSize    int    `json:"encoder_matched_size"`
+	PodType               string `json:"pod_type,omitempty"` // "prefill", "decode", or "" for monolithic
+	PrefillTokensInFlight int64  `json:"prefill_tokens_in_flight"`
+	DecodeTokensInFlight  int64  `json:"decode_tokens_in_flight"`
 }
 
 type PredictionResponse struct {

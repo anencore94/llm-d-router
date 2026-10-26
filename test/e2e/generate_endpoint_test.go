@@ -1,0 +1,313 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+
+	"github.com/llm-d/llm-d-router/test/e2e/utils/k8s"
+	"github.com/llm-d/llm-d-router/test/e2e/utils/metrics"
+	"github.com/llm-d/llm-d-router/test/e2e/utils/standalone"
+)
+
+const (
+	vLLMGeneratePath = "/inference/v1/generate"
+
+	requestTimeout = 60 * time.Second
+)
+
+// mmSpec describes one multimodal entry as it appears in encode and
+// prefill request bodies. Hash, Offset and Length come from the (mocked)
+// render stage; tests pick fixed values so the bodies are deterministic.
+// The modality (image/video/audio) is passed alongside at the call site
+// — the spec itself is modality-neutral.
+type mmSpec struct {
+	Hash   string
+	Offset int
+	Length int
+}
+
+// singleImage is the canonical one-item spec the basic encode/prefill
+// tests share. Offset is always 1 in encode requests (right after BOS),
+// length matches the placeholder span. Reused across image/video/audio
+// modalities — the hash is an opaque token the simulator does not validate.
+var singleImage = mmSpec{Hash: "e2e-image-hash", Offset: 1, Length: 3}
+
+// twoImages is the canonical two-item spec for fan-out coverage.
+// Distinct lengths so the two placeholder spans aren't accidentally identical.
+var twoImages = []mmSpec{
+	{Hash: "e2e-image-hash-0", Offset: 1, Length: 3},
+	{Hash: "e2e-image-hash-1", Offset: 4, Length: 5},
+}
+
+// mmModalities lists the modality labels each /inference/v1/generate
+// encode and prefill test iterates over. These are the coarser bucket
+// names vLLM uses inside mm_hashes / mm_placeholders — distinct from
+// the OpenAI content-type strings (image_url, audio_url, video_url,
+// input_audio) that mmTypes in connector_ec_common.go keys on.
+var mmModalities = []string{"image", "video", "audio"}
+
+var _ = ginkgo.Describe("Direct gateway /inference/v1/generate encode against encode-only", ginkgo.Ordered, testWrapper(func() {
+	// Uses single-profile-handler (generateEncodeConfig) so the EPP routes
+	// directly to encode pods without requiring a decode stage first.
+	ginkgo.It("returns ec_transfer_params for encode bodies", func() {
+		nsName := getNamespace()
+
+		encodeReplicas := 1
+		createModelServersEncodeOnly(encodeReplicas)
+		standalone.Create(standaloneConfig(), generateEncodeConfig, 1, 8000)
+
+		encodePods := k8s.GetPodNames(testConfig, encodeSelector, nsName)
+		gomega.Expect(encodePods).Should(gomega.HaveLen(encodeReplicas))
+
+		for _, modality := range mmModalities {
+			ginkgo.By(fmt.Sprintf("SingleItem_Encode(%s): encode body returns ec_transfer_params", modality))
+			{
+				resp, raw := doGenerate(encodeBody(modality, singleImage))
+				parsed := expectGenerateOK(resp, raw)
+				expectECTransferParams(parsed, raw)
+			}
+
+			ginkgo.By(fmt.Sprintf("TwoItems_Encode(%s): per-item fan-out, every encode body returns ec_transfer_params", modality))
+			for _, item := range twoImages {
+				resp, raw := doGenerate(encodeBody(modality, item))
+				parsed := expectGenerateOK(resp, raw)
+				expectECTransferParams(parsed, raw)
+			}
+		}
+	})
+}))
+
+var _ = ginkgo.Describe("Direct gateway /inference/v1/generate prefill against prefill-only", ginkgo.Ordered, testWrapper(func() {
+	// Uses single-profile-handler (generatePrefillConfig) so the EPP routes
+	// directly to prefill pods without requiring a decode stage first.
+	ginkgo.It("returns kv_transfer_params for prefill bodies", func() {
+		nsName := getNamespace()
+
+		prefillReplicas := 1
+		createModelServersPrefillOnly(prefillReplicas)
+		standalone.Create(standaloneConfig(), generatePrefillConfig, 1, 8000)
+
+		prefillPods := k8s.GetPodNames(testConfig, prefillSelector, nsName)
+		gomega.Expect(prefillPods).Should(gomega.HaveLen(prefillReplicas))
+
+		tokenIDs := []int{1, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 2345, 6789}
+		for _, modality := range mmModalities {
+			ginkgo.By(fmt.Sprintf("TwoItems_Prefill(%s): combined two-item prefill body returns kv_transfer_params", modality))
+			resp, raw := doGenerate(prefillBody(modality, tokenIDs, twoImages))
+			parsed := expectGenerateOK(resp, raw)
+			expectKVTransferParams(parsed, raw)
+		}
+	})
+}))
+
+// mmFeatures builds the features map that encode and prefill share:
+// mm_hashes, mm_placeholders, kwargs_data, all keyed by modality
+// (image/video/audio). kwargs_data is a placeholder "AA==" per entry;
+// the simulator does not validate it.
+func mmFeatures(modality string, items []mmSpec) map[string]any {
+	hashes := make([]string, len(items))
+	placeholders := make([]map[string]any, len(items))
+	kwargs := make([]string, len(items))
+	for i, it := range items {
+		hashes[i] = it.Hash
+		placeholders[i] = map[string]any{"offset": it.Offset, "length": it.Length}
+		kwargs[i] = "AA=="
+	}
+	return map[string]any{
+		"mm_hashes":       map[string]any{modality: hashes},
+		"mm_placeholders": map[string]any{modality: placeholders},
+		"kwargs_data":     map[string]any{modality: kwargs},
+	}
+}
+
+// encodeBody builds a single-item encode request for the given modality.
+// token_ids = [BOS, placeholder*length]; offset is always 1 since each
+// encode carries exactly one item.
+func encodeBody(modality string, item mmSpec) []byte {
+	tokenIDs := make([]int, 1+item.Length)
+	tokenIDs[0] = 1
+	for i := 1; i < len(tokenIDs); i++ {
+		tokenIDs[i] = 32000
+	}
+	body := map[string]any{
+		"model":           simModelName,
+		"token_ids":       tokenIDs,
+		"features":        mmFeatures(modality, []mmSpec{{Hash: item.Hash, Offset: 1, Length: item.Length}}),
+		"sampling_params": map[string]any{"max_tokens": 1},
+	}
+	return mustMarshal(body)
+}
+
+// ecTransferEntries builds the per-item entries of
+// prefill.ec_transfer_params.<modality>, one map per item keyed by
+// mm_hash. Values are dummy NIXL transfer params; the simulator does
+// not validate.
+func ecTransferEntries(items []mmSpec) []map[string]any {
+	entries := make([]map[string]any, len(items))
+	for i, it := range items {
+		entries[i] = map[string]any{
+			it.Hash: map[string]any{
+				"peer_host":               "10.0.0.1",
+				"peer_port":               5501 + i,
+				"size_bytes":              0,
+				"nixl_agent_metadata_b64": "",
+			},
+		}
+	}
+	return entries
+}
+
+// prefillBody builds a prefill request covering every item in one body
+// for the given modality.
+func prefillBody(modality string, tokenIDs []int, items []mmSpec) []byte {
+	body := map[string]any{
+		"request_id":         "e2e-prefill-" + uuid.NewString(),
+		"model":              simModelName,
+		"token_ids":          tokenIDs,
+		"features":           mmFeatures(modality, items),
+		"ec_transfer_params": map[string]any{modality: ecTransferEntries(items)},
+		"kv_transfer_params": map[string]any{"do_remote_decode": true},
+		"sampling_params":    map[string]any{"max_tokens": 1},
+	}
+	return mustMarshal(body)
+}
+
+// doRequest POSTs body to <gateway><path>. Always sets Content-Type and a
+// fresh X-Request-ID. Returns the live *http.Response (its body is already
+// drained) and the raw response body.
+func doRequest(path string, body []byte) (*http.Response, []byte) {
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d%s", getPort(), path), bytes.NewReader(body))
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "build POST request")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", uuid.NewString())
+
+	client := &http.Client{Timeout: requestTimeout}
+	resp, err := client.Do(req)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "POST %s", req.URL)
+	defer func() {
+		gomega.Expect(resp.Body.Close()).To(gomega.Succeed())
+	}()
+	raw, err := io.ReadAll(resp.Body)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "read response body")
+	return resp, raw
+}
+
+// doGenerate is a thin wrapper over doRequest targeting /inference/v1/generate.
+func doGenerate(body []byte) (*http.Response, []byte) {
+	return doRequest(vLLMGeneratePath, body)
+}
+
+// expectGenerateOK asserts a 2xx status and that the response body parses
+// as a JSON object, returning the parsed map for further phase-specific
+// assertions.
+func expectGenerateOK(resp *http.Response, raw []byte) map[string]any {
+	gomega.Expect(resp.StatusCode).To(gomega.Equal(http.StatusOK),
+		"non-200 from gateway: status=%d body=%s", resp.StatusCode, string(raw))
+	var parsed map[string]any
+	gomega.Expect(json.Unmarshal(raw, &parsed)).To(gomega.Succeed(),
+		"response is not valid JSON: %s", string(raw))
+	return parsed
+}
+
+// expectECTransferParams asserts the encode response carries a non-empty
+// ec_transfer_params object keyed by mm_hash.
+func expectECTransferParams(parsed map[string]any, raw []byte) {
+	ec, ok := parsed["ec_transfer_params"].(map[string]any)
+	gomega.Expect(ok).To(gomega.BeTrue(),
+		"missing or malformed ec_transfer_params in encode response: %s", string(raw))
+	gomega.Expect(ec).NotTo(gomega.BeEmpty(),
+		"ec_transfer_params is empty: %s", string(raw))
+}
+
+// expectKVTransferParams asserts the prefill response carries a non-empty
+// kv_transfer_params object (handoff metadata for the decode worker).
+func expectKVTransferParams(parsed map[string]any, raw []byte) {
+	kv, ok := parsed["kv_transfer_params"].(map[string]any)
+	gomega.Expect(ok).To(gomega.BeTrue(),
+		"missing or malformed kv_transfer_params in prefill response: %s", string(raw))
+	gomega.Expect(kv).NotTo(gomega.BeEmpty(),
+		"kv_transfer_params is empty: %s", string(raw))
+}
+
+var _ = ginkgo.Describe("P/D gateway /inference/v1/generate disaggregates via sidecar", ginkgo.Ordered, testWrapper(func() {
+	// Regression test for https://github.com/llm-d/llm-d-router/issues/1461:
+	// the pd-sidecar previously had no route for /inference/v1/generate, so
+	// token-in P/D requests silently fell through to decode-only. This test
+	// verifies that the prefill pod receives the generate request when a full
+	// P/D setup is used, proving the sidecar routes it through
+	// disaggregatedPrefillHandler rather than the decoder catch-all.
+	ginkgo.It("routes token-in generate to the prefill pod", func() {
+		nsName := getNamespace()
+
+		prefillReplicas := 1
+		decodeReplicas := 1
+		createModelServersPDSharedStorage(decodeReplicas)
+		standalone.Create(standaloneConfig(), pdConfig, 1, 8000)
+
+		prefillPods, decodePods := k8s.GetModelServerPods(testConfig, podSelector, prefillSelector, decodeSelector, nsName)
+		gomega.Expect(prefillPods).Should(gomega.HaveLen(prefillReplicas))
+		gomega.Expect(decodePods).Should(gomega.HaveLen(decodeReplicas))
+
+		prefillCountBefore := metrics.GetPodRequestCount(testConfig, nsName, prefillPods[0])
+		ginkgo.By(fmt.Sprintf("prefill request count before test: %d", prefillCountBefore))
+
+		ginkgo.By("sending /inference/v1/generate through P/D EPP")
+		resp, raw := doGenerate(simpleTokenGenerateBody())
+		gomega.Expect(resp.StatusCode).To(gomega.Equal(http.StatusOK),
+			"non-200 from gateway: status=%d body=%s", resp.StatusCode, string(raw))
+
+		prefillCountAfter := metrics.GetPodRequestCount(testConfig, nsName, prefillPods[0])
+		ginkgo.By(fmt.Sprintf("prefill request count after test: %d", prefillCountAfter))
+
+		gomega.Expect(prefillCountAfter).To(gomega.BeNumerically(">", prefillCountBefore),
+			"prefill pod should have received the generate request; sidecar must route "+
+				"/inference/v1/generate through disaggregatedPrefillHandler, not the decoder catch-all")
+	})
+}))
+
+// simpleTokenGenerateBody builds a minimal /inference/v1/generate body with
+// enough token IDs to exceed the prefix-based-pd-decider nonCachedTokens
+// threshold (16) and guarantee P/D routing on a cold cache.
+func simpleTokenGenerateBody() []byte {
+	tokenIDs := make([]int, 20)
+	for i := range tokenIDs {
+		tokenIDs[i] = 1000 + i
+	}
+	return mustMarshal(map[string]any{
+		"model":     simModelName,
+		"token_ids": tokenIDs,
+		"sampling_params": map[string]any{
+			"max_tokens": echoOutputTokens,
+		},
+	})
+}
+
+func mustMarshal(v any) []byte {
+	b, err := json.Marshal(v)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "json.Marshal failed: %v", v)
+	return b
+}

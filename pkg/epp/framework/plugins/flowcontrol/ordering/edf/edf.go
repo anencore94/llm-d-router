@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -61,12 +62,6 @@ func (p *EDFPolicy) withName(name string) *EDFPolicy {
 
 func (p *EDFPolicy) Name() string {
 	return p.name
-}
-
-// RequiredQueueCapabilities returns the queue capabilities required by this policy.
-// It requires a priority-configurable queue (e.g., heap-based) to maintain items in deadline-sorted order.
-func (p *EDFPolicy) RequiredQueueCapabilities() []flowcontrol.QueueCapability {
-	return []flowcontrol.QueueCapability{flowcontrol.CapabilityPriorityConfigurable}
 }
 
 // TypedName returns the type and name tuple of this plugin instance.

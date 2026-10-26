@@ -4,15 +4,16 @@
 
 - [Overview](#overview)
 - [Core Goals](#core-goals)
-- [Filters, Scorers, and Scrapers](#filters-scorers-and-scrapers)
+- [Filters, Scorers, and the Data Layer](#filters-scorers-and-the-data-layer)
   - [Core Design Principles](#core-design-principles)
   - [Routing Flow](#routing-flow)
 - [Configuration](#configuration)
+  - [API versions](#api-versions)
   - [`Plugins` Configuration](#plugins-configuration)
   - [`SchedulingProfiles` Configuration](#schedulingprofiles-configuration)
   - [Available plugins](#available-plugins)
-- [Metric Scraping](#metric-scraping)
-- [Disaggregated Encode/Prefill/Decode (E/P/D)](#disaggregated-encodeprefilldecodesepd-epd)
+- [Metric Scraping and the Data Layer](#metric-scraping-and-the-data-layer)
+- [Disaggregated Encode/Prefill/Decode (E/P/D)](#disaggregated-encodeprefilldecode-epd)
 - [InferencePool & InferenceModel Design](#inferencepool--inferencemodel-design)
   - [Current Assumptions](#current-assumptions)
 - [References](#references)
@@ -26,12 +27,12 @@
 
 The design enables:
 
-- Support for **multiple base models** within a shared cluster (see [serving multiple inference pools](https://gateway-api-inference-extension.sigs.k8s.io/guides/serving-multiple-inference-pools-latest/))
+- Support for **multiple base models** within a shared cluster (see [InferencePool & InferenceModel Design](#inferencepool--inferencemodel-design))
 - Efficient routing based on **KV cache locality**, **session affinity**, **load**, and
 **model metadata**
 - Disaggregated **Prefill/Decode (P/D)** execution
   - We have introduced experimental **Encode/Prefill/Decode (E/P/D and all its permutations)** execution. For a detailed explanation, see [Disaggregated Inference Serving](./disaggregation.md)
-- Pluggable **filters**, **scorers**, and **scrapers** for extensible scheduling
+- Pluggable **filters** and **scorers**, backed by a pluggable **data layer**, for extensible scheduling
 
 ---
 
@@ -42,12 +43,12 @@ The design enables:
   - KV cache reuse
   - Load balancing
 - Support multi-model deployments on heterogeneous hardware
-- Enable runtime extensibility with pluggable logic (filters, scorers, scrapers)
+- Enable runtime extensibility with pluggable logic (filters, scorers, data layer)
 - Community-aligned implementation using GIE and Envoy + External Processing (EPP)
 
 ---
 
-## Filters, Scorers, and Scrapers
+## Filters, Scorers, and the Data Layer
 
 ### Core Design Principles
 
@@ -58,6 +59,30 @@ The design enables:
 
 ### Routing Flow
 
+See the upstream [Request Scheduler](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/scheduling.md) doc for the canonical scheduling model.
+
+#### Request Control
+
+A configured `Responder` may answer a `GET` request locally before this flow starts. A local
+response skips flow-control, endpoint selection, screening, data production, admission
+plugins, and scheduling.
+
+Request control runs once per request before any scheduling profiles:
+
+1. Request headers are processed and flow-control admission completes
+2. Endpoint candidates are located
+3. Global `Screener` plugins perform preliminary filtering of located endpoints
+   - Each screener receives an independent copy of the same endpoint set, and their returned subsets are intersected
+   - Most endpoint-selection plugins should implement a scheduling `Filter`, not a `Screener`
+   - Use a `Screener` only for mandatory constraints that must apply to every scheduling profile
+4. Data producers prepare per-request data using the filtered candidate set
+5. Admission plugins may reject the request
+6. The scheduler runs the configured scheduling profiles using the filtered candidate set
+
+#### Scheduling
+
+Each scheduling profile runs the following stages. Multiple profiles may run for one request, such as separate prefill and decode profiles.
+
 1. **Filtering**
    - Pods in an `InferencePool` go through a sequential chain of filters
    - Pods may be excluded based on criteria like model compatibility, resource usage, or custom logic
@@ -65,7 +90,7 @@ The design enables:
 2. **Scoring**
    - Filtered pods are scored using a weighted set of scorers
    - Scorers currently run sequentially (future: parallel execution)
-   - Scorers access a shared datastore populated by scrapers
+   - Scorers access a shared datastore populated by the data layer
 
 3. **Pod Selection**
    - The highest-scored pod is selected
@@ -77,6 +102,8 @@ The design enables:
 
 The llm-d Endpoint Picker relies on a YAML-based configuration—provided either as a file or an in-line parameter—to determine which lifecycle hooks (plugins) are active.
 
+See the upstream [Configuration](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/configuration.md) doc for the canonical schema.
+
 Specifically, this configuration establishes the following components:
 
 - `Plugins`: The specific plugins to instantiate, along with their parameters. Because each instantiated plugin is assigned a unique name, you can configure the same plugin type multiple times if necessary.
@@ -86,7 +113,7 @@ Specifically, this configuration establishes the following components:
 The configuration text has the following form:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - ....
@@ -97,6 +124,48 @@ schedulingProfiles:
 ```
 
 The first two lines of the configuration are constant and must appear as is.
+
+### API versions
+
+The EPP accepts two configuration API versions:
+
+| `apiVersion` | Status |
+|---|---|
+| `llm-d.ai/v1` | Current. |
+| `llm-d.ai/v1alpha1` | Deprecated, reported on startup. Support ends in a later release. |
+
+The deprecated version is read as `v1` and yields the same configuration as the equivalent `v1` document. The field placements that differ are all under `dataLayer`:
+
+| `v1alpha1` | `v1` |
+|---|---|
+| `crossReplicaSyncerPluginRef` | `crossReplica.syncerPluginRef` |
+| `crossReplicaSyncInterval` | `crossReplica.syncInterval` |
+| `crossReplicaPublishTimeout` | `crossReplica.publishTimeout` |
+| `discovery.pluginRef` | `discovery.endpoints.pluginRef` |
+
+Moving a configuration to `v1` means changing the `apiVersion` line, and, where these fields are set, writing them in their `v1` placement:
+
+```yaml
+# v1alpha1
+dataLayer:
+  discovery:
+    pluginRef: my-discovery
+  crossReplicaSyncerPluginRef: my-syncer
+  crossReplicaSyncInterval: 500ms
+  crossReplicaPublishTimeout: 2s
+
+# v1
+dataLayer:
+  discovery:
+    endpoints:
+      pluginRef: my-discovery
+  crossReplica:
+    syncerPluginRef: my-syncer
+    syncInterval: 500ms
+    publishTimeout: 2s
+```
+
+All other fields keep their names, defaults, and meaning.
 
 ### `Plugins` Configuration
 
@@ -138,23 +207,20 @@ in this section has the following form:
 The fields in a schedulingProfile entry are:
 
 - **name**: specifies the scheduling profile's name.
-- **plugins**: specifies the set of plugins to be used when this scheduling profile is chosen for a request.
+- **plugins**: references plugins that implement `Filter`, `Scorer`, or `Picker` to run when this scheduling profile is chosen for a request.
 - **pluginRef**: reference to the name of the plugin instance to be used
 - **weight**: weight to be used if the referenced plugin is a scorer.
 
 A complete configuration might look like this:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: precise-prefix-cache-producer
   parameters:
-    indexerConfig:
-      tokenProcessorConfig:
-        blockSize: 5
-      kvBlockIndexConfig:
-        maxPrefixBlocksToMatch: 256
+    tokenProcessorConfig:
+      blockSizeTokens: 5
 - type: prefix-cache-scorer
   parameters:
     prefixMatchInfoProducerName: precise-prefix-cache-producer
@@ -170,9 +236,13 @@ schedulingProfiles:
     weight: 50
 ```
 
-If the configuration is in a file, the EPP command line argument `--configFile` should be used
+If the configuration is in a file, the EPP command line argument `--config-file` should be used
  to specify the full path of the file in question. If the configuration is passed as in-line
- text the EPP command line argument `--configText` should be used.
+ text the EPP command line argument `--config-text` should be used.
+
+Feature gates can also be set with the `--feature-gates` command line argument, which takes a 
+ comma-separated list of kubelet-style `name=bool` entries; a bare name enables the gate. These
+ entries are applied after the configuration's own `featureGates` list, so they override it.
 
 ### Default plugins
 
@@ -191,6 +261,9 @@ RequestHandler:
 - When no parsers are configured, `openai-parser`, `anthropic-parser`, and `vllmhttp-parser` are used.
 
 FlowControl:
+- The flow control admission layer itself is off by default; enable it with
+  `featureGates: ["flowControl"]` in the configuration, or with
+  `--feature-gates=flowControl=true` on the command line.
 - `fcfs-ordering-policy`, `global-strict-fairness-policy`, and `static-usage-limit-policy` are configured when absent.
 - `utilization-detector` is configured as the saturation detector when none is set.
 
@@ -210,11 +283,28 @@ To learn more about the available plugins, check the plugins [README.md](../pkg/
 
 ---
 
-## Metric Scraping
+## Metric Scraping and the Data Layer
 
-- Scrapers collect metrics (e.g., memory usage, active adapters)
-- Data is injected into the shared datastore for scorers
-- Scoring can rely on numerical metrics or metadata (model ID, adapter tags)
+The data layer follows a Source -> Extract -> Attribute lifecycle:
+
+- Data sources collect per-endpoint data. Some poll pods periodically, for metrics (e.g., memory
+  usage, active adapters) or served models and LoRA adapters (via `/v1/models`); others react to
+  endpoint or Kubernetes object change notifications
+- Extractors populate per-endpoint attributes in the shared datastore for scorers
+- Screeners and scoring can rely on numerical metrics or metadata (model ID, adapter tags)
+
+The `models-responder` uses the per-endpoint model attributes for both its pool-wide
+OpenAI-compatible `GET /v1/models` response and its request-control screening. The public
+response does not expose endpoint identity. Inference screening uses the endpoint attributes
+before profile selection.
+
+Polling sources share one Collector goroutine per endpoint. The base tick is
+`--refresh-metrics-interval` (default 50ms). Each polling source plugin accepts an
+`interval` parameter (e.g. `"1s"`) that is rounded to the nearest multiple of the base tick;
+when omitted, the source runs on every base tick. The runtime converts each source's
+interval to base-tick multiples and schedules dispatches accordingly.
+
+See the upstream [Data Layer](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/datalayer.md) doc for the canonical model.
 
 ---
 
@@ -282,8 +372,15 @@ Enable chunked decode via the pd-sidecar flag:
 | `--decode-chunk-size` | `0` (disabled) | Token budget per chunk. Set to a positive integer to enable chunked decode. For best performance use a multiple of the KV cache block size. |
 
 > [!NOTE]
-> If the request's `max_tokens` / `max_completion_tokens` is less than or equal to `--decode-chunk-size`,
-> the sidecar falls back to a single regular decode call without chunking.
+> The sidecar falls back to a single regular decode call without chunking in any of these cases:
+>
+> - the request's `max_tokens` / `max_completion_tokens` is less than or equal to `--decode-chunk-size`.
+> - the request sets `echo: true`, because the decoder would echo the accumulated assistant text on
+>   every chunk.
+> - the request sets `n` greater than 1, because each chunk would continue the text of the first
+>   choice for every choice.
+> - the request declares a non-empty `tools` array and does not set `tool_choice: none`, because a
+>   tool call cannot be reassembled across chunk boundaries.
 
 ---
 
@@ -304,6 +401,17 @@ Enable chunked decode via the pd-sidecar flag:
 
 ## References
 
-- [GIE Spec](../README.md#relation-to-gie-igw)
+- [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension)
 - [Envoy External Processing](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter)
 - [EPP Container Sizing Guide](./operations.md)
+
+### Canonical llm-d architecture (upstream)
+
+- [Router overview](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/README.md)
+- [Proxy](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/proxy.md)
+- [Endpoint Picker (EPP)](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/epp.md)
+- [Configuration](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/configuration.md)
+- [Request Scheduler](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/scheduling.md)
+- [Request Handler](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/request-handling.md)
+- [Flow Control](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/flow-control.md)
+- [Data Layer](https://github.com/llm-d/llm-d/blob/main/docs/architecture/router/datalayer.md)

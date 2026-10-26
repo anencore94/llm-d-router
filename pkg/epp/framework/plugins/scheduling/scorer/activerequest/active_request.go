@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package activerequest
 
 import (
@@ -49,7 +65,7 @@ type endpointScores map[scheduling.Endpoint]float64
 func (s endpointScores) MarshalLog() interface{} {
 	result := make(map[string]float64, len(s))
 	for ep, score := range s {
-		result[ep.GetMetadata().NamespacedName.String()] = score
+		result[ep.GetMetadata().ID.String()] = score
 	}
 	return result
 }
@@ -158,7 +174,7 @@ func (s *ActiveRequest) Score(ctx context.Context, _ *scheduling.InferenceReques
 	maxCount := int64(0)
 
 	for _, endpoint := range endpoints {
-		endpointName := endpoint.GetMetadata().NamespacedName.String()
+		endpointName := endpoint.GetMetadata().ID.String()
 		count := s.requestCount(ctx, endpoint)
 		requestCounts[endpoint] = count
 		logCounts[endpointName] = count
@@ -187,7 +203,7 @@ func (s *ActiveRequest) Score(ctx context.Context, _ *scheduling.InferenceReques
 }
 
 func (s *ActiveRequest) requestCount(ctx context.Context, endpoint scheduling.Endpoint) int64 {
-	val, ok := endpoint.Get(s.inFlightLoadDataKey.String())
+	val, ok := endpoint.Get(s.inFlightLoadDataKey)
 	if !ok {
 		return 0
 	}
@@ -196,13 +212,13 @@ func (s *ActiveRequest) requestCount(ctx context.Context, endpoint scheduling.En
 	case *attrconcurrency.InFlightLoad:
 		if load == nil {
 			log.FromContext(ctx).V(logutil.TRACE).Info("Ignoring nil in-flight load attribute",
-				"endpoint", endpoint.GetMetadata().NamespacedName.String())
+				"endpoint", endpoint.GetMetadata().ID.String())
 			return 0
 		}
 		return load.Requests
 	default:
 		log.FromContext(ctx).V(logutil.TRACE).Info("Ignoring in-flight load attribute with unexpected type",
-			"endpoint", endpoint.GetMetadata().NamespacedName.String(),
+			"endpoint", endpoint.GetMetadata().ID.String(),
 			"attributeType", fmt.Sprintf("%T", val))
 		return 0
 	}

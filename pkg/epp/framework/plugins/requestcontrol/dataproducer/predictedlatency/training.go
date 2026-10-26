@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	latencypredictor "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/latencypredictorclient"
@@ -37,6 +39,8 @@ func buildPredictionRequest(
 	inputTokenLength int,
 	generatedTokens int,
 	prefixCacheScore float64,
+	encoderInputSize int,
+	encoderMatchedSize int,
 ) latencypredictor.PredictionRequest {
 	podType := ""
 	if endpointRoleLabel != "" && targetEndpointMetadata != nil && targetEndpointMetadata.Labels != nil {
@@ -50,8 +54,15 @@ func buildPredictionRequest(
 		NumRequestRunning:  metrics.RunningRequestsSize,
 		NumTokensGenerated: generatedTokens,
 		PrefixCacheScore:   prefixCacheScore,
+		EncoderInputSize:   encoderInputSize,
+		EncoderMatchedSize: encoderMatchedSize,
 		PodType:            podType,
 	}
+}
+
+type trainingEntryOptions struct {
+	PredictedTTFT *float64
+	PredictedTPOT *float64
 }
 
 // buildTrainingEntry constructs a training entry from actual latency measurements.
@@ -65,6 +76,9 @@ func buildTrainingEntry(
 	timestamp time.Time,
 	generatedTokens int,
 	prefixCacheScore float64,
+	encoderInputSize int,
+	encoderMatchedSize int,
+	options trainingEntryOptions,
 ) latencypredictor.TrainingEntry {
 	podType := ""
 	if endpointRoleLabel != "" && targetEndpointMetadata != nil && targetEndpointMetadata.Labels != nil {
@@ -81,7 +95,11 @@ func buildTrainingEntry(
 		NumRequestRunning:  m.RunningRequestsSize,
 		NumTokensGenerated: generatedTokens,
 		PrefixCacheScore:   prefixCacheScore,
+		EncoderInputSize:   encoderInputSize,
+		EncoderMatchedSize: encoderMatchedSize,
 		PodType:            podType,
+		PredictedTTFT:      options.PredictedTTFT,
+		PredictedTPOT:      options.PredictedTPOT,
 	}
 }
 
@@ -95,6 +113,7 @@ func recordTTFTTrainingData(
 	targetEndpointMetadata *fwkdl.EndpointMetadata,
 	now time.Time,
 	prefixCacheScore float64,
+	encoderMatchedSize int,
 ) {
 	logger := log.FromContext(ctx)
 	entry := buildTrainingEntry(
@@ -107,16 +126,33 @@ func recordTTFTTrainingData(
 		now,
 		0,
 		prefixCacheScore,
+		predictedLatencyCtx.encoderInputSize,
+		encoderMatchedSize,
+		trainingEntryOptions{PredictedTTFT: predictedLatencyMSPtr(predictedLatencyCtx.predictedTTFT)},
 	)
-	if predictedLatencyCtx.prefillTokensAtDispatchOnPrefill > 0 {
+	// In disaggregated serving TTFT is incurred on the prefill endpoint, so the
+	// in-flight features are snapshotted from that endpoint; otherwise the decode
+	// (monolithic) endpoint snapshot applies.
+	if predictedLatencyCtx.prefillTargetMetadata != nil {
 		entry.PrefillTokensInFlight = predictedLatencyCtx.prefillTokensAtDispatchOnPrefill
+		entry.NumRequestRunning = predictedLatencyCtx.requestsAtDispatchOnPrefill
 	} else {
 		entry.PrefillTokensInFlight = predictedLatencyCtx.prefillTokensAtDispatch
+		entry.NumRequestRunning = predictedLatencyCtx.requestsAtDispatch
 	}
 	entry.DecodeTokensInFlight = predictedLatencyCtx.decodeTokensAtDispatch
 	if err := predictor.AddTrainingDataBulk([]latencypredictor.TrainingEntry{entry}); err != nil {
 		logger.V(logutil.DEBUG).Error(err, "record TTFT training failed")
 	}
+}
+
+// predictedLatencyMSPtr returns a pointer for optional predicted_* JSON fields.
+// Zero or non-finite values mean no usable selected prediction and must be omitted.
+func predictedLatencyMSPtr(ms float64) *float64 {
+	if ms <= 0 || math.IsNaN(ms) || math.IsInf(ms, 0) {
+		return nil
+	}
+	return &ms
 }
 
 // refreshLastSeenMetrics updates predictedLatencyCtx.lastSeenMetrics from scheduling results.
@@ -162,6 +198,9 @@ func bulkPredictWithMetrics(
 	generatedTokenCounts []int,
 	prefixCacheScores []float64,
 	prefillTokensInFlights []int64,
+	numRequestRunnings []int,
+	encoderInputSizes []int,
+	encoderMatchedSizes []int,
 ) ([]*latencypredictor.PredictionResponse, error) {
 	logger := log.FromContext(ctx)
 
@@ -172,6 +211,10 @@ func bulkPredictWithMetrics(
 
 	if len(metricsStates) == 0 {
 		return []*latencypredictor.PredictionResponse{}, nil
+	}
+
+	if predictor == nil {
+		return nil, errPredictorUnavailable
 	}
 
 	for i, metricsState := range metricsStates {
@@ -195,9 +238,22 @@ func bulkPredictWithMetrics(
 			inputTokenLengths[i],
 			generatedTokenCounts[i],
 			prefixCacheScores[i],
+			0,
+			0,
 		)
 		if i < len(prefillTokensInFlights) {
 			bulkRequests[i].PrefillTokensInFlight = prefillTokensInFlights[i]
+		}
+		if i < len(numRequestRunnings) {
+			bulkRequests[i].NumRequestRunning = numRequestRunnings[i]
+		}
+		if i < len(encoderInputSizes) {
+			bulkRequests[i].EncoderInputSize = encoderInputSizes[i]
+		}
+		if i < len(encoderMatchedSizes) {
+			// The predictor rejects matched > input, so clamp instead of
+			// failing the whole bulk request when the slices are inconsistent.
+			bulkRequests[i].EncoderMatchedSize = min(encoderMatchedSizes[i], bulkRequests[i].EncoderInputSize)
 		}
 	}
 
@@ -206,7 +262,8 @@ func bulkPredictWithMetrics(
 	duration := time.Since(start)
 
 	if err != nil {
-		logger.V(logutil.DEBUG).Error(err, "bulk prediction failed",
+		logger.V(logutil.DEBUG).Info("bulk prediction failed",
+			"error", err,
 			"duration_ms", duration.Milliseconds(),
 			"request_count", len(bulkRequests))
 		return nil, err
@@ -215,12 +272,12 @@ func bulkPredictWithMetrics(
 	if bulkResponse == nil {
 		logger.V(logutil.DEBUG).Info("bulk prediction returned nil",
 			"duration_ms", duration.Milliseconds())
-		return nil, errors.New("bulk prediction returned nil result")
+		return nil, errNilPredictionResponse
 	}
 
 	if predictedLatencyContext != nil {
-		recordRequestTTFTPredictionDuration(ctx, pluginName, pluginType, predictedLatencyContext.schedulingRequest.TargetModel, predictedLatencyContext.incomingModelName, duration.Seconds())
-		recordRequestTPOTPredictionDuration(ctx, pluginName, pluginType, predictedLatencyContext.schedulingRequest.TargetModel, predictedLatencyContext.incomingModelName, duration.Seconds())
+		recordRequestTTFTPredictionDuration(ctx, pluginName, pluginType, predictedLatencyContext.incomingModelName, predictedLatencyContext.schedulingRequest.TargetModel, duration.Seconds())
+		recordRequestTPOTPredictionDuration(ctx, pluginName, pluginType, predictedLatencyContext.incomingModelName, predictedLatencyContext.schedulingRequest.TargetModel, duration.Seconds())
 	}
 
 	results := make([]*latencypredictor.PredictionResponse, len(bulkResponse.Predictions))

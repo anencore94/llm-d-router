@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +18,34 @@ limitations under the License.
 package server
 
 import (
+	"crypto/tls"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/require"
+	ctrl "sigs.k8s.io/controller-runtime"
+
+	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
 )
+
+const (
+	testPoolName   = "test-pool"
+	testConfigFile = "fake-config.yaml"
+)
+
+func TestToolCallingTelemetryOption(t *testing.T) {
+	opts := NewOptions()
+	require.False(t, opts.EnableToolCallingTelemetry)
+	fs := pflag.NewFlagSet(t.Name(), pflag.ContinueOnError)
+	opts.AddFlags(fs)
+	require.NoError(t, fs.Parse([]string{"--enable-tool-calling-telemetry"}))
+	require.True(t, opts.EnableToolCallingTelemetry)
+}
 
 // TestEndpointTargetPorts
 func TestEndpointTargetPorts(t *testing.T) {
@@ -88,7 +112,7 @@ func TestEndpointTargetPorts(t *testing.T) {
 			opts.AddFlags(tt.fs)
 
 			argv := make([]string, 0, 4+len(tt.args))
-			argv = append(argv, "--endpoint-selector", "app=vllm", "--config-file", "fake-config.yaml") // avoid an options validation error
+			argv = append(argv, "--endpoint-selector", "app=vllm", "--config-file", testConfigFile) // avoid an options validation error
 			argv = append(argv, tt.args...)
 
 			if err := tt.fs.Parse(argv); err != nil {
@@ -199,7 +223,7 @@ func TestGRPCFlags(t *testing.T) {
 			opts.AddFlags(fs)
 
 			argv := make([]string, 0, 4+len(tt.args))
-			argv = append(argv, "--pool-name", "test-pool", "--config-file", "fake-config.yaml")
+			argv = append(argv, "--pool-name", testPoolName, "--config-file", testConfigFile)
 			argv = append(argv, tt.args...)
 
 			if err := fs.Parse(argv); err != nil {
@@ -231,18 +255,579 @@ func TestGRPCFlags(t *testing.T) {
 	}
 }
 
+// TestPortFlags exercises --grpc-port, --metrics-port, and --grpc-health-port
+// as uint16-backed flags: defaults, valid values including the boundary
+// 65535, and rejection of values outside the uint16 range at parse time.
+func TestPortFlags(t *testing.T) {
+	tests := []struct {
+		name               string
+		args               []string
+		expectParseError   bool
+		expectedGRPCPort   uint16
+		expectedMetricsPrt uint16
+		expectedHealthPort uint16
+	}{
+		{
+			name:               "defaults",
+			args:               []string{},
+			expectedGRPCPort:   DefaultGrpcPort,
+			expectedMetricsPrt: 9090,
+			expectedHealthPort: 9003,
+		},
+		{
+			name: "valid explicit values",
+			args: []string{
+				"--grpc-port", "8080",
+				"--metrics-port", "8081",
+				"--grpc-health-port", "8082",
+			},
+			expectedGRPCPort:   8080,
+			expectedMetricsPrt: 8081,
+			expectedHealthPort: 8082,
+		},
+		{
+			name:               "max uint16 boundary",
+			args:               []string{"--grpc-port", "65535"},
+			expectedGRPCPort:   65535,
+			expectedMetricsPrt: 9090,
+			expectedHealthPort: 9003,
+		},
+		{
+			name:             "value over uint16 range is rejected at parse time",
+			args:             []string{"--grpc-port", "65536"},
+			expectParseError: true,
+		},
+		{
+			name:             "negative value is rejected at parse time",
+			args:             []string{"--metrics-port", "-1"},
+			expectParseError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			err := fs.Parse(argv)
+
+			if tt.expectParseError {
+				require.Error(t, err, "expected flag parsing to fail")
+				return
+			}
+			require.NoError(t, err, "flag parsing failed unexpectedly")
+
+			require.Equal(t, tt.expectedGRPCPort, opts.GRPCPort)
+			require.Equal(t, tt.expectedMetricsPrt, opts.MetricsPort)
+			require.Equal(t, tt.expectedHealthPort, opts.GRPCHealthPort)
+		})
+	}
+}
+
 func TestValidateDirectValues(t *testing.T) {
 	opts := NewOptions()
-	opts.PoolName = "test-pool" // bypass other validations
+	opts.PoolName = testPoolName // bypass other validations
 	opts.GRPCMaxRecvMsgSize = -5
 	if err := opts.Validate(); err == nil {
 		t.Errorf("Expected Validate() to fail for negative GRPCMaxRecvMsgSize, but it succeeded")
 	}
 
 	opts = NewOptions()
-	opts.PoolName = "test-pool"
+	opts.PoolName = testPoolName
 	opts.GRPCMaxSendMsgSize = -5
 	if err := opts.Validate(); err == nil {
 		t.Errorf("Expected Validate() to fail for negative GRPCMaxSendMsgSize, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.PoolName = testPoolName
+	opts.FairnessIDMetricLabelLimit = -1
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for negative FairnessIDMetricLabelLimit, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.FairnessIDMetricLabelLimit = 0
+	if err := opts.Validate(); err != nil {
+		t.Errorf("Expected Validate() to allow a zero FairnessIDMetricLabelLimit, got %v", err)
+	}
+}
+
+func TestFairnessIDMetricLabelLimitDefault(t *testing.T) {
+	if got := NewOptions().FairnessIDMetricLabelLimit; got != metricsutil.DefaultFairnessIDLabelLimit {
+		t.Errorf("default FairnessIDMetricLabelLimit: got %d, want %d", got, metricsutil.DefaultFairnessIDLabelLimit)
+	}
+}
+
+func TestValidateRefreshMetricsIntervalFloor(t *testing.T) {
+	opts := NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshMetricsInterval = 10 * time.Millisecond
+	if err := opts.Validate(); err != nil {
+		t.Fatalf("Expected Validate() to clamp, not fail: %v", err)
+	}
+	if opts.RefreshMetricsInterval != MinRefreshMetricsInterval {
+		t.Errorf("Expected RefreshMetricsInterval to be clamped to %s, got %s",
+			MinRefreshMetricsInterval, opts.RefreshMetricsInterval)
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshMetricsInterval = 50 * time.Millisecond
+	if err := opts.Validate(); err != nil {
+		t.Errorf("Expected Validate() to pass for RefreshMetricsInterval of 50ms, got %v", err)
+	}
+}
+
+func TestValidateMetricsTimingFlags(t *testing.T) {
+	opts := NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshPrometheusMetricsInterval = 0
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for zero RefreshPrometheusMetricsInterval, but it succeeded")
+	} else if !strings.Contains(err.Error(), "refresh-prometheus-metrics-interval") {
+		t.Errorf("Expected error to reference the flag, got: %v", err)
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshPrometheusMetricsInterval = -time.Second
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for negative RefreshPrometheusMetricsInterval, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.MetricsStalenessThreshold = 0
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for zero MetricsStalenessThreshold, but it succeeded")
+	} else if !strings.Contains(err.Error(), "metrics-staleness-threshold") {
+		t.Errorf("Expected error to reference the flag, got: %v", err)
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.MetricsStalenessThreshold = -5 * time.Second
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for negative MetricsStalenessThreshold, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	if err := opts.Validate(); err != nil {
+		t.Errorf("Expected Validate() to pass for default timing values, got: %v", err)
+	}
+}
+
+func TestDrainTimeoutFlag(t *testing.T) {
+	// Defaults to DefaultDrainTimeout.
+	def := NewOptions()
+	def.AddFlags(pflag.NewFlagSet("default", pflag.ContinueOnError))
+	if def.DrainTimeout != DefaultDrainTimeout {
+		t.Errorf("DrainTimeout default = %v, want %v", def.DrainTimeout, DefaultDrainTimeout)
+	}
+
+	// The flag parses a duration.
+	opts := NewOptions()
+	fs := pflag.NewFlagSet("set", pflag.ContinueOnError)
+	opts.AddFlags(fs)
+	if err := fs.Parse([]string{"--drain-timeout=30s"}); err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	if opts.DrainTimeout != 30*time.Second {
+		t.Errorf("DrainTimeout = %v, want 30s", opts.DrainTimeout)
+	}
+}
+
+func TestValidateConfigFlagsMutuallyExclusive(t *testing.T) {
+	opts := NewOptions()
+	opts.PoolName = "config-flags-pool" // bypass the pool/selector validation
+	opts.ConfigFile = testConfigFile
+	opts.ConfigText = "fake: config"
+
+	err := opts.Validate()
+	if err == nil {
+		t.Fatalf("Expected Validate() to fail when both config flags are set, but it succeeded")
+	}
+	for _, want := range []string{"config-file", "config-text"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate() error must reference the %q flag, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateWithoutPoolNameOrEndpointSelector(t *testing.T) {
+	opts := NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("pool-selector", pflag.ContinueOnError))
+	opts.ConfigFile = testConfigFile
+	require.NoError(t, opts.Validate(), "file discovery runs without pool-name or endpoint-selector")
+}
+
+func TestMetricsMTLSFlags(t *testing.T) {
+	fs := pflag.NewFlagSet("metrics-mtls", pflag.ContinueOnError)
+	opts := NewOptions()
+	opts.AddFlags(fs)
+	require.NoError(t, fs.Parse([]string{
+		"--pool-name", testPoolName, "--config-file", testConfigFile,
+		"--metrics-cert-dir", "/etc/epp-tls",
+		"--metrics-client-ca-file", "/etc/epp-ca/ca.crt",
+	}))
+	require.Equal(t, "/etc/epp-tls", opts.MetricsCertDir)
+	require.Equal(t, "/etc/epp-ca/ca.crt", opts.MetricsClientCAFile)
+}
+
+func TestValidateMetricsMTLS(t *testing.T) {
+	tests := []struct {
+		name         string
+		clientCA     string
+		certDir      string
+		endpointAuth bool
+		wantErr      error
+	}{
+		{name: "neither set"},
+		{name: "endpoint auth only", endpointAuth: true},
+		{name: "mTLS (cert dir + client CA)", clientCA: "ca.crt", certDir: "tls"},
+		{name: "cert dir + endpoint auth", certDir: "tls", endpointAuth: true},
+		{name: "cert dir + client CA + auth", clientCA: "ca.crt", certDir: "tls", endpointAuth: true},
+		{name: "cert dir only, no auth (fail-open)", certDir: "tls", wantErr: errMetricsTLSWithoutAuth},
+		{name: "client CA without cert dir", clientCA: "ca.crt", wantErr: errMetricsClientCARequiresCertDir},
+		{name: "client CA without cert dir, auth on", clientCA: "ca.crt", endpointAuth: true, wantErr: errMetricsClientCARequiresCertDir},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.AddFlags(pflag.NewFlagSet(tc.name, pflag.ContinueOnError))
+			opts.PoolName = testPoolName
+			opts.MetricsClientCAFile = tc.clientCA
+			opts.MetricsCertDir = tc.certDir
+			opts.MetricsEndpointAuth = tc.endpointAuth
+			err := opts.Validate()
+			if tc.wantErr == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestCompleteMetricsCertFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	missing := NewOptions()
+	missing.AddFlags(pflag.NewFlagSet("missing", pflag.ContinueOnError))
+	missing.MetricsCertDir = dir
+	require.ErrorIs(t, missing.Complete(), errMetricsCertUnreadable)
+
+	// tls.crt present but tls.key still missing: partial cert must fail.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.crt"), []byte("x"), 0o600))
+	partial := NewOptions()
+	partial.AddFlags(pflag.NewFlagSet("partial", pflag.ContinueOnError))
+	partial.MetricsCertDir = dir
+	require.ErrorIs(t, partial.Complete(), errMetricsCertUnreadable)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.key"), []byte("x"), 0o600))
+
+	present := NewOptions()
+	present.AddFlags(pflag.NewFlagSet("present", pflag.ContinueOnError))
+	present.MetricsCertDir = dir
+	require.NoError(t, present.Complete())
+}
+
+func TestTLSMinVersionFlag(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		wantVersion     uint16
+		wantErrContains string
+	}{
+		{
+			name:        "VersionTLS12",
+			args:        []string{"--tls-min-version", "VersionTLS12"},
+			wantVersion: tls.VersionTLS12,
+		},
+		{
+			name:        "VersionTLS13",
+			args:        []string{"--tls-min-version", "VersionTLS13"},
+			wantVersion: tls.VersionTLS13,
+		},
+		{
+			name:        "not set",
+			args:        []string{},
+			wantVersion: 0,
+		},
+		{
+			name:            "TLS1.2",
+			args:            []string{"--tls-min-version", "TLS1.2"},
+			wantErrContains: "unknown TLS version",
+		},
+		{
+			name:            "VersionTLS10",
+			args:            []string{"--tls-min-version", "VersionTLS10"},
+			wantErrContains: "below the TLS 1.2 minimum",
+		},
+		{
+			name:            "VersionTLS11",
+			args:            []string{"--tls-min-version", "VersionTLS11"},
+			wantErrContains: "below the TLS 1.2 minimum",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			require.NoError(t, fs.Parse(argv))
+
+			err := opts.Complete()
+			if tt.wantErrContains != "" {
+				require.ErrorContains(t, err, tt.wantErrContains)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantVersion, opts.TLSMinVersionValue())
+		})
+	}
+}
+
+func TestTLSCipherSuitesFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantSuites []uint16
+		wantErr    bool
+	}{
+		{
+			name: "single cipher",
+			args: []string{"--tls-cipher-suites", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+			wantSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			},
+		},
+		{
+			name: "multiple ciphers",
+			args: []string{"--tls-cipher-suites", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"},
+			wantSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			},
+		},
+		{
+			name:       "not set",
+			args:       []string{},
+			wantSuites: nil,
+		},
+		{
+			name:    "unknown cipher",
+			args:    []string{"--tls-cipher-suites", "FAKE_CIPHER_SUITE"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			require.NoError(t, fs.Parse(argv))
+
+			err := opts.Complete()
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantSuites, opts.TLSCipherSuiteValues())
+		})
+	}
+}
+
+func TestParseTLSVersion(t *testing.T) {
+	for name, want := range tlsVersions {
+		got, err := parseTLSVersion(name)
+		require.NoError(t, err, name)
+		require.Equal(t, want, got, name)
+	}
+	_, err := parseTLSVersion("invalid")
+	require.Error(t, err)
+}
+
+func TestParseCipherSuites(t *testing.T) {
+	ids, err := parseCipherSuites([]string{
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	}, ids)
+
+	_, err = parseCipherSuites([]string{"BOGUS"})
+	require.Error(t, err)
+}
+
+func TestValidatePoolGroupFlag(t *testing.T) {
+	opts := NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.PoolGroup = "inference.networking.k8s.io/v1"
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for PoolGroup %q recommended by the flag help text, but it succeeded", opts.PoolGroup)
+	} else if !strings.Contains(err.Error(), "pool-group") {
+		t.Errorf("Expected error to reference the flag, got: %v", err)
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.PoolGroup = ""
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to fail for empty PoolGroup, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.PoolGroup = "inference.networking.x-k8s.io"
+	if err := opts.Validate(); err == nil {
+		t.Errorf("Expected Validate() to reject the inference.networking.x-k8s.io PoolGroup, but it succeeded")
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	if err := opts.Validate(); err != nil {
+		t.Errorf("Expected Validate() to accept the default PoolGroup, got: %v", err)
+	}
+}
+
+// TestLeaderElectionFlags covers the lease name and timing flags: defaults, explicit values, the
+// validation that mirrors client-go's leader elector, and the manager option override.
+func TestLeaderElectionFlags(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		wantLeaseName string
+		wantDuration  time.Duration
+		wantRenew     time.Duration
+		wantRetry     time.Duration
+		expectError   bool
+	}{
+		{
+			name:         "defaults",
+			args:         []string{"--ha-enable-leader-election"},
+			wantDuration: DefaultLeaseDuration,
+			wantRenew:    DefaultRenewDeadline,
+			wantRetry:    DefaultRetryPeriod,
+		},
+		{
+			name: "explicit values",
+			args: []string{
+				"--ha-enable-leader-election", "--ha-lease-name", "epp-replacement",
+				"--ha-lease-duration", "40s", "--ha-renew-deadline", "30s", "--ha-retry-period", "3s",
+			},
+			wantLeaseName: "epp-replacement",
+			wantDuration:  40 * time.Second,
+			wantRenew:     30 * time.Second,
+			wantRetry:     3 * time.Second,
+		},
+		{
+			name:        "renew deadline not shorter than lease duration",
+			args:        []string{"--ha-enable-leader-election", "--ha-lease-duration", "30s", "--ha-renew-deadline", "30s"},
+			expectError: true,
+		},
+		{
+			name:        "renew deadline within the retry jitter",
+			args:        []string{"--ha-enable-leader-election", "--ha-renew-deadline", "2s", "--ha-retry-period", "2s"},
+			expectError: true,
+		},
+		{
+			name:        "non-positive retry period",
+			args:        []string{"--ha-enable-leader-election", "--ha-retry-period", "0s"},
+			expectError: true,
+		},
+		{
+			name:         "timings are not validated without leader election",
+			args:         []string{"--ha-lease-duration", "5s", "--ha-renew-deadline", "30s"},
+			wantDuration: 5 * time.Second,
+			wantRenew:    30 * time.Second,
+			wantRetry:    DefaultRetryPeriod,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			if err := fs.Parse(argv); err != nil {
+				t.Fatalf("Failed to parse flags: %v", err)
+			}
+			err := opts.Complete()
+			if err == nil {
+				err = opts.Validate()
+			}
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("Expected Complete() or Validate() to fail, but it succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Complete/Validate failed unexpectedly with error: %v", err)
+			}
+			if opts.LeaseName != tt.wantLeaseName || opts.LeaseDuration != tt.wantDuration ||
+				opts.RenewDeadline != tt.wantRenew || opts.RetryPeriod != tt.wantRetry {
+				t.Errorf("got name=%q duration=%s renew=%s retry=%s, want name=%q duration=%s renew=%s retry=%s",
+					opts.LeaseName, opts.LeaseDuration, opts.RenewDeadline, opts.RetryPeriod,
+					tt.wantLeaseName, tt.wantDuration, tt.wantRenew, tt.wantRetry)
+			}
+		})
+	}
+}
+
+func TestLeaderElectionOverride(t *testing.T) {
+	opts := NewOptions()
+	opts.LeaseName = "epp-replacement"
+	opts.LeaseDuration, opts.RenewDeadline, opts.RetryPeriod = 40*time.Second, 30*time.Second, 3*time.Second
+
+	enabled := ctrl.Options{LeaderElection: true, LeaderElectionID: "epp-ns-pool.llm-d.ai"}
+	opts.LeaderElectionOverride()(&enabled)
+	if enabled.LeaderElectionID != "epp-replacement" {
+		t.Errorf("LeaderElectionID = %q, want %q", enabled.LeaderElectionID, "epp-replacement")
+	}
+	if enabled.LeaseDuration == nil || *enabled.LeaseDuration != 40*time.Second ||
+		enabled.RenewDeadline == nil || *enabled.RenewDeadline != 30*time.Second ||
+		enabled.RetryPeriod == nil || *enabled.RetryPeriod != 3*time.Second {
+		t.Errorf("lease timings not applied: %v %v %v", enabled.LeaseDuration, enabled.RenewDeadline, enabled.RetryPeriod)
+	}
+
+	opts.LeaseName = ""
+	derived := ctrl.Options{LeaderElection: true, LeaderElectionID: "epp-ns-pool.llm-d.ai"}
+	opts.LeaderElectionOverride()(&derived)
+	if derived.LeaderElectionID != "epp-ns-pool.llm-d.ai" {
+		t.Errorf("empty lease name changed LeaderElectionID to %q", derived.LeaderElectionID)
+	}
+
+	disabled := ctrl.Options{}
+	opts.LeaderElectionOverride()(&disabled)
+	if disabled.LeaseDuration != nil || disabled.LeaderElectionID != "" {
+		t.Errorf("override changed manager options with leader election disabled: %+v", disabled)
 	}
 }

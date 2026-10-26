@@ -18,9 +18,12 @@ package proxy
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/felixge/httpsnoop"
 )
 
 const sseEventDelimiter = "\n\n"
@@ -55,6 +58,265 @@ func (w *bufferedResponseWriter) bodyBytes() []byte {
 	return w.buffer.Bytes()
 }
 
+// responseStatus records the final status code written through a writer
+// returned by captureResponseStatus and whether any body write failed, so a
+// streamed response (SSE included) can be observed for error metrics without
+// buffering its body.
+type responseStatus struct {
+	statusCode  int
+	writeFailed bool
+}
+
+// captureResponseStatus wraps w so writes pass straight through while being
+// recorded in the returned responseStatus. httpsnoop gives the wrapper the same
+// optional interfaces as w (http.Flusher, http.Hijacker, io.ReaderFrom), so
+// wrappers stacked on top of it keep their own hooks for those interfaces.
+func captureResponseStatus(w http.ResponseWriter) (http.ResponseWriter, *responseStatus) {
+	s := &responseStatus{}
+	writer := httpsnoop.Wrap(w, httpsnoop.Hooks{
+		WriteHeader: func(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
+			return func(statusCode int) {
+				// 1xx responses are informational; the final status follows them.
+				// An error status after an implicit 200 (e.g. a later failing chunk
+				// in streaming chunked decode) still marks the response failed.
+				if statusCode >= http.StatusOK && (s.statusCode == 0 || isHTTPError(statusCode)) {
+					s.statusCode = statusCode
+				}
+				next(statusCode)
+			}
+		},
+		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+			return func(b []byte) (int, error) {
+				s.implicitOK()
+				n, err := next(b)
+				if err != nil {
+					s.writeFailed = true
+				}
+				return n, err
+			}
+		},
+		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+			return func(src io.Reader) (int64, error) {
+				s.implicitOK()
+				n, err := next(src)
+				if err != nil {
+					s.writeFailed = true
+				}
+				return n, err
+			}
+		},
+	})
+	return writer, s
+}
+
+func (s *responseStatus) implicitOK() {
+	if s.statusCode == 0 {
+		s.statusCode = http.StatusOK
+	}
+}
+
+// failed reports whether the response carried an error status or could not be
+// delivered to the client. A response that wrote no status at all also counts
+// as failed: the stage produced nothing, and net/http would send the client an
+// empty 200.
+func (s *responseStatus) failed() bool {
+	return s.statusCode == 0 || isHTTPError(s.statusCode) || s.writeFailed
+}
+
+// deferredCommitWriter wraps a client http.ResponseWriter and holds all writes
+// until the caller decides the outcome (the "commit point"). It is used by the
+// MoRI-IO parallel WRITE dispatch so decode can run concurrently with prefill
+// yet never surface a response to the client before prefill has succeeded:
+//
+//   - commit(): relay the buffered status/headers/body to the client and switch
+//     to pass-through mode, so any further decode writes stream straight to the
+//     client (SSE/streaming is preserved after the commit point).
+//   - abort():  discard the buffered output and drop every subsequent write, so
+//     a failed prefill can never let decode emit a (possibly 200) response; the
+//     caller then writes the prefill error to the client directly.
+//
+// It is safe for concurrent use by the decode goroutine (Write/WriteHeader/
+// Flush) and the coordinating goroutine (commit/abort).
+type deferredCommitWriter struct {
+	dst http.ResponseWriter
+
+	mu sync.Mutex
+	// committed: caller decided prefill succeeded, decode's response may reach
+	// the client. aborted: caller decided prefill failed, decode is discarded.
+	committed bool
+	aborted   bool
+	// wroteHeader records that decode has produced its status/headers.
+	wroteHeader bool
+	// headerFlushed records that decode's status/headers have been relayed to
+	// dst; after this, writes stream straight through.
+	headerFlushed bool
+	// writeFailed records that relaying decode's output to dst failed.
+	writeFailed bool
+	statusCode  int
+	header      http.Header
+	buffer      bytes.Buffer
+}
+
+func newDeferredCommitWriter(dst http.ResponseWriter) *deferredCommitWriter {
+	return &deferredCommitWriter{
+		dst:    dst,
+		header: make(http.Header),
+	}
+}
+
+func (w *deferredCommitWriter) Header() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Once decode's headers have been relayed, hand back the real writer's
+	// header map. Until then (buffering, or committed but decode hasn't emitted
+	// its header yet) collect into our own map so we can relay it verbatim.
+	if w.headerFlushed {
+		return w.dst.Header()
+	}
+	return w.header
+}
+
+func (w *deferredCommitWriter) WriteHeader(statusCode int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.aborted {
+		return
+	}
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		w.statusCode = statusCode
+	}
+	// If we've already committed, decode's header is now known -> relay it.
+	if w.committed && !w.headerFlushed {
+		w.flushCommitLocked()
+	}
+}
+
+func (w *deferredCommitWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.aborted {
+		// Response was discarded (prefill failed); silently drop decode output.
+		return len(b), nil
+	}
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		if w.statusCode == 0 {
+			w.statusCode = http.StatusOK
+		}
+	}
+	if w.committed {
+		if !w.headerFlushed {
+			w.flushCommitLocked()
+		}
+		n, err := w.dst.Write(b)
+		if err != nil {
+			w.writeFailed = true
+		}
+		return n, err
+	}
+	return w.buffer.Write(b)
+}
+
+// Flush only propagates once decode's response has been relayed to the client;
+// while buffering it is a no-op so nothing reaches the client before the commit
+// point.
+func (w *deferredCommitWriter) Flush() {
+	w.mu.Lock()
+	streaming := w.headerFlushed && !w.aborted
+	w.mu.Unlock()
+	if !streaming {
+		return
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// flushCommitLocked relays decode's buffered status/headers/body to dst and
+// marks the response as flushed so subsequent writes stream through. Caller must
+// hold w.mu and must have set committed.
+func (w *deferredCommitWriter) flushCommitLocked() {
+	if w.headerFlushed {
+		return
+	}
+	dstHeader := w.dst.Header()
+	for key, values := range w.header {
+		dstHeader[key] = values
+	}
+	status := w.statusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.headerFlushed = true
+	w.dst.WriteHeader(status)
+	if w.buffer.Len() > 0 {
+		if _, err := w.dst.Write(w.buffer.Bytes()); err != nil {
+			w.writeFailed = true
+		}
+		w.buffer.Reset()
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// commit allows decode's response to reach the client, preserving decode's own
+// status, headers, and body. If decode has already produced output it is flushed
+// immediately; otherwise the flush is deferred until decode emits its header, so
+// a fast-succeeding prefill never clobbers decode's status/headers with a
+// synthesized default. Returns false if the writer had already been aborted.
+func (w *deferredCommitWriter) commit() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.aborted {
+		return false
+	}
+	if w.committed {
+		return true
+	}
+	w.committed = true
+	// Only flush now if decode already emitted its header/body; otherwise wait
+	// for decode's WriteHeader/Write so we relay its real status and headers.
+	if w.wroteHeader || w.buffer.Len() > 0 {
+		w.flushCommitLocked()
+	}
+	return true
+}
+
+// abort discards buffered output and drops all future writes. It is a no-op
+// once decode's response has been relayed to the client, which the
+// concurrent-dispatch decode abort path reaches: the response is already on the
+// wire, so the caller tears the connection down instead.
+func (w *deferredCommitWriter) abort() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.headerFlushed {
+		return
+	}
+	w.aborted = true
+	w.buffer.Reset()
+}
+
+// failed reports whether decode's response carried an error status or could
+// not be relayed to the client. A status of 0 means decode wrote nothing, or
+// the writer was aborted before decode emitted a header; both count as failed.
+func (w *deferredCommitWriter) failed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return isHTTPError(w.statusCode) || w.writeFailed
+}
+
+// responseStarted reports whether decode's status/headers have reached the
+// client. Callers that need to fail a request after the commit point use it to
+// choose between writing their own error status, which is only possible while
+// nothing has been relayed, and tearing the connection down.
+func (w *deferredCommitWriter) responseStarted() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.headerFlushed
+}
+
 type flushableResponseWriter interface {
 	http.ResponseWriter
 	http.Flusher
@@ -77,6 +339,11 @@ type responseWriterWithBuffer struct {
 	statusCode  int
 	wroteHeader bool
 
+	// header holds the headers set while buffering. They reach the underlying
+	// writer only on flushBufferAndGoDirect, so a response that is never
+	// flushed leaves the client's headers untouched.
+	header http.Header
+
 	// ready receives an error (or nil) when the first Write happens,
 	// signaling that there's data available for inspection or an error occurred.
 	ready     chan struct{}
@@ -87,6 +354,7 @@ type responseWriterWithBuffer struct {
 func newResponseWriterWithBuffer(w flushableResponseWriter) *responseWriterWithBuffer {
 	rw := &responseWriterWithBuffer{
 		writerFlusher: w,
+		header:        make(http.Header),
 		ready:         make(chan struct{}, 1), // buffered to avoid blocking sender
 	}
 	rw.buffering.Store(true)
@@ -94,6 +362,9 @@ func newResponseWriterWithBuffer(w flushableResponseWriter) *responseWriterWithB
 }
 
 func (w *responseWriterWithBuffer) Header() http.Header {
+	if w.buffering.Load() {
+		return w.header
+	}
 	return w.writerFlusher.Header()
 }
 
@@ -182,6 +453,10 @@ func (w *responseWriterWithBuffer) writeHeaderOnce() {
 		return
 	}
 	w.wroteHeader = true
+	dstHeader := w.writerFlusher.Header()
+	for key, values := range w.header {
+		dstHeader[key] = values
+	}
 	if w.statusCode != 0 {
 		w.writerFlusher.WriteHeader(w.statusCode)
 	}

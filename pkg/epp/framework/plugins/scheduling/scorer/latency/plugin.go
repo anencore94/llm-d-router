@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -162,7 +163,7 @@ func (s *Plugin) Score(ctx context.Context, _ *fwksched.InferenceRequest, endpoi
 	hasPredictions := false
 	for _, ep := range endpoints {
 		d := epData{endpoint: ep}
-		if raw, ok := ep.Get(s.latencyPredictionInfoDataKey.String()); ok {
+		if raw, ok := ep.Get(s.latencyPredictionInfoDataKey); ok {
 			info := raw.(*attrlatency.LatencyPredictionInfo)
 			d.info = info
 			d.ttftHeadroom = info.TTFTHeadroom()
@@ -281,11 +282,11 @@ func (s *Plugin) scoreBucket(ctx context.Context, data []epData, scores map[fwks
 	tpotRange := maxTPOT - minTPOT
 
 	// Range-based weight re-normalization.
-	// If one dimension has zero range (all values identical), set its weight
-	// to 0 so it doesn't compress scores to a single value.
-	if ttftRange <= eps && tpotRange > eps {
+	// If one dimension has zero range, use the other dimension only when
+	// its configured weight is positive.
+	if ttftRange <= eps && tpotRange > eps && s.config.TPOTWeight > 0 {
 		alpha, beta = 0.0, 1.0
-	} else if tpotRange <= eps && ttftRange > eps {
+	} else if tpotRange <= eps && ttftRange > eps && s.config.TTFTWeight > 0 {
 		alpha, beta = 1.0, 0.0
 	}
 
@@ -320,7 +321,7 @@ func (s *Plugin) scoreBucket(ctx context.Context, data []epData, scores map[fwks
 		scores[d.endpoint] = w / float64(wMax)
 
 		logger.V(logutil.TRACE).Info("LatencyScorer: scored endpoint",
-			"endpoint", d.endpoint.GetMetadata().NamespacedName.Name,
+			"endpoint", d.endpoint.GetMetadata().ID.Name,
 			"ttftHeadroom", d.ttftHeadroom, "tpotHeadroom", d.tpotHeadroom,
 			"nTTFT", nTTFT, "nTPOT", nTPOT, "combined", combined, "score", scores[d.endpoint])
 	}
@@ -345,7 +346,11 @@ func (s *Plugin) compositeScores(ctx context.Context, endpoints []fwksched.Endpo
 	// Find max queue for relative scoring.
 	maxQ := 0
 	for _, ep := range endpoints {
-		if q := ep.GetMetrics().WaitingQueueSize; q > maxQ {
+		podMetrics := ep.GetMetrics()
+		if !podMetrics.Updated() {
+			continue
+		}
+		if q := podMetrics.WaitingQueueSize; q > maxQ {
 			maxQ = q
 		}
 	}
@@ -353,13 +358,17 @@ func (s *Plugin) compositeScores(ctx context.Context, endpoints []fwksched.Endpo
 
 	logger := log.FromContext(ctx)
 	for _, ep := range endpoints {
-		q := ep.GetMetrics().WaitingQueueSize
+		podMetrics := ep.GetMetrics()
+		if !podMetrics.Updated() {
+			continue
+		}
+		q := podMetrics.WaitingQueueSize
 		relQueue := 1.0
 		if qRange > 0 {
 			relQueue = float64(maxQ-q) / qRange
 		}
 
-		kvFree := 1.0 - ep.GetMetrics().KVCacheUsagePercent
+		kvFree := 1.0 - podMetrics.KVCacheUsagePercent
 		prefix := s.prefixCacheScore(ep)
 
 		composite := wkv*kvFree + wq*relQueue + wpref*prefix
@@ -368,7 +377,7 @@ func (s *Plugin) compositeScores(ctx context.Context, endpoints []fwksched.Endpo
 
 		scores[ep] = score
 		logger.V(logutil.TRACE).Info("LatencyScorer: composite",
-			"endpoint", ep.GetMetadata().NamespacedName.Name,
+			"endpoint", ep.GetMetadata().ID.Name,
 			"kvFree", kvFree, "relQueue", relQueue, "prefix", prefix, "score", score)
 	}
 
@@ -393,7 +402,7 @@ func normalizedWeights(a, b float64) (float64, float64) {
 }
 
 func (s *Plugin) prefixCacheScore(ep fwksched.Endpoint) float64 {
-	if raw, ok := ep.Get(s.prefixMatchDataKey.String()); ok {
+	if raw, ok := ep.Get(s.prefixMatchDataKey); ok {
 		info := raw.(*attrprefix.PrefixCacheMatchInfo)
 		if info.TotalBlocks() > 0 {
 			score := float64(info.MatchBlocks()) / float64(info.TotalBlocks())

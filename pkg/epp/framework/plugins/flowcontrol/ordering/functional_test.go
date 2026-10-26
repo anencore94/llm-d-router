@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -57,9 +58,6 @@ func TestOrderingPolicyConformance(t *testing.T) {
 			t.Run("Initialization", func(t *testing.T) {
 				t.Parallel()
 				assert.Equal(t, name, policy.TypedName().Name, "TypedName().Name should match registered name")
-
-				caps := policy.RequiredQueueCapabilities()
-				assert.NotNil(t, caps, "RequiredQueueCapabilities() should not return nil slice")
 			})
 
 			t.Run("Less_Sanity", func(t *testing.T) {

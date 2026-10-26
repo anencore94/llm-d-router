@@ -1,0 +1,834 @@
+// Copyright 2025 The llm-d Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kvevents
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
+)
+
+const (
+	defaultEventSourceDeviceTier = kvcache.GPUTier
+	defaultPodSelector           = ""
+)
+
+// normalizeDeviceTier lowercases an event's device tier and defaults an empty
+// value to the GPU source tier. Store and remove events that mean the same tier
+// must normalize identically so they build equal PodEntries and dedup scopes;
+// keeping this in one place prevents the two call sites from drifting apart.
+func normalizeDeviceTier(deviceTier string) string {
+	if deviceTier == "" {
+		return defaultEventSourceDeviceTier
+	}
+	return strings.ToLower(deviceTier)
+}
+
+func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
+	switch kind {
+	case KVCacheSpecKindFullAttention, KVCacheSpecKindMlaAttention, KVCacheSpecKindSinkFull:
+		return true
+	default:
+		return false
+	}
+}
+
+func cacheKindLabel(kind KVCacheSpecKind) string {
+	if kind == "" {
+		return string(KVCacheSpecKindUnknown)
+	}
+	return string(kind)
+}
+
+// subCanonicalStore reports whether ev's engine blocks are smaller than the
+// canonical block size. Events without a declared block size fall back to
+// tokens per block hash.
+func subCanonicalStore(ev *BlockStoredEvent, canonicalBlockSize int) bool {
+	engineBlockSize := ev.BlockSize
+	if engineBlockSize <= 0 && len(ev.BlockHashes) > 0 {
+		engineBlockSize = len(ev.Tokens) / len(ev.BlockHashes)
+	}
+	return engineBlockSize > 0 && engineBlockSize < canonicalBlockSize
+}
+
+func blockStoredEventDigestible(ev *BlockStoredEvent, canonicalBlockSize int) (bool, string) {
+	if ev.GroupIdx == nil {
+		return true, ""
+	}
+	if len(ev.Tokens) > 0 {
+		if ev.BlockSize <= 0 {
+			return false, "invalid_block_size"
+		}
+		if len(ev.Tokens)%ev.BlockSize != 0 || len(ev.Tokens)/ev.BlockSize != len(ev.BlockHashes) {
+			return false, "non_dense_block_span"
+		}
+	}
+	if !isPrefixIndexableSpecKind(ev.KVCacheSpecKind) {
+		return false, "unsupported_cache_kind"
+	}
+	if len(ev.Tokens) > 0 && len(ev.Tokens) < canonicalBlockSize {
+		return false, "incomplete_canonical_block"
+	}
+	return true, ""
+}
+
+// Config holds the configuration for the event processing pool.
+type Config struct {
+	// ZMQEndpoint is the ZMQ address to connect to (e.g., "tcp://indexer:5557").
+	ZMQEndpoint string `json:"zmqEndpoint,omitempty"`
+	// TopicFilter is the ZMQ subscription filter (e.g., "kv@").
+	TopicFilter string `json:"topicFilter"`
+	// Concurrency is the number of parallel workers to run.
+	Concurrency int `json:"concurrency"`
+	// EngineType selects the inference engine adapter ("vllm" or "sglang").
+	// Default: "vllm".
+	EngineType string `json:"engineType,omitempty"`
+	// Tracing enables the receive, process and decode spans this package emits.
+	// KV events arrive at many times the inference request rate, so those spans
+	// are opt-in: with a shared head sampler, always-on event spans would crowd
+	// request traces out of the exported volume. Index spans reached from the
+	// event path are emitted by the traced Index wrapper and are not gated
+	// here, so an exporter still receives those with this unset.
+	Tracing bool `json:"tracing,omitempty"`
+	// DiscoverPods enables the Kubernetes pod reconciler for automatic
+	// per-pod subscriber management. When enabled, the reconciler watches
+	// Kubernetes pods and creates/removes ZMQ subscribers dynamically.
+	DiscoverPods bool `json:"discoverPods"`
+	// PodDiscoveryConfig holds the configuration for pod discovery.
+	// Only used when DiscoverPods is true.
+	PodDiscoveryConfig *PodDiscoveryConfig `json:"podDiscoveryConfig,omitempty"`
+}
+
+// PodDiscoveryConfig holds configuration for the Kubernetes pod reconciler.
+type PodDiscoveryConfig struct {
+	// PodLabelSelector is a label selector string for filtering which pods to watch.
+	// Empty matches every pod.
+	// Example: "app=vllm" or "app=vllm,tier=gpu"
+	PodLabelSelector string `json:"podLabelSelector"`
+	// PodNamespace limits the reconciler to watch pods in a specific namespace.
+	// If empty, watches all namespaces (requires appropriate RBAC).
+	PodNamespace string `json:"podNamespace,omitempty"`
+	// SocketPort is the port number where vLLM pods expose their ZMQ socket.
+	// The reconciler will connect to tcp://<PodIP>:<SocketPort>
+	// Default: 5557
+	SocketPort int `json:"socketPort"`
+	// ReplaySocketPort is the port where vLLM pods expose their ZMQ ROUTER
+	// socket for replay requests. Disabled when not set (0 or negative).
+	ReplaySocketPort int `json:"replaySocketPort,omitempty"`
+	// SnapshotSocketPort is the port where vLLM pods serve KV cache snapshots,
+	// offset by rank like SocketPort. A subscriber loads the snapshot in place
+	// of a full replay. Disabled when not set (0 or negative).
+	SnapshotSocketPort int `json:"snapshotSocketPort,omitempty"`
+}
+
+// EffectiveReplayPort returns the replay socket port.
+// Returns -1 (disabled) when not explicitly configured.
+func (c *PodDiscoveryConfig) EffectiveReplayPort() int {
+	if c.ReplaySocketPort <= 0 {
+		return -1
+	}
+	return c.ReplaySocketPort
+}
+
+// DefaultPodReconcilerConfig returns a default configuration for the pod reconciler.
+func DefaultPodReconcilerConfig() *PodDiscoveryConfig {
+	return &PodDiscoveryConfig{
+		PodLabelSelector: defaultPodSelector,
+		SocketPort:       5557,
+	}
+}
+
+// DefaultConfig returns a default configuration for the event processing pool.
+func DefaultConfig() *Config {
+	return &Config{
+		TopicFilter:        "kv@",
+		Concurrency:        4,
+		DiscoverPods:       true,
+		PodDiscoveryConfig: DefaultPodReconcilerConfig(),
+	}
+}
+
+// Pool is a sharded worker pool that processes events from ZMQ subscribers.
+// It ensures that events for the same PodIdentifier are processed in order.
+// Pool keeps transient event-stream state while durable key mappings are
+// delegated to the Index.
+type Pool struct {
+	queues         []workqueue.TypedRateLimitingInterface[*RawMessage]
+	concurrency    int // can replace use with len(queues)
+	index          kvblock.Index
+	tokenProcessor kvblock.TokenProcessor
+	adapter        EngineAdapter
+	groupCatalog   *kvblock.GroupCatalog
+	// dedup lives in the Pool, not as an Index decorator, because its scope is
+	// built from event fields absent from the Index.Evict signature (device
+	// tier, KV-cache group, DP rank) and a store must be counted only after
+	// Index.Add succeeds — both of which only the Pool observes.
+	dedup *eventDedupFilter
+	// tracer is resolved once: tracing.Tracer rebuilds its instrumentation
+	// options on every call, which is not free on the per-message event path.
+	// Nil when Config.Tracing is unset, which is what startSpan tests to skip
+	// span construction on the default path.
+	tracer trace.Tracer
+	wg     sync.WaitGroup
+	// queueDepth mirrors the number of tasks queued across all shards. It is
+	// tracked incrementally rather than by summing queue.Len() so that the
+	// depth gauge stays O(1) on the enqueue/dequeue hot path.
+	queueDepth atomic.Int64
+}
+
+// NewPool creates a Pool with a sharded worker setup.
+// Subscribers are managed by SubscriberManager which is controlled by the pod
+// reconciler.
+//
+// Side effect: it registers the kvcache metrics with the controller-runtime
+// registry so that the kvevents metrics are scraped wherever a pool runs.
+// Registration is idempotent (guarded by a sync.Once).
+func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
+	adapter EngineAdapter,
+) (*Pool, error) {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+	if cfg.Concurrency <= 0 {
+		return nil, fmt.Errorf("kvEventsConfig.concurrency must be positive, got %d", cfg.Concurrency)
+	}
+
+	p := &Pool{
+		queues:         make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
+		concurrency:    cfg.Concurrency,
+		index:          index,
+		tokenProcessor: tokenProcessor,
+		adapter:        adapter,
+		groupCatalog:   kvblock.NewGroupCatalog(),
+		dedup:          newEventDedupFilter(),
+		tracer:         newEventTracer(cfg.Tracing),
+	}
+
+	for i := 0; i < p.concurrency; i++ {
+		p.queues[i] = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*RawMessage]())
+	}
+
+	metrics.Register()
+
+	return p, nil
+}
+
+// Span start options are built once. Passing them variadically at each call
+// site allocates a fresh slice per message.
+var (
+	consumerSpanOptions = []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindConsumer)}
+	internalSpanOptions = []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindInternal)}
+)
+
+// disabledSpan stands in for a real span when event tracing is off. A single
+// package-level value keeps the default path free of allocation while call
+// sites use the span unconditionally.
+var disabledSpan trace.Span = tracenoop.Span{}
+
+// newEventTracer returns the event-pipeline tracer, or nil when event tracing
+// is disabled. Resolving it once keeps the per-message path clear of
+// tracing.Tracer's per-call option building.
+func newEventTracer(enabled bool) trace.Tracer {
+	if !enabled {
+		return nil
+	}
+	return tracing.Tracer(TracerScope)
+}
+
+// startSpan opens a pipeline span, or leaves ctx untouched and returns a span
+// that records nothing when event tracing is disabled. The default path skips
+// Start rather than relying on a no-op tracer, which still builds an option
+// slice and a context per call. See Config.Tracing.
+func (p *Pool) startSpan(ctx context.Context, name string, opts []trace.SpanStartOption) (context.Context, trace.Span) {
+	if p.tracer == nil {
+		return ctx, disabledSpan
+	}
+	return p.tracer.Start(ctx, name, opts...)
+}
+
+// addQueueDepth adjusts the tracked queue depth by delta and publishes the new
+// total to the depth gauge.
+func (p *Pool) addQueueDepth(delta int64) {
+	metrics.PoolQueueDepth.Set(float64(p.queueDepth.Add(delta)))
+}
+
+// GroupCatalog returns the KV cache group metadata learned from events.
+func (p *Pool) GroupCatalog() *kvblock.GroupCatalog {
+	return p.groupCatalog
+}
+
+// Start begins the worker pool.
+// It is non-blocking.
+func (p *Pool) Start(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	logger.Info("Starting sharded event processing pool", "workers", p.concurrency)
+
+	metrics.PoolCapacity.Set(float64(p.concurrency))
+
+	p.wg.Add(p.concurrency)
+	for i := 0; i < p.concurrency; i++ {
+		// Each worker is given its own dedicated queue shard.
+		go p.worker(ctx, i)
+	}
+}
+
+// Shutdown gracefully stops the pool and its global subscriber if present.
+func (p *Pool) Shutdown(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	logger.Info("Shutting down event processing pool...")
+
+	for _, queue := range p.queues {
+		queue.ShutDown()
+	}
+
+	p.wg.Wait()
+
+	// Tasks still queued at shutdown are dropped with the queues, so reset the
+	// depth rather than leaving the gauge pinned at the undrained count.
+	p.queueDepth.Store(0)
+	metrics.PoolQueueDepth.Set(0)
+
+	logger.Info("event processing pool shut down.")
+}
+
+// AddTask is called by the subscriber to add a message to the processing queue.
+// It hashes the sharding key to select a queue, ensuring messages for the
+// same source endpoint always go to the same worker (ordered queue).
+func (p *Pool) AddTask(task *RawMessage) {
+	key := task.SourceEndpoint
+	if key == "" {
+		key = p.adapter.ShardingKey(task)
+	}
+	// Use an FNV-1a hash to deterministically select a queue.
+	h := fnv.New32a()
+	_, err := h.Write([]byte(key))
+	if err != nil {
+		return
+	}
+
+	queueIndex := int64(h.Sum32()) % int64(p.concurrency)
+	p.queues[queueIndex].Add(task)
+	p.addQueueDepth(1)
+}
+
+// worker is the main processing loop for a single worker goroutine.
+// It processes messages from its dedicated queue using the workqueue pattern.
+func (p *Pool) worker(ctx context.Context, workerIndex int) {
+	defer p.wg.Done()
+	queue := p.queues[workerIndex]
+	for {
+		task, shutdown := queue.Get()
+		if shutdown {
+			return
+		}
+
+		// Use a nested func to ensure Done is always called.
+		func(task *RawMessage) {
+			defer queue.Done(task)
+			p.processRawMessage(ctx, task)
+			// Task succeeded, remove it from the queue.
+			queue.Forget(task)
+		}(task)
+		p.addQueueDepth(-1)
+
+		// Check if context was cancelled after processing a task.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+}
+
+// processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
+func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
+	logger := log.FromContext(ctx)
+	if msg.reset {
+		podID := msg.SourceEndpoint
+		if podID == "" {
+			podID = p.adapter.ShardingKey(msg)
+		}
+		p.clearPod(ctx, podID, msg.retire)
+		return
+	}
+
+	// Parent to the receive span while keeping the worker's context for
+	// cancellation, so index operations below land in the message's trace.
+	// The queue handoff stays inside one process, so the parent is local: a
+	// remote parent selects a different ParentBased sampler branch.
+	if msg.SpanContext != nil {
+		ctx = trace.ContextWithSpanContext(ctx, *msg.SpanContext)
+	}
+
+	ctx, span := p.startSpan(ctx, "events_process", consumerSpanOptions)
+	defer span.End()
+	// Guards every attribute block in this package: a span the sampler dropped
+	// reports IsRecording false, so those messages skip attribute construction
+	// too, not just the ones with tracing off.
+	tracingActive := span.IsRecording()
+	if tracingActive {
+		span.SetAttributes(
+			semconv.LLMDKVCacheEventsTopic(msg.Topic),
+			semconv.LLMDKVCacheEventsPayloadSizeBytes(len(msg.Payload)),
+		)
+	}
+
+	podID, modelName, batch, err := p.decode(ctx, msg)
+	if err != nil {
+		if tracingActive {
+			span.SetStatus(codes.Error, err.Error())
+		}
+		logger.Error(err, "Failed to parse message")
+		return
+	}
+
+	if msg.SourceEndpoint != "" {
+		podID = msg.SourceEndpoint
+	}
+	if tracingActive {
+		span.SetAttributes(
+			semconv.LLMDKVCacheEventsPodID(podID),
+			semconv.LLMDKVCacheEventsEventCount(len(batch.Events)),
+		)
+	}
+
+	p.processEventBatch(ctx, &batch, podID, modelName)
+}
+
+// decode spans the adapter's payload decode. It wraps the call rather than the
+// EngineAdapter itself so out-of-tree adapters need no signature change.
+func (p *Pool) decode(ctx context.Context, msg *RawMessage) (string, string, EventBatch, error) {
+	_, span := p.startSpan(ctx, "events_decode", internalSpanOptions)
+	defer span.End()
+
+	podID, modelName, batch, err := p.adapter.ParseMessage(msg)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return podID, modelName, batch, err
+	}
+
+	// pod_id and event_count live on events_process, which holds the effective
+	// pod after the SourceEndpoint override. Repeating the pre-override pod
+	// under the same key would give one attribute two meanings in one trace.
+	if span.IsRecording() {
+		span.SetAttributes(semconv.GenAIRequestModel(modelName))
+	}
+
+	return podID, modelName, batch, nil
+}
+
+func (p *Pool) clearPod(ctx context.Context, podIdentifier string, retire bool) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	if err := p.index.Clear(ctx, podIdentifier); err != nil {
+		debugLogger.Error(err, "Failed to clear pod from index",
+			"podIdentifier", podIdentifier)
+	}
+	p.dedup.clear(podIdentifier)
+	if retire {
+		p.groupCatalog.Clear(podIdentifier)
+	}
+}
+
+// realignExtraFeatures converts per-engine-block extra features to per-canonical-block
+// granularity so that len(result) matches the canonical chunk count expected by
+// TokensToKVBlockKeys.
+//
+// For 1:many (engine BS > canonical BS): each engine block's features are replicated
+// to all its constituent canonical sub-blocks.
+// For many:1 (engine BS < canonical BS): features from multiple engine blocks are
+// merged (union of MMHashes) into each canonical block.
+//
+// When all entries are nil (text-only prompts), this simply produces a nil-filled
+// slice of the correct length.
+func realignExtraFeatures(engineFeatures []*kvblock.BlockExtraFeatures, canonicalBlockCount int) []*kvblock.BlockExtraFeatures {
+	engineBlockCount := len(engineFeatures)
+	if canonicalBlockCount == 0 {
+		return nil
+	}
+	if engineBlockCount == 0 || engineBlockCount == canonicalBlockCount {
+		return engineFeatures
+	}
+
+	canonical := make([]*kvblock.BlockExtraFeatures, canonicalBlockCount)
+
+	if engineBlockCount < canonicalBlockCount {
+		// 1:many -> replicate each engine feature to its canonical sub-blocks
+		for i := range canonicalBlockCount {
+			engineIdx := i * engineBlockCount / canonicalBlockCount
+			canonical[i] = engineFeatures[engineIdx]
+		}
+	} else {
+		// many:1 -> merge constituent engine features into each canonical block
+		for i, ef := range engineFeatures {
+			canonicalIdx := i * canonicalBlockCount / engineBlockCount
+			if ef == nil {
+				continue
+			}
+			if canonical[canonicalIdx] == nil {
+				canonical[canonicalIdx] = &kvblock.BlockExtraFeatures{}
+			}
+			canonical[canonicalIdx].MMHashes = append(
+				canonical[canonicalIdx].MMHashes, ef.MMHashes...)
+		}
+	}
+
+	return canonical
+}
+
+// handleDeviceTierUpdate handles offloading/location-only events (e.g., DeviceTier=CPU
+// with no tokens). It resolves existing request keys from the engine→request mapping and
+// adds the new PodEntry so the EPP tracks which device tiers hold each block.
+//
+// It returns true only when at least one engine key resolved and the resulting
+// PodEntry was added to the index, so the caller knows the store took effect
+// and can reference-count it.
+func (p *Pool) handleDeviceTierUpdate(
+	ctx context.Context, tokens []uint32, engineKeys []kvblock.BlockHash,
+	podEntries []kvblock.PodEntry, podIdentifier, deviceTier string,
+) bool {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+
+	// Only attempt resolution when tokens are truly absent; partial-block
+	// events (tokens < blockSize) should just be skipped.
+	if len(tokens) != 0 || len(engineKeys) == 0 {
+		return false
+	}
+
+	seen := make(map[kvblock.BlockHash]struct{})
+	var resolvedKeys []kvblock.BlockHash
+	for _, ek := range engineKeys {
+		rk, err := p.index.GetRequestKey(ctx, ek)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[rk]; !ok {
+			seen[rk] = struct{}{}
+			resolvedKeys = append(resolvedKeys, rk)
+		}
+	}
+
+	if len(resolvedKeys) == 0 {
+		debugLogger.Info("no indexed engine keys found for device-tier update, skipping",
+			"podIdentifier", podIdentifier, "engineKeyCount", len(engineKeys))
+		return false
+	}
+
+	if err := p.index.Add(ctx, nil, resolvedKeys, podEntries); err != nil {
+		debugLogger.Error(err, "Failed to add device-tier update to index",
+			"podIdentifier", podIdentifier, "deviceTier", deviceTier)
+		return false
+	}
+	return true
+}
+
+// processEventBatch processes a batch of events using type switches.
+func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	debugLogger.V(logging.TRACE).Info("Processing event batch",
+		"podID", podIdentifier,
+		"modelName", modelName,
+		"eventCount", len(batch.Events))
+
+	// Process each event in the batch
+	for _, genericEvent := range batch.Events {
+		switch ev := genericEvent.(type) {
+		case *BlockStoredEvent:
+			deviceTier := normalizeDeviceTier(ev.DeviceTier)
+
+			// Scope for reference-counting this store against duplicate removes.
+			// Mirrors the index eviction identity (pod, tier, group); DP rank is
+			// the sentinel until PR #370 makes the index DP-aware.
+			storeScope := blockScope{
+				podIdentifier:    podIdentifier,
+				deviceTier:       deviceTier,
+				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
+				dataParallelRank: noDataParallelRank,
+			}
+
+			// Use LoRA name as model identifier if available, otherwise fall back to base model name.
+			effectiveModelName := modelName
+			if ev.LoraName != nil && *ev.LoraName != "" {
+				effectiveModelName = *ev.LoraName
+			}
+
+			// Create PodEntry for this specific event's device tier.
+			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			hasExplicitKind := ev.KVCacheSpecKind != ""
+			if ev.GroupIdx != nil {
+				g := kvblock.GroupID(*ev.GroupIdx)
+				if ev.KVCacheSpecKind == "" {
+					if meta, found := p.groupCatalog.Get(podIdentifier, g); found {
+						ev.KVCacheSpecKind = KVCacheSpecKind(meta.Kind)
+					}
+				}
+				podEntries[0].HasGroup = true
+				podEntries[0].GroupIdx = g
+			}
+
+			digestible, reason := blockStoredEventDigestible(ev, p.tokenProcessor.BlockSize())
+			if ev.GroupIdx != nil && len(ev.Tokens) > 0 && ev.KVCacheSpecKind != "" &&
+				(digestible || reason == "unsupported_cache_kind") {
+				g := kvblock.GroupID(*ev.GroupIdx)
+				// A dense engine stream can use a different block size than the
+				// router. Prefer its larger geometry over auxiliary streams.
+				if meta, found := p.groupCatalog.Get(podIdentifier, g); found &&
+					meta.Kind == string(ev.KVCacheSpecKind) && meta.BlockSize > ev.BlockSize {
+					digestible, reason = false, "conflicting_block_size"
+				} else if hasExplicitKind {
+					p.groupCatalog.Learn(podIdentifier, g, kvblock.GroupMetadata{
+						Kind:              string(ev.KVCacheSpecKind),
+						BlockSize:         ev.BlockSize,
+						SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
+					})
+				}
+			}
+			if !digestible {
+				metrics.KVEventStoresSkipped.WithLabelValues(cacheKindLabel(ev.KVCacheSpecKind), reason).Inc()
+				log.FromContext(ctx).V(logging.TRACE).Info("Skipping KV cache store event",
+					"podIdentifier", podIdentifier,
+					"groupIdx", ev.GroupIdx,
+					"cacheKind", ev.KVCacheSpecKind,
+					"reason", reason,
+					"numTokens", len(ev.Tokens),
+					"numBlockHashes", len(ev.BlockHashes),
+					"blockSize", ev.BlockSize)
+				continue
+			}
+
+			engineKeys := make([]kvblock.BlockHash, len(ev.BlockHashes))
+			for i, hash := range ev.BlockHashes {
+				engineKeys[i] = kvblock.BlockHash(hash)
+			}
+
+			parentRequestKey := kvblock.EmptyBlockHash
+			if ev.ParentHash != 0 {
+				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
+				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
+				if err != nil {
+					// Engine blocks smaller than the canonical block that end mid
+					// canonical block yield no request key, so their hashes stay
+					// unmapped and a child naming one as parent cannot resolve it.
+					if subCanonicalStore(ev, p.tokenProcessor.BlockSize()) {
+						const reason = "unresolved_sub_canonical_parent"
+						metrics.KVEventStoresSkipped.WithLabelValues(cacheKindLabel(ev.KVCacheSpecKind), reason).Inc()
+						log.FromContext(ctx).V(logging.TRACE).Info("Skipping KV cache store event",
+							"podIdentifier", podIdentifier,
+							"groupIdx", ev.GroupIdx,
+							"cacheKind", ev.KVCacheSpecKind,
+							"reason", reason,
+							"parentEngineKey", parentEngineKey,
+							"numTokens", len(ev.Tokens),
+							"numBlockHashes", len(ev.BlockHashes),
+							"blockSize", ev.BlockSize)
+						continue
+					}
+					debugLogger.Error(err, "Failed to get request key for parent block",
+						"parentEngineKey", parentEngineKey,
+						"effectiveModelName", effectiveModelName,
+						"groupIdx", ev.GroupIdx,
+						"cacheKind", ev.KVCacheSpecKind,
+						"numTokens", len(ev.Tokens),
+						"numBlockHashes", len(ev.BlockHashes),
+						"blockSize", ev.BlockSize)
+					continue
+				}
+				parentRequestKey = key
+			}
+
+			var extraFeatures []*kvblock.BlockExtraFeatures
+			if ev.ExtraKeys != nil {
+				var loraName string
+				if ev.LoraName != nil {
+					loraName = *ev.LoraName
+				}
+				var err error
+				extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys, loraName)
+				if err != nil {
+					debugLogger.Error(err, "Failed to parse extra keys",
+						"podIdentifier", podIdentifier)
+					continue
+				}
+			}
+
+			// Realign extraFeatures from engine-block granularity to canonical-block
+			// granularity. ParseRawExtraKeys returns one entry per engine block, but
+			// TokensToKVBlockKeys expects one entry per canonical block.
+			if extraFeatures != nil {
+				canonicalBlockCount := len(ev.Tokens) / p.tokenProcessor.BlockSize()
+				if canonicalBlockCount == 0 {
+					// Tokens don't fill a complete canonical block; no realignment needed
+					// since TokensToKVBlockKeys will produce zero keys anyway.
+					extraFeatures = nil
+				} else if len(extraFeatures) != canonicalBlockCount {
+					extraFeatures = realignExtraFeatures(extraFeatures, canonicalBlockCount)
+				}
+			}
+
+			traceLogger := log.FromContext(ctx).V(logging.TRACE)
+			if traceLogger.Enabled() {
+				nonNil := 0
+				for _, ef := range extraFeatures {
+					if ef != nil {
+						nonNil++
+					}
+				}
+				traceLogger.Info("BlockStored extra_features",
+					"podIdentifier", podIdentifier,
+					"hasExtraKeys", ev.ExtraKeys != nil,
+					"parsedBlockCount", len(extraFeatures),
+					"nonNilBlocks", nonNil,
+					"numTokens", len(ev.Tokens),
+					"numEngineKeys", len(ev.BlockHashes))
+				for bIdx, ef := range extraFeatures {
+					if ef != nil {
+						traceLogger.Info("BlockStored block extra",
+							"podIdentifier", podIdentifier,
+							"blockIdx", bIdx,
+							"mmHashes", fmt.Sprintf("%+v", ef.MMHashes))
+					}
+				}
+			}
+
+			// Compute request keys at canonical block size (= BlockSize)
+			requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
+				parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
+			if err != nil {
+				debugLogger.Error(err, "Failed to generate request keys",
+					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
+				continue
+			}
+
+			if len(requestKeys) == 0 {
+				if p.handleDeviceTierUpdate(ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier) {
+					p.dedup.trackStore(storeScope, ev.BlockHashes)
+				}
+				continue
+			}
+
+			// Index.Add infers the engine->request mapping from the ratio of
+			// len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
+			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
+				debugLogger.Error(err, "Failed to add event to index",
+					"podIdentifier", podIdentifier, "event", ev)
+				continue
+			}
+			p.dedup.trackStore(storeScope, ev.BlockHashes)
+
+		case *BlockRemovedEvent:
+			deviceTier := normalizeDeviceTier(ev.DeviceTier)
+			if ev.GroupIdx != nil {
+				groupIdx := kvblock.GroupID(*ev.GroupIdx)
+				meta, found := p.groupCatalog.Get(podIdentifier, groupIdx)
+				if !found || !isPrefixIndexableSpecKind(KVCacheSpecKind(meta.Kind)) {
+					reason := "unsupported_cache_kind"
+					if !found {
+						reason = "unknown_group"
+					}
+					metrics.KVEventRemovalsSkipped.WithLabelValues(
+						cacheKindLabel(KVCacheSpecKind(meta.Kind)), reason).Inc()
+					log.FromContext(ctx).V(logging.TRACE).Info("Skipping KV cache remove event",
+						"podIdentifier", podIdentifier,
+						"groupIdx", groupIdx,
+						"cacheKind", meta.Kind,
+						"groupKnown", found)
+					continue
+				}
+			}
+
+			// Create PodEntry for this specific event's device tier.
+			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			if ev.GroupIdx != nil {
+				podEntries[0].HasGroup = true
+				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
+			}
+
+			// Reference-count duplicate removes: vLLM chunk-mode offloading can
+			// re-announce a shared constituent hash across overlapping chunks, so
+			// only forward a hash to the index once no outstanding store still
+			// references it. Unknown hashes pass through (Evict is a no-op).
+			removeScope := blockScope{
+				podIdentifier:    podIdentifier,
+				deviceTier:       deviceTier,
+				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
+				dataParallelRank: noDataParallelRank,
+			}
+			hashesToEvict := p.dedup.filterRemove(removeScope, ev.BlockHashes)
+
+			// Observe how many constituent block hashes were forwarded vs.
+			// suppressed (these count block hashes, not BlockRemoved events).
+			if forwarded := len(hashesToEvict); forwarded > 0 {
+				metrics.DedupRemovedHashesForwarded.Add(float64(forwarded))
+			}
+			if suppressed := len(ev.BlockHashes) - len(hashesToEvict); suppressed > 0 {
+				metrics.DedupRemovedHashesSuppressed.Add(float64(suppressed))
+				log.FromContext(ctx).V(logging.TRACE).Info("Suppressed duplicate block removals",
+					"podIdentifier", podIdentifier, "deviceTier", deviceTier,
+					"received", len(ev.BlockHashes), "forwarded", len(hashesToEvict), "suppressed", suppressed)
+			}
+
+			if len(hashesToEvict) == 0 {
+				break
+			}
+			// The Index handles engine->request key resolution internally for
+			// both 1:1 (legacy) and 1:many (canonical) mappings.
+			engineKeys := make([]kvblock.BlockHash, len(hashesToEvict))
+			for i, hash := range hashesToEvict {
+				engineKeys[i] = kvblock.BlockHash(hash)
+			}
+			if err := p.index.Evict(ctx, kvblock.EngineKey, engineKeys, podEntries); err != nil {
+				debugLogger.Error(err, "Failed to evict engine keys from index",
+					"podIdentifier", podIdentifier, "keyCount", len(engineKeys))
+			}
+
+		case *AllBlocksClearedEvent:
+			debugLogger.Info("All blocks cleared event received",
+				"podIdentifier", podIdentifier,
+				"deviceTier", ev.DeviceTier,
+				"modelName", modelName)
+
+			// AllBlocksCleared is pod-wide: vLLM reset its entire prefix cache
+			// (e.g. after an RLHF weight update), so drop every entry for this pod
+			// across all tiers. vLLM and SGLang both emit it with no tier annotation.
+			// Index.Clear cannot scope by tier, so if an engine ever starts setting
+			// DeviceTier (a tier-scoped reset), this would over-wipe the other tiers.
+			// Surface that here so the regression does not pass silently.
+			if ev.DeviceTier != "" {
+				debugLogger.Info("AllBlocksCleared carried a device tier; clearing all tiers "+
+					"anyway (tier-scoped clear is not supported)",
+					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
+			}
+			p.clearPod(ctx, podIdentifier, false)
+
+		default:
+			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
+		}
+	}
+}

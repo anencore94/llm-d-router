@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,18 +19,21 @@ package loader
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
-	configapi "github.com/llm-d/llm-d-router/apix/config/v1alpha1"
+	configapiv1 "github.com/llm-d/llm-d-router/apix/config/v1"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/registry"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/bandselection"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/globalstrict"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/roundrobin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/edf"
@@ -65,9 +68,9 @@ func newFlowControlTestHandle(t *testing.T) fwkplugin.Handle {
 			Type: edf.EDFOrderingPolicyType,
 			Name: edf.EDFOrderingPolicyType,
 		},
-		RequiredQueueCapabilitiesV: []fwkfc.QueueCapability{fwkfc.CapabilityPriorityConfigurable},
 	})
 	handle.AddPlugin(usagelimits.StaticUsageLimitPolicyType, usagelimits.DefaultPolicy())
+	handle.AddPlugin(bandselection.StrictBandSelectionPolicyType, bandselection.DefaultPolicy())
 	return handle
 }
 
@@ -79,22 +82,22 @@ func TestBuildRegistryConfig(t *testing.T) {
 
 	testCases := []struct {
 		name        string
-		apiConfig   *configapi.FlowControlConfig
+		apiConfig   *configapiv1.FlowControlConfig
 		assertion   func(*testing.T, *registry.Config)
 		expectedErr string
 	}{
 		// --- Happy Paths ---
 		{
 			name: "ShouldSucceed_WithFullConfiguration",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxBytes: ptr.To(resource.MustParse("100")),
-				PriorityBands: []configapi.PriorityBandConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority: 1,
 						MaxBytes: ptr.To(resource.MustParse("50")),
 					},
 				},
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("10")),
 				},
 			},
@@ -112,10 +115,37 @@ func TestBuildRegistryConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "ShouldResolveBandRequestTTLs",
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
+					DefaultRequestTTL: &metav1.Duration{Duration: 10 * time.Second},
+				},
+				DefaultNegativePriorityBand: &configapiv1.PriorityBandConfig{
+					DefaultRequestTTL: &metav1.Duration{Duration: 20 * time.Second},
+				},
+				PriorityBands: []configapiv1.PriorityBandConfig{
+					{Priority: 1},
+					{Priority: 2, DefaultRequestTTL: &metav1.Duration{}},
+					{Priority: 3, DefaultRequestTTL: &metav1.Duration{Duration: 5 * time.Second}},
+				},
+			},
+			assertion: func(t *testing.T, cfg *registry.Config) {
+				assert.Nil(t, cfg.PriorityBands[1].DefaultRequestTTL)
+				require.NotNil(t, cfg.PriorityBands[2].DefaultRequestTTL)
+				assert.Zero(t, *cfg.PriorityBands[2].DefaultRequestTTL)
+				require.NotNil(t, cfg.PriorityBands[3].DefaultRequestTTL)
+				assert.Equal(t, 5*time.Second, *cfg.PriorityBands[3].DefaultRequestTTL)
+				require.NotNil(t, cfg.DefaultPriorityBand.DefaultRequestTTL)
+				assert.Equal(t, 10*time.Second, *cfg.DefaultPriorityBand.DefaultRequestTTL)
+				require.NotNil(t, cfg.DefaultNegativePriorityBand.DefaultRequestTTL)
+				assert.Equal(t, 20*time.Second, *cfg.DefaultNegativePriorityBand.DefaultRequestTTL)
+			},
+		},
+		{
 			name: "ShouldSucceed_WithKubernetesQuantityFormat",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxBytes: ptr.To(resource.MustParse("1Gi")),
-				PriorityBands: []configapi.PriorityBandConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority: 1,
 						MaxBytes: ptr.To(resource.MustParse("500Mi")),
@@ -132,8 +162,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldSucceed_WithPolicyReferences",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority:          1,
 						OrderingPolicyRef: edf.EDFOrderingPolicyType,
@@ -155,18 +185,21 @@ func TestBuildRegistryConfig(t *testing.T) {
 			apiConfig: nil,
 			assertion: func(t *testing.T, cfg *registry.Config) {
 				assert.Equal(t, uint64(0), cfg.MaxBytes, "Default global limit should be 0 (unlimited)")
+				assert.Equal(t, uint64(0), cfg.MaxRequests, "Default global request limit should be 0 (unlimited)")
 				require.NotNil(t, cfg.DefaultPriorityBand,
 					"Default priority band template should be initialized automatically")
 				assert.Equal(t, uint64(1_000_000_000) /* registry default: 1 GB */, cfg.DefaultPriorityBand.MaxBytes,
 					"Default template should use system default capacity")
+				assert.Equal(t, uint64(5000) /* registry default */, cfg.DefaultPriorityBand.MaxRequests,
+					"Default template should use the system default request-count capacity")
 			},
 		},
 
 		// --- Defaulting Logic (Nil vs Zero) ---
 		{
 			name: "ShouldApplyDefault_WhenBandMaxBytesIsNil",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority: 1,
 						// MaxBytes and MaxRequests omitted
@@ -181,8 +214,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldApplyDefault_WhenBandMaxBytesIsZero",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority: 1,
 						MaxBytes: ptr.To(resource.MustParse("0")), // Explicitly zero,
@@ -197,8 +230,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldApplyDefault_WhenDefaultPriorityBandMaxBytesIsZero",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("0")), // Explicitly zero,
 				},
 			},
@@ -208,19 +241,71 @@ func TestBuildRegistryConfig(t *testing.T) {
 					"Explicit 0 in DefaultPriorityBand template should be treated as 'Use Default'")
 			},
 		},
+		{
+			name: "ShouldApplyDefault_WhenBandMaxRequestsIsNilOrZero",
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
+					{
+						Priority: 1,
+						// MaxRequests omitted
+					},
+					{
+						Priority:    2,
+						MaxRequests: ptr.To(resource.MustParse("0")), // Explicitly zero
+					},
+					{
+						Priority:    3,
+						MaxRequests: ptr.To(resource.MustParse("250")),
+					},
+				},
+			},
+			assertion: func(t *testing.T, cfg *registry.Config) {
+				require.Contains(t, cfg.PriorityBands, 1)
+				assert.Equal(t, uint64(5000) /* registry default */, cfg.PriorityBands[1].MaxRequests,
+					"Omitted MaxRequests (nil) should result in the system default (5000)")
+				require.Contains(t, cfg.PriorityBands, 2)
+				assert.Equal(t, uint64(5000) /* registry default */, cfg.PriorityBands[2].MaxRequests,
+					"Explicit MaxRequests (0) should be treated as 'Use Default' (5000)")
+				require.Contains(t, cfg.PriorityBands, 3)
+				assert.Equal(t, uint64(250), cfg.PriorityBands[3].MaxRequests,
+					"Explicit MaxRequests should be preserved")
+			},
+		},
+		{
+			name: "ShouldApplyDefault_WhenNegativeBandTemplateMaxRequestsIsZero",
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultNegativePriorityBand: &configapiv1.PriorityBandConfig{
+					MaxRequests: ptr.To(resource.MustParse("0")), // Explicitly zero
+				},
+			},
+			assertion: func(t *testing.T, cfg *registry.Config) {
+				require.NotNil(t, cfg.DefaultNegativePriorityBand)
+				assert.Equal(t, uint64(5000) /* registry default */, cfg.DefaultNegativePriorityBand.MaxRequests,
+					"Explicit 0 in the negative band template should be treated as 'Use Default', not zero capacity")
+			},
+		},
 
 		// --- Validation Errors ---
 		{
+			name: "ShouldError_WithNegativePriorityBandRequestTTL",
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
+					{Priority: 1, DefaultRequestTTL: &metav1.Duration{Duration: -time.Second}},
+				},
+			},
+			expectedErr: "defaultRequestTTL cannot be negative",
+		},
+		{
 			name: "ShouldError_WithNegativeGlobalMaxBytes",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxBytes: ptr.To(resource.MustParse("-1")),
 			},
 			expectedErr: "global MaxBytes must be non-negative",
 		},
 		{
 			name: "ShouldError_WithNegativePriorityBandMaxBytes",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority: 1,
 						MaxBytes: ptr.To(resource.MustParse("-100")),
@@ -231,8 +316,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldError_WithNegativeDefaultPriorityBandMaxBytes",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("-5")),
 				},
 			},
@@ -242,10 +327,10 @@ func TestBuildRegistryConfig(t *testing.T) {
 		// --- MaxRequests: Happy Paths ---
 		{
 			name: "ShouldSucceed_WithMaxBytesAndMaxRequests",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxBytes:    ptr.To(resource.MustParse("1Gi")),
 				MaxRequests: ptr.To(resource.MustParse("5000")),
-				PriorityBands: []configapi.PriorityBandConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority:    100,
 						MaxBytes:    ptr.To(resource.MustParse("1Gi")),
@@ -265,9 +350,9 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldSucceed_WithOnlyMaxRequests_NoMaxBytes",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxRequests: ptr.To(resource.MustParse("1000")),
-				PriorityBands: []configapi.PriorityBandConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority:    1,
 						MaxRequests: ptr.To(resource.MustParse("500")),
@@ -287,8 +372,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldSucceed_WithDefaultPriorityBandMaxRequests",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxRequests: ptr.To(resource.MustParse("200")),
 				},
 			},
@@ -300,50 +385,21 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 
 		// --- MaxRequests: Defaulting Logic ---
-		{
-			name: "ShouldDefaultToZero_WhenMaxRequestsIsNil",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
-					{
-						Priority: 1,
-					},
-				},
-			},
-			assertion: func(t *testing.T, cfg *registry.Config) {
-				require.Contains(t, cfg.PriorityBands, 1)
-				assert.Equal(t, uint64(0), cfg.PriorityBands[1].MaxRequests,
-					"Omitted MaxRequests should default to 0 (no request limit)")
-			},
-		},
-		{
-			name: "ShouldDefaultToZero_WhenMaxRequestsIsZero",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
-					{
-						Priority:    1,
-						MaxRequests: ptr.To(resource.MustParse("0")),
-					},
-				},
-			},
-			assertion: func(t *testing.T, cfg *registry.Config) {
-				require.Contains(t, cfg.PriorityBands, 1)
-				assert.Equal(t, uint64(0), cfg.PriorityBands[1].MaxRequests,
-					"Explicit MaxRequests=0 should remain 0 (no request limit)")
-			},
-		},
+		// Nil and explicit-zero band MaxRequests defaulting is covered by
+		// ShouldApplyDefault_WhenBandMaxRequestsIsNilOrZero above.
 
 		// --- MaxRequests: Validation Errors ---
 		{
 			name: "ShouldError_WithNegativeGlobalMaxRequests",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxRequests: ptr.To(resource.MustParse("-1")),
 			},
 			expectedErr: "global MaxRequests must be non-negative",
 		},
 		{
 			name: "ShouldError_WithNegativePriorityBandMaxRequests",
-			apiConfig: &configapi.FlowControlConfig{
-				PriorityBands: []configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				PriorityBands: []configapiv1.PriorityBandConfig{
 					{
 						Priority:    1,
 						MaxRequests: ptr.To(resource.MustParse("-100")),
@@ -354,8 +410,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldError_WithNegativeDefaultPriorityBandMaxRequests",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxRequests: ptr.To(resource.MustParse("-5")),
 				},
 			},
@@ -365,8 +421,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		// --- DefaultNegativePriorityBand ---
 		{
 			name: "ShouldSucceed_WithDefaultNegativePriorityBand",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultNegativePriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultNegativePriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("100")),
 				},
 			},
@@ -380,8 +436,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldFallBackToDefaultBand_WhenNegativeBandIsNil",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultPriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultPriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("500")),
 				},
 			},
@@ -394,8 +450,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 		},
 		{
 			name: "ShouldError_WithNegativeDefaultNegativePriorityBandMaxBytes",
-			apiConfig: &configapi.FlowControlConfig{
-				DefaultNegativePriorityBand: &configapi.PriorityBandConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
+				DefaultNegativePriorityBand: &configapiv1.PriorityBandConfig{
 					MaxBytes: ptr.To(resource.MustParse("-1")),
 				},
 			},
@@ -432,20 +488,19 @@ func TestBuildFlowControlConfig(t *testing.T) {
 	handle := newFlowControlTestHandle(t)
 
 	const funcPolicyName = "func-policy"
-	handle.AddPlugin(funcPolicyName, usagelimits.NewPolicyFunc(funcPolicyName, func(_ context.Context, _ float64, priorities []int) []float64 {
-		result := make([]float64, len(priorities))
-		for i := range result {
-			result[i] = 0.8
-		}
-		return result
-	}))
+	handle.AddPlugin(funcPolicyName, usagelimits.NewPolicyFunc(funcPolicyName,
+		func(_ context.Context, _ float64, _ []int, ceilings []float64) {
+			for i := range ceilings {
+				ceilings[i] = 0.8
+			}
+		}))
 
 	const structPolicyName = "struct-policy"
 	handle.AddPlugin(structPolicyName, &constantPointEightPolicy{})
 
 	testCases := []struct {
 		name      string
-		apiConfig *configapi.FlowControlConfig
+		apiConfig *configapiv1.FlowControlConfig
 		assertion func(*testing.T, *flowcontrol.Config)
 	}{
 		{
@@ -461,7 +516,7 @@ func TestBuildFlowControlConfig(t *testing.T) {
 		},
 		{
 			name: "Success - Explicit Values",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				MaxBytes: ptr.To(resource.MustParse("2048")),
 			},
 			assertion: func(t *testing.T, cfg *flowcontrol.Config) {
@@ -474,29 +529,28 @@ func TestBuildFlowControlConfig(t *testing.T) {
 			apiConfig: nil,
 			assertion: func(t *testing.T, cfg *flowcontrol.Config) {
 				require.NotNil(t, cfg.UsageLimitPolicy, "UsageLimitPolicy should be resolved even when not explicitly configured")
-				ceilings := cfg.UsageLimitPolicy.ComputeLimit(context.Background(), 0.5, []int{0})
+				ceilings := computeLimits(t, cfg.UsageLimitPolicy, 0.5, []int{0})
 				assert.Equal(t, []float64{1.0}, ceilings, "Default noop policy should return 1.0 (no gating)")
 			},
 		},
 		{
 			name: "Success - UsageLimitPolicyPluginRef is resolved",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				UsageLimitPolicyPluginRef: usagelimits.StaticUsageLimitPolicyType,
 			},
 			assertion: func(t *testing.T, cfg *flowcontrol.Config) {
 				require.NotNil(t, cfg.UsageLimitPolicy, "UsageLimitPolicy should be resolved from the handle")
-				ceilings := cfg.UsageLimitPolicy.ComputeLimit(context.Background(), 0.5, []int{0})
+				ceilings := computeLimits(t, cfg.UsageLimitPolicy, 0.5, []int{0})
 				assert.Equal(t, []float64{1.0}, ceilings, "Noop policy should return 1.0 (no gating)")
 			},
 		},
 		{
 			name: "Success - Func-based UsageLimitPolicy resolved via PluginRef",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				UsageLimitPolicyPluginRef: funcPolicyName,
 			},
 			assertion: func(t *testing.T, cfg *flowcontrol.Config) {
 				require.NotNil(t, cfg.UsageLimitPolicy)
-				ctx := context.Background()
 				for _, tc := range []struct {
 					name       string
 					priority   int
@@ -506,19 +560,18 @@ func TestBuildFlowControlConfig(t *testing.T) {
 					{"half saturation", 1, 0.5},
 					{"full saturation", 5, 1.0},
 				} {
-					assert.Equal(t, []float64{0.8}, cfg.UsageLimitPolicy.ComputeLimit(ctx, tc.saturation, []int{tc.priority}),
+					assert.Equal(t, []float64{0.8}, computeLimits(t, cfg.UsageLimitPolicy, tc.saturation, []int{tc.priority}),
 						"func-based policy should return 0.8 at %s", tc.name)
 				}
 			},
 		},
 		{
 			name: "Success - Struct-based UsageLimitPolicy resolved via PluginRef",
-			apiConfig: &configapi.FlowControlConfig{
+			apiConfig: &configapiv1.FlowControlConfig{
 				UsageLimitPolicyPluginRef: structPolicyName,
 			},
 			assertion: func(t *testing.T, cfg *flowcontrol.Config) {
 				require.NotNil(t, cfg.UsageLimitPolicy)
-				ctx := context.Background()
 				for _, tc := range []struct {
 					name       string
 					priority   int
@@ -528,7 +581,7 @@ func TestBuildFlowControlConfig(t *testing.T) {
 					{"half saturation", 1, 0.5},
 					{"full saturation", 5, 1.0},
 				} {
-					assert.Equal(t, []float64{0.8}, cfg.UsageLimitPolicy.ComputeLimit(ctx, tc.saturation, []int{tc.priority}),
+					assert.Equal(t, []float64{0.8}, computeLimits(t, cfg.UsageLimitPolicy, tc.saturation, []int{tc.priority}),
 						"struct-based policy should return 0.8 at %s", tc.name)
 				}
 			},
@@ -557,7 +610,7 @@ func TestBuildFlowControlConfig_Errors(t *testing.T) {
 
 	t.Run("Error - UsageLimitPolicy plugin not found", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildFlowControlConfig(&configapi.FlowControlConfig{
+		_, err := buildFlowControlConfig(&configapiv1.FlowControlConfig{
 			UsageLimitPolicyPluginRef: "non-existent-policy",
 		}, handle)
 		require.Error(t, err)
@@ -592,12 +645,22 @@ func (p *constantPointEightPolicy) TypedName() fwkplugin.TypedName {
 	}
 }
 
-func (p *constantPointEightPolicy) ComputeLimit(_ context.Context, _ float64, priorities []int) []float64 {
-	result := make([]float64, len(priorities))
-	for i := range result {
-		result[i] = 0.8
+func (p *constantPointEightPolicy) ComputeLimit(_ context.Context, _ float64, _ []int, ceilings []float64) {
+	for i := range ceilings {
+		ceilings[i] = 0.8
 	}
-	return result
 }
 
 var _ fwkfc.UsageLimitPolicy = (*constantPointEightPolicy)(nil)
+
+// computeLimits invokes a UsageLimitPolicy with a framework-style output buffer (pre-filled with
+// 1.0, sized to priorities) and returns the filled ceilings.
+func computeLimits(t *testing.T, p fwkfc.UsageLimitPolicy, saturation float64, priorities []int) []float64 {
+	t.Helper()
+	ceilings := make([]float64, len(priorities))
+	for i := range ceilings {
+		ceilings[i] = 1.0
+	}
+	p.ComputeLimit(context.Background(), saturation, priorities, ceilings)
+	return ceilings
+}

@@ -1,0 +1,326 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/pflag"
+	"golang.org/x/sync/errgroup"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/llm-d/llm-d-router/pkg/common"
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/version"
+
+	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
+	coordmetrics "github.com/llm-d/llm-d-router/pkg/coordinator/metrics"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline/builder"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/server"
+)
+
+// metricsShutdownTimeout bounds the Prometheus /metrics server's shutdown.
+// Scrapes are short; a small budget is enough and keeps process exit prompt.
+const metricsShutdownTimeout = 5 * time.Second
+
+// tracingShutdownTimeout bounds the final flush of buffered spans so an
+// unreachable collector cannot hold up process exit.
+const tracingShutdownTimeout = 5 * time.Second
+
+// tracingServiceName is the OTel service.name reported for coordinator spans
+// when OTEL_SERVICE_NAME is unset.
+const tracingServiceName = "llm-d-coordinator"
+
+var errMetricsTLS = errors.New("metrics TLS")
+
+func main() {
+	configPath := pflag.String("config", "config/coordinator/coordinator.yaml", "path to configuration file")
+	metricsPort := pflag.Int("metrics-port", 0, "port for the Prometheus /metrics endpoint. Non-positive disables the endpoint. Overrides server.metrics_port (default 9090).")
+	metricsCertDir := pflag.String("metrics-cert-dir", "", "Directory with tls.crt and tls.key for the metrics endpoint. Empty serves metrics over plain HTTP. Independent of --secure-serving and --cert-path, which apply to the serving listener. Overrides server.metrics_cert_dir.")
+	secureServing := pflag.Bool("secure-serving", true, "Serve the listener over TLS. Overrides server.secure_serving.")
+	certPath := pflag.String("cert-path", "", "Directory with tls.crt and tls.key for secure serving. Empty generates a self-signed certificate, which is only suitable for testing. Overrides server.cert_path.")
+	tlsMinVersion := pflag.String("tls-min-version", "", "Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13). Empty uses VersionTLS12. Overrides server.tls_min_version.")
+	tlsCipherSuites := pflag.StringSlice("tls-cipher-suites", nil, "Comma-separated list of TLS cipher suites for secure serving (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Empty uses the crypto/tls default. Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable. Overrides server.tls_cipher_suites.")
+	tracingEnabled := pflag.Bool("tracing", false, "Export OpenTelemetry spans. Exporter, sampler, and endpoint come from the standard OTEL_* environment variables. Overrides tracing.")
+
+	logOpts := logutil.NewOptions()
+	logOpts.AddFlags(pflag.CommandLine)
+
+	pflag.Parse()
+
+	logutil.InitSetupLogging("llm-d-coordinator")
+	log := ctrl.Log.WithName("coordinator")
+
+	log.Info("coordinator build", "commit-sha", version.CommitSHA, "build-ref", version.BuildRef)
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Error(err, "failed to load config")
+		os.Exit(1)
+	}
+
+	// CLI -v wins over config log_level.
+	if vFlag := pflag.CommandLine.Lookup("v"); vFlag != nil && !vFlag.Changed {
+		logOpts.LogVerbosity = cfg.LogLevel
+	}
+	// CLI --metrics-port wins over config server.metrics_port.
+	if f := pflag.CommandLine.Lookup("metrics-port"); f != nil && f.Changed {
+		cfg.Server.MetricsPort = *metricsPort
+	}
+	// CLI --metrics-cert-dir wins over server.metrics_cert_dir.
+	if f := pflag.CommandLine.Lookup("metrics-cert-dir"); f != nil && f.Changed {
+		cfg.Server.MetricsCertDir = *metricsCertDir
+	}
+	if f := pflag.CommandLine.Lookup("secure-serving"); f != nil && f.Changed {
+		cfg.Server.SecureServing = *secureServing
+	}
+	if f := pflag.CommandLine.Lookup("cert-path"); f != nil && f.Changed {
+		cfg.Server.CertPath = *certPath
+	}
+	if f := pflag.CommandLine.Lookup("tls-min-version"); f != nil && f.Changed {
+		cfg.Server.TLSMinVersion = *tlsMinVersion
+	}
+	if f := pflag.CommandLine.Lookup("tls-cipher-suites"); f != nil && f.Changed {
+		cfg.Server.TLSCipherSuites = *tlsCipherSuites
+	}
+	if f := pflag.CommandLine.Lookup("tracing"); f != nil && f.Changed {
+		cfg.Tracing = *tracingEnabled
+	}
+	if err := logOpts.Validate(); err != nil {
+		log.Error(err, "invalid logging options")
+		os.Exit(1)
+	}
+	if err := logOpts.Complete(); err != nil {
+		log.Error(err, "failed to complete logging options")
+		os.Exit(1)
+	}
+	logutil.InitLogging(&logOpts.ZapOptions)
+	tracing.InitTextMapPropagator()
+	log.Info("log level set", "level", logOpts.LogVerbosity)
+	log.Info("pipeline connectors",
+		"kv_connector", cfg.Pipeline.KVConnector,
+		"ec_connector", cfg.Pipeline.ECConnector)
+	// Log presence only: proxy URLs can carry basic-auth credentials
+	// (http://user:pass@host) and must not reach startup logs. NO_PROXY is a
+	// plain host list, so it is safe to log verbatim.
+	log.Info("proxy environment",
+		"http_proxy_set", os.Getenv("HTTP_PROXY") != "",
+		"https_proxy_set", os.Getenv("HTTPS_PROXY") != "",
+		"NO_PROXY", os.Getenv("NO_PROXY"))
+
+	if err := coordmetrics.Register(ctrlmetrics.Registry); err != nil {
+		log.Error(err, "failed to register coordinator metrics")
+		os.Exit(1)
+	}
+
+	gwClient := gateway.New(cfg.Gateway)
+
+	p, err := builder.Build(cfg, gwClient)
+	if err != nil {
+		log.Error(err, "failed to build pipeline")
+		os.Exit(1)
+	}
+	srv, err := server.New(cfg.Server, p, gwClient)
+	if err != nil {
+		log.Error(err, "failed to create server")
+		os.Exit(1)
+	}
+
+	log.Info("starting coordinator",
+		"addr", cfg.Server.ListenAddr,
+		"metrics_port", cfg.Server.MetricsPort,
+		"metrics_tls", cfg.Server.MetricsCertDir != "",
+		"tracing", cfg.Tracing)
+	log.Info("server TLS", "tls", cfg.Server.SecureServing, "cert_path", cfg.Server.CertPath)
+	if cfg.Server.MetricsPort <= 0 {
+		log.Info("metrics endpoint disabled", "reason", "server.metrics_port <= 0")
+	}
+	log.Info("graceful shutdown enabled", "timeout", cfg.Server.ShutdownTimeout)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	var shutdownTracing func(context.Context) error
+	if cfg.Tracing {
+		// Span export is optional: a collector that cannot be reached must not
+		// stop the coordinator from serving requests.
+		shutdown, traceErr := tracing.InitTracing(ctx, log, tracingServiceName)
+		if traceErr != nil {
+			log.Error(traceErr, "failed to initialize tracing")
+		} else {
+			shutdownTracing = shutdown
+		}
+	}
+
+	err = run(ctx, srv, cfg.Server, nil)
+	stop()
+	if shutdownTracing != nil {
+		flushCtx, cancel := context.WithTimeout(context.Background(), tracingShutdownTimeout)
+		if flushErr := shutdownTracing(flushCtx); flushErr != nil {
+			log.Error(flushErr, "failed to shut down tracing")
+		}
+		cancel()
+	}
+	if err != nil {
+		log.Error(err, "server error")
+		os.Exit(1)
+	}
+}
+
+// run starts the coordinator server and, when cfg.MetricsPort > 0, the
+// Prometheus /metrics server alongside it. It blocks until ctx is cancelled
+// or either server exits. On any exit condition both servers are drained
+// before run returns: the coordinator server bounded by cfg.ShutdownTimeout,
+// the metrics server by metricsShutdownTimeout. A non-positive MetricsPort
+// disables the metrics endpoint entirely. lis, when non-nil, is an already
+// bound listener the coordinator server serves on instead of binding
+// cfg.ListenAddr itself; production passes nil.
+func run(ctx context.Context, srv *server.Server, cfg config.ServerConfig, lis net.Listener) error {
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		errCh := make(chan error, 1)
+		go func() {
+			if lis != nil {
+				errCh <- srv.Serve(gctx, lis)
+			} else {
+				errCh <- srv.ListenAndServe(gctx)
+			}
+		}()
+		select {
+		case err := <-errCh:
+			// ListenAndServe returned before shutdown was requested; always a failure.
+			return fmt.Errorf("coordinator server: %w", err)
+		case <-gctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				return fmt.Errorf("coordinator server shutdown: %w", err)
+			}
+			if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("coordinator server: %w", err)
+			}
+			return nil
+		}
+	})
+
+	if cfg.MetricsPort > 0 {
+		g.Go(func() error {
+			return serveMetrics(gctx, cfg.MetricsPort, cfg.MetricsCertDir, nil)
+		})
+	}
+
+	return g.Wait()
+}
+
+// serveMetrics stands up a Prometheus /metrics server and blocks until ctx is
+// cancelled or the underlying listen/serve returns unexpectedly. On ctx
+// cancellation the server is drained via Shutdown bounded by
+// metricsShutdownTimeout. Uses the shared controller-runtime registry so
+// every package that registers against it (this coordinator's metrics,
+// controller-runtime's process collectors) is exposed on the same endpoint. A
+// non-empty certDir enables TLS with tls.crt and tls.key. lis, when non-nil,
+// is an already bound listener the server serves on instead of binding port
+// itself; production passes nil.
+func serveMetrics(ctx context.Context, port int, certDir string, lis net.Listener) error {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{EnableOpenMetrics: true}))
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	serveTLS := certDir != ""
+	if serveTLS {
+		tlsConfig, err := metricsTLSConfig(ctx, certDir)
+		if err != nil {
+			if lis != nil {
+				_ = lis.Close()
+			}
+			return err
+		}
+		srv.TLSConfig = tlsConfig
+	}
+
+	// Shutdown fires when ctx cancels (normal path) or when the local
+	// cancel below is invoked after listen/serve returns (bind failure).
+	shutdownCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-shutdownCtx.Done()
+		graceCtx, cancelGrace := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
+		defer cancelGrace()
+		_ = srv.Shutdown(graceCtx)
+	}()
+
+	var err error
+	switch {
+	case lis != nil && serveTLS:
+		err = srv.ServeTLS(lis, "", "")
+	case lis != nil:
+		err = srv.Serve(lis)
+	case serveTLS:
+		err = srv.ListenAndServeTLS("", "")
+	default:
+		err = srv.ListenAndServe()
+	}
+	cancel()
+	<-shutdownDone
+
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("metrics server: %w", err)
+	}
+	return nil
+}
+
+// metricsTLSConfig loads and reloads the certificate used by the metrics server.
+func metricsTLSConfig(ctx context.Context, certDir string) (*tls.Config, error) {
+	certFile := filepath.Join(certDir, "tls.crt")
+	keyFile := filepath.Join(certDir, "tls.key")
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: load key pair from cert %q and key %q: %w", errMetricsTLS, certFile, keyFile, err)
+	}
+
+	reloader, err := common.NewCertReloader(ctx, certDir, &cert)
+	if err != nil {
+		return nil, fmt.Errorf("%w: start certificate reloader: %w", errMetricsTLS, err)
+	}
+
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return reloader.Get(), nil
+		},
+	}, nil
+}

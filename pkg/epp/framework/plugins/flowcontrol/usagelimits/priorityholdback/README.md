@@ -1,0 +1,107 @@
+# Priority Holdback Policy Plugin
+
+**Type:** `priority-holdback-policy`
+
+A usage limit policy that computes differentiated admission ceilings per priority level. As pool saturation rises, lower-priority traffic is gated first, reserving capacity for higher-priority work.
+
+This can be used in place the default static usage limit policy (which applies a single ceiling to all priorities) with priority-aware stepped gating.
+
+## What It Does
+
+Each active priority level receives an admission ceiling in [0.0, 1.0]. During each dispatch cycle, the Flow Controller compares current pool saturation against each priority's ceiling. When saturation exceeds a priority's ceiling, that priority's traffic is held back.
+
+Higher-priority traffic continues to flow until saturation reaches its own (higher) ceiling, providing quality-of-service differentiation under load.
+
+## Configuration
+
+For algorithmic domains (`rank`, `value`), behavior is configured via `shape`, `minCeiling`, and `maxCeiling`, distributing ceilings across `[minCeiling, maxCeiling]`. For the `explicit` domain, ceilings are determined by operator-supplied priority anchors in `ceilings`.
+
+### `shape`
+
+The interpolation curve used to distribute ceilings across the range. Applies to algorithmic domains (`rank`, `value`). Currently only `"linear"` is supported.
+
+### `domain`
+
+How priority levels are mapped to positions in the ceiling range.
+
+#### `rank` (default)
+
+Distributes ceilings in equal steps by ordinal rank, ignoring numerical priority values. Ceilings are evenly spaced across `[minCeiling, maxCeiling]`.
+
+    c_i = maxCeiling - i * (maxCeiling - minCeiling) / (N - 1)
+
+Where `i` is the index in descending priority order (0 = highest) and `N` is the count of active priorities.
+
+Use when priorities represent ordinal categories (e.g., "critical", "normal", "batch") where the numerical values are arbitrary labels.
+
+#### `value`
+
+Scales ceilings proportionally to the numerical priority value within the observed active range.
+
+    r_i = (p_i - pMin) / (pMax - pMin)
+    c_i = minCeiling + r_i * (maxCeiling - minCeiling)
+
+Use when the numerical spacing between priority values carries meaning and priorities that are numerically close should behave similarly under pressure.
+
+#### `explicit`
+
+Maps priorities to admission ceilings using operator-supplied priority anchors in the `ceilings` map.
+
+Unlisted priorities are resolved as follows:
+- Priorities between two configured anchors are linearly interpolated over numerical priority value (not ordinal rank). Value-based interpolation makes the mapping a total function from priority to ceiling, ensuring ceilings remain stable regardless of dynamic priority band churn.
+- Priorities outside the configured anchor range are clamped to the nearest boundary anchor: priorities above the highest configured anchor receive the highest anchor's ceiling, and priorities below the lowest configured anchor receive the lowest anchor's ceiling.
+- When only a single anchor is configured, all priorities receive that anchor's ceiling.
+
+Use when hand-tuned, per-band ceiling values are required and the algorithmic domains do not produce the desired distribution.
+
+**Constraints:**
+- `ceilings` (map of integer priority to float64) is required.
+- Each ceiling must be in `[0.0, 1.0]`.
+- Ceilings must be monotonically non-increasing when priorities are sorted highest-first.
+- `shape`, `minCeiling`, and `maxCeiling` must not be set when `domain` is `explicit`; they are rejected during configuration validation.
+
+**Parameters:**
+
+- `shape` (string, optional, default: `"linear"`): Interpolation curve. Currently only `"linear"` is supported.
+- `domain` (string, optional, default: `"rank"`): Priority mapping: `"rank"`, `"value"`, or `"explicit"`.
+- `minCeiling` (float64, required unless domain is `"explicit"`, no default): Ceiling for the lowest priority. Must be in `[0.0, 1.0)`.
+- `maxCeiling` (float64, optional, default: `1.0`): Ceiling for the highest priority. Must be in `(0.0, 1.0]`.
+- `ceilings` (map[int]float64, required when domain is `"explicit"`): Maps priority levels (anchors) to their admission ceilings in `[0.0, 1.0]`.
+
+`minCeiling` is required for algorithmic domains because it determines how aggressively low-priority traffic is gated and there is no universally correct default.
+
+**Configuration Example (algorithmic):**
+```yaml
+plugins:
+  - type: priority-holdback-policy
+    name: my-holdback-policy
+    parameters:
+      shape: linear
+      domain: rank
+      minCeiling: 0.4
+      maxCeiling: 0.9
+flowControl:
+  usageLimitPolicyPluginRef: my-holdback-policy
+```
+
+**Configuration Example (explicit):**
+```yaml
+plugins:
+  - type: priority-holdback-policy
+    name: my-explicit-holdback
+    parameters:
+      domain: explicit
+      ceilings:
+        100: 0.95
+        50: 0.70
+        10: 0.30
+flowControl:
+  usageLimitPolicyPluginRef: my-explicit-holdback
+```
+
+---
+
+## Related Documentation
+- [Static Usage Limit Policy](../README.md)
+- [Flow Control Overview](../../fairness/README.md)
+

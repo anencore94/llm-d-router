@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,14 +22,15 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"slices"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/util"
 )
 
 // ValidateAndOrderDataDependencies validates that the data dependencies among the given plugins are acyclic
@@ -49,12 +51,26 @@ func ValidateAndOrderDataDependencies(plugins []plugin.Plugin) ([]string, error)
 			consumers[name] = consumer
 		}
 	}
+	// Build the attribute registry from producer declarations, then check
+	// every consumer against it. This is the value-safety complement to PR
+	// 2190's key-safety: it catches typos in consumed DataKeys and value-
+	// type mismatches between producer and consumer declarations before
+	// the DAG is built. Run before buildDAG so its errors surface first.
+	reg, err := fwkdl.BuildRegistry(plugins)
+	if err != nil {
+		return nil, err
+	}
+	for _, consumer := range consumers {
+		if err := reg.ValidateConsumer(consumer); err != nil {
+			return nil, err
+		}
+	}
 	dag, err := buildDAG(producers, consumers)
 	if err != nil {
 		return nil, err
 	}
 	// Topologically sort the DAG to determine the order of plugin execution.
-	pluginNames, err := topologicalSort(dag)
+	pluginNames, err := util.TopologicalSort(dag)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +110,7 @@ func CreateMissingDataProducers(ctx context.Context, defaultProducerRegistry map
 		for key, consumerName := range missingKeys {
 			defaultProducerNameOrType, ok := defaultProducerRegistry[key]
 			if !ok {
-				return fmt.Errorf("no default producer found for missing data key: %v, which is consumed by: %v", key, consumerName)
+				return fmt.Errorf("%w %v, consumed by %v", ErrNoDefaultProducer, key, consumerName)
 			}
 			if handle.Plugin(defaultProducerNameOrType) != nil {
 				// Already created. This can happen when a producer produces multiple data keys.
@@ -222,11 +238,19 @@ func buildDAG(producers map[string]plugin.ProducerPlugin, consumers map[string]p
 				continue
 			}
 			dependencies := consumer.Consumes()
-			if producer.Produces() != nil && dependencies.Required != nil {
+			if producer.Produces() != nil {
 				for producedKey, producedData := range producer.Produces() {
-					if consumedData, ok := dependencies.Required[producedKey]; ok {
-						// Check types are same.
-						if reflect.TypeOf(producedData) != reflect.TypeOf(consumedData) {
+					consumedData, ok := dependencies.Required[producedKey]
+					if !ok {
+						consumedData, ok = dependencies.Optional[producedKey]
+					}
+					if ok {
+						// Check types are same. A nil witness declares no type, matching the
+						// datalayer Registry, so a consumer that accepts several value types
+						// (e.g. any string kind) can still depend on a typed producer.
+						producedType := plugin.UnwrapDataType(producedData)
+						consumedType := plugin.UnwrapDataType(consumedData)
+						if producedType != nil && consumedType != nil && reflect.TypeOf(producedType) != reflect.TypeOf(consumedType) {
 							return nil, errors.New("data type mismatch between produced and consumed data for key: " + producedKey.String())
 						}
 						if pluginToLayerExecutionOrder(producer) > pluginToLayerExecutionOrder(consumer) {
@@ -241,60 +265,4 @@ func buildDAG(producers map[string]plugin.ProducerPlugin, consumers map[string]p
 		}
 	}
 	return dag, nil
-}
-
-// TopologicalSort performs Kahn's Algorithm on a DAG.
-// It returns the sorted order or an error if a cycle is detected.
-func topologicalSort(graph map[string][]string) ([]string, error) {
-	// 1. Initialize in-degree map
-	inDegree := make(map[string]int)
-
-	// Ensure all nodes are present in the inDegree map, even those with no dependencies
-	for u, neighbors := range graph {
-		if _, ok := inDegree[u]; !ok {
-			inDegree[u] = 0
-		}
-		for _, v := range neighbors {
-			inDegree[v]++ // Increment in-degree for the destination node
-		}
-	}
-
-	// 2. Initialize the queue with nodes having 0 in-degree
-	var queue []string
-	for node, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, node)
-		}
-	}
-
-	var result []string
-
-	// 3. Process the queue
-	for len(queue) > 0 {
-		// Dequeue
-		u := queue[0]
-		queue = queue[1:]
-
-		result = append(result, u)
-
-		// Decrease in-degree of neighbors
-		if neighbors, ok := graph[u]; ok {
-			for _, v := range neighbors {
-				inDegree[v]--
-				if inDegree[v] == 0 {
-					queue = append(queue, v)
-				}
-			}
-		}
-	}
-
-	// 4. Check for cycles
-	// If the result size != total nodes, there is a cycle
-	if len(result) != len(inDegree) {
-		return nil, errors.New("cycle detected: graph is not a DAG")
-	}
-
-	// Reverse to get the correct order since edges point from consumer to producer
-	slices.Reverse(result)
-	return result, nil
 }

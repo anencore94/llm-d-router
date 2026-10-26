@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package nohitlru
 
 import (
@@ -169,13 +185,13 @@ func (s *NoHitLRU) isColdRequest(ctx context.Context, endpoints []scheduling.End
 	logger := log.FromContext(ctx).V(logging.DEBUG)
 
 	for _, ep := range endpoints {
-		attr, ok := ep.Get(s.dk.String())
+		attr, ok := ep.Get(s.dk)
 		if !ok {
 			continue
 		}
 		info, ok := attr.(*attrprefix.PrefixCacheMatchInfo)
 		if ok && info.MatchBlocks() > 0 {
-			logger.Info("Cache hit detected on endpoint", "endpoint", ep.GetMetadata().NamespacedName)
+			logger.Info("Cache hit detected on endpoint", "endpoint", ep.GetMetadata().ID)
 			return false
 		}
 	}
@@ -210,7 +226,7 @@ func (s *NoHitLRU) getLRUPositions() map[string]int {
 // (usedPods) and those that have never received cold requests (neverUsedPods).
 func (s *NoHitLRU) partitionPodsByUsage(endpoints []scheduling.Endpoint, lruPosition map[string]int) (usedEndpoints, neverUsedEndpoints []scheduling.Endpoint) {
 	for _, endpoint := range endpoints {
-		endpointName := endpoint.GetMetadata().NamespacedName.String()
+		endpointName := endpoint.GetMetadata().ID.String()
 		if _, exists := lruPosition[endpointName]; exists {
 			usedEndpoints = append(usedEndpoints, endpoint)
 		} else {
@@ -242,7 +258,7 @@ func (s *NoHitLRU) scoreUsedPods(scoredEndpoints map[scheduling.Endpoint]float64
 		return
 	}
 	for _, endpoint := range usedPods {
-		endpointName := endpoint.GetMetadata().NamespacedName.String()
+		endpointName := endpoint.GetMetadata().ID.String()
 		lruPos := lruPosition[endpointName]
 		// LRU keys are oldest to newest so rank 0 = oldest
 		// The never used endpoint count is added to the rank so that
@@ -304,12 +320,12 @@ func (s *NoHitLRU) Score(ctx context.Context, request *scheduling.InferenceReque
 
 // PreRequest is called before a request is sent to the target endpoint.
 // For cold requests, it updates the LRU cache to track which endpoints have been used recently.
-func (s *NoHitLRU) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
+func (s *NoHitLRU) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) error {
 	logger := log.FromContext(ctx).V(logging.DEBUG)
 
 	if schedulingResult == nil || len(schedulingResult.ProfileResults) == 0 {
 		logger.Info("No scheduling result available")
-		return
+		return nil
 	}
 
 	// Read the cold request state we stored in Score
@@ -319,12 +335,12 @@ func (s *NoHitLRU) PreRequest(ctx context.Context, request *scheduling.Inference
 
 	if err != nil {
 		logger.Info("No cold request state found, treating as non-cold request", "error", err)
-		return
+		return nil
 	}
 
 	if !coldState.isCold {
 		logger.Info("Not a cold request, skipping LRU update")
-		return
+		return nil
 	}
 
 	if targetProfile, ok := schedulingResult.ProfileResults[schedulingResult.PrimaryProfileName]; ok && targetProfile != nil && len(targetProfile.TargetEndpoints) != 0 {
@@ -333,13 +349,14 @@ func (s *NoHitLRU) PreRequest(ctx context.Context, request *scheduling.Inference
 	if targetProfile, ok := schedulingResult.ProfileResults[defaultPrefillProfile]; ok && targetProfile != nil && len(targetProfile.TargetEndpoints) != 0 {
 		s.moveTargetPodToFront(ctx, request, targetProfile, defaultPrefillProfile)
 	}
+	return nil
 }
 
 func (s *NoHitLRU) moveTargetPodToFront(ctx context.Context, request *scheduling.InferenceRequest, targetProfile *scheduling.ProfileRunResult, profileName string) {
 	logger := log.FromContext(ctx).V(logging.DEBUG)
 
 	targetPod := targetProfile.TargetEndpoints[0]
-	endpointName := targetPod.GetMetadata().NamespacedName.String()
+	endpointName := targetPod.GetMetadata().ID.String()
 
 	// Move the endpoint to the front of the LRU.
 	var present struct{} // dummy value

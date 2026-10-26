@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -32,8 +34,9 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload"
 )
+
+const cleanEndpoint = "clean-endpoint"
 
 // localRegistry is a thread-safe storage for simulated endpoint load.
 type localRegistry struct {
@@ -109,6 +112,11 @@ func TestConcurrencyDetectorFactory(t *testing.T) {
 			name:       "invalid headroom",
 			configJSON: []byte(`{"headroom": -0.5}`),
 			wantError:  true,
+		},
+		{
+			name:       "valid hybrid mode",
+			configJSON: []byte(`{"concurrencyMode": "hybrid", "maxConcurrency": 10, "maxTokenConcurrency": 100}`),
+			wantError:  false,
 		},
 		{
 			name:       "invalid mode",
@@ -188,13 +196,20 @@ func TestDetector_Configuration(t *testing.T) {
 		driveLoad(ctx, reg, detector, endpointName, 1)
 
 		t.Run("fallback to clean endpoint", func(t *testing.T) {
-			cleanEndpoint := "clean-endpoint"
 			kept = detector.Filter(ctx, nil, []fwksched.Endpoint{
 				newStubSchedulingEndpoint(reg, endpointName),
 				newStubSchedulingEndpoint(reg, cleanEndpoint),
 			})
 			require.Len(t, kept, 1, "Filter should drop the overloaded endpoint")
-			require.Equal(t, cleanEndpoint, kept[0].GetMetadata().NamespacedName.Name)
+			require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+		})
+
+		t.Run("fail open when all endpoints overloaded", func(t *testing.T) {
+			kept = detector.Filter(ctx, nil, []fwksched.Endpoint{
+				newStubSchedulingEndpoint(reg, endpointName),
+			})
+			require.Len(t, kept, 1, "Filter should fail open and return all endpoints when all are overloaded")
+			require.Equal(t, endpointName, kept[0].GetMetadata().ID.Name)
 		})
 	})
 }
@@ -292,6 +307,55 @@ func TestDetector_Saturation(t *testing.T) {
 			require.InDelta(t, tc.wantSaturation, got, 1e-6, "Saturation result mismatch")
 		})
 	}
+}
+
+func TestDetector_DispatchReservations(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	reg := newLocalRegistry()
+	endpoint := newFakeEndpoint(reg, "endpoint-a")
+
+	t.Run("request mode counts pending dispatches idempotently", func(t *testing.T) {
+		t.Parallel()
+		detector := newDetector("test", config{mode: modeRequests, maxConcurrency: 8}, logr.Discard())
+
+		for i := range 6 {
+			require.True(t, detector.ReserveDispatch(fmt.Sprintf("req-%d", i)))
+		}
+		require.False(t, detector.ReserveDispatch("req-0"), "duplicate reservation must be ignored")
+		require.InDelta(t, 0.75, detector.Saturation(ctx, []datalayer.Endpoint{endpoint}), 1e-6)
+
+		require.True(t, detector.ReleaseDispatch("req-0"))
+		require.False(t, detector.ReleaseDispatch("req-0"), "duplicate release must be ignored")
+		require.False(t, detector.ReleaseDispatch("unknown"), "unknown release must be ignored")
+		require.InDelta(t, 0.625, detector.Saturation(ctx, []datalayer.Endpoint{endpoint}), 1e-6)
+	})
+
+	t.Run("hybrid mode uses pending request saturation as a lower bound", func(t *testing.T) {
+		t.Parallel()
+		detector := newDetector("test", config{
+			mode:                modeHybrid,
+			maxConcurrency:      8,
+			maxTokenConcurrency: 80_000,
+		}, logr.Discard())
+
+		for i := range 6 {
+			detector.ReserveDispatch(fmt.Sprintf("hybrid-%d", i))
+		}
+		require.InDelta(t, 0.75, detector.Saturation(ctx, []datalayer.Endpoint{endpoint}), 1e-6)
+	})
+
+	t.Run("token mode is unchanged", func(t *testing.T) {
+		t.Parallel()
+		detector := newDetector("test", config{
+			mode:                modeTokens,
+			maxTokenConcurrency: 80_000,
+		}, logr.Discard())
+
+		detector.ReserveDispatch("token-only")
+		require.InDelta(t, 0.0, detector.Saturation(ctx, []datalayer.Endpoint{endpoint}), 1e-6)
+	})
 }
 
 // TestDetector_Lifecycle verifies the full state transition cycle.
@@ -429,9 +493,12 @@ func TestDetector_TokenFilter(t *testing.T) {
 	reg := newLocalRegistry()
 	detector := newDetector("test-detector", config, logr.Discard())
 	endpointName := "token-filter-endpoint"
-	endpoints := []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)}
+	endpoints := []fwksched.Endpoint{
+		newStubSchedulingEndpoint(reg, endpointName),
+		newStubSchedulingEndpoint(reg, cleanEndpoint),
+	}
 
-	// Drive 110 tokens (just below 120 burst limit) -> endpoint should pass filter.
+	// Drive 110 tokens (just below 120 burst limit) -> both endpoints should pass filter.
 	// 4 input -> 10 total tokens per request * 11 requests = 110 tokens.
 	reqs := make([]*fwksched.InferenceRequest, 0, 11)
 	for i := range 11 {
@@ -440,14 +507,135 @@ func TestDetector_TokenFilter(t *testing.T) {
 	driveTokenLoad(ctx, reg, detector, endpointName, reqs)
 
 	kept := detector.Filter(ctx, nil, endpoints)
-	require.Len(t, kept, 1, "endpoint should pass filter below burst limit")
+	require.Len(t, kept, 2, "endpoint should pass filter below burst limit")
 
-	// Add one more request to reach 120 tokens -> filtered out
+	// Add one more request to reach 120 tokens -> endpointName filtered out, cleanEndpoint kept.
 	driveTokenLoad(ctx, reg, detector, endpointName, []*fwksched.InferenceRequest{
 		makeTokenRequest("r12", 4),
 	})
 	kept = detector.Filter(ctx, nil, endpoints)
-	require.Len(t, kept, 0, "endpoint should be filtered at burst limit")
+	require.Len(t, kept, 1, "overloaded endpoint should be filtered at burst limit when clean endpoint available")
+	require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+
+	// When all endpoints are at burst limit -> fail open returns all endpoints.
+	kept = detector.Filter(ctx, nil, []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)})
+	require.Len(t, kept, 1, "filter should fail open when all endpoints exceed burst limit")
+}
+
+// TestDetector_TokenFilterIncomingTokens verifies that the token limit applies to the endpoint's load
+// plus the uncached tokens the current request would add to it.
+func TestDetector_TokenFilterIncomingTokens(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	reg := newLocalRegistry()
+	// Burst limit = 100 * 1.2 = 120 tokens.
+	detector := newDetector("test-detector", config{mode: modeTokens, maxTokenConcurrency: 100, headroom: 0.2}, logr.Discard())
+	endpointName := "incoming-endpoint"
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) { load.Tokens = 110 })
+	endpoint := newStubSchedulingEndpoint(reg, endpointName)
+	candidates := []fwksched.Endpoint{endpoint, newStubSchedulingEndpoint(reg, cleanEndpoint)}
+
+	endpoint.incomingTokens = 9
+	require.Len(t, detector.Filter(ctx, nil, candidates), 2, "projected load below the limit passes")
+
+	endpoint.incomingTokens = 10
+	require.Len(t, detector.Filter(ctx, nil, candidates), 2, "projected load equal to the limit passes")
+
+	endpoint.incomingTokens = 11
+	kept := detector.Filter(ctx, nil, candidates)
+	require.Len(t, kept, 1, "projected load above the limit is filtered")
+	require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+
+	untokenized := &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{}}
+	require.Len(t, detector.Filter(ctx, untokenized, candidates), 1,
+		"the published cost is counted whether or not the prompt is tokenized")
+}
+
+// TestDetector_TokenFilterOversizedRequest verifies that a request larger than the token limit is
+// kept off loaded endpoints and still placed on an endpoint with no in-flight tokens.
+func TestDetector_TokenFilterOversizedRequest(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	for _, mode := range []concurrencyMode{modeTokens, modeHybrid} {
+		reg := newLocalRegistry()
+		detector := newDetector("test-detector",
+			config{mode: mode, maxConcurrency: 10, maxTokenConcurrency: 100, failClosed: true}, logr.Discard())
+		loadedName := "loaded-endpoint"
+		reg.update(fullEndpointName(loadedName), func(load *attrconcurrency.InFlightLoad) {
+			load.Requests = 1
+			load.Tokens = 1
+		})
+		loaded := newStubSchedulingEndpoint(reg, loadedName)
+		loaded.incomingTokens = 120
+		idle := newStubSchedulingEndpoint(reg, cleanEndpoint)
+		idle.incomingTokens = 120
+
+		kept := detector.Filter(ctx, nil, []fwksched.Endpoint{loaded, idle})
+		require.Len(t, kept, 1, "mode %s: only the idle endpoint takes a request above the limit", mode)
+		require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+
+		require.Empty(t, detector.Filter(ctx, nil, []fwksched.Endpoint{loaded}),
+			"mode %s: a loaded endpoint does not take a request above the limit", mode)
+	}
+}
+
+// TestDetector_HybridFilterIncomingTokens verifies that hybrid mode projects tokens and keeps the
+// request limit on current load.
+func TestDetector_HybridFilterIncomingTokens(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	reg := newLocalRegistry()
+	detector := newDetector("test-detector", config{mode: modeHybrid, maxConcurrency: 10, maxTokenConcurrency: 100}, logr.Discard())
+	endpointName := "hybrid-incoming-endpoint"
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+		load.Requests = 5
+		load.Tokens = 50
+	})
+	endpoint := newStubSchedulingEndpoint(reg, endpointName)
+	candidates := []fwksched.Endpoint{endpoint, newStubSchedulingEndpoint(reg, cleanEndpoint)}
+
+	endpoint.incomingTokens = 50
+	require.Len(t, detector.Filter(ctx, nil, candidates), 2, "tokens fill the limit exactly")
+
+	endpoint.incomingTokens = 51
+	require.Len(t, detector.Filter(ctx, nil, candidates), 1, "tokens exceed the limit")
+
+	endpoint.incomingTokens = 0
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) { load.Requests = 10 })
+	require.Len(t, detector.Filter(ctx, nil, candidates), 1, "request limit reached")
+}
+
+// TestDetector_FilterFailClosed verifies that with FailOpen false the filter returns no endpoints
+// when every candidate is over its limit.
+func TestDetector_FilterFailClosed(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := buildConfig(&apiConfig{MaxConcurrency: ptr.To(int64(2)), FailOpen: ptr.To(false)})
+	require.NoError(t, err)
+	require.True(t, cfg.failClosed)
+
+	defaults, err := buildConfig(&apiConfig{})
+	require.NoError(t, err)
+	require.False(t, defaults.failClosed, "the filter fails open by default")
+
+	ctx := t.Context()
+	reg := newLocalRegistry()
+	detector := newDetector("test-detector", *cfg, logr.Discard())
+	endpointName := "busy-endpoint"
+	reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) { load.Requests = 2 })
+
+	kept := detector.Filter(ctx, nil, []fwksched.Endpoint{
+		newStubSchedulingEndpoint(reg, endpointName),
+		newStubSchedulingEndpoint(reg, cleanEndpoint),
+	})
+	require.Len(t, kept, 1, "a clean endpoint is still kept")
+	require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+
+	kept = detector.Filter(ctx, nil, []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)})
+	require.Empty(t, kept, "no endpoint is returned when every candidate is over its limit")
 }
 
 // TestDetector_TokenLifecycle verifies token accounting.
@@ -488,6 +676,137 @@ func TestDetector_TokenDeleteEndpoint(t *testing.T) {
 
 	simulateDeleteEndpoint(reg, fullEndpointName(endpointName))
 	require.InDelta(t, 0.0, detector.Saturation(ctx, candidates), 1e-6, "expected clean state after DeleteEndpoint")
+}
+
+// TestDetector_HybridSaturation verifies hybrid mode evaluates each endpoint as the more
+// saturated of its request and token dimensions and averages the result across endpoints.
+func TestDetector_HybridSaturation(t *testing.T) {
+	t.Parallel()
+
+	config := config{
+		mode:                modeHybrid,
+		maxConcurrency:      10,
+		maxTokenConcurrency: 100,
+	}
+
+	type endpointLoad struct {
+		requests int64
+		tokens   int64
+	}
+
+	tests := []struct {
+		name           string
+		endpoints      map[string]endpointLoad
+		wantSaturation float64
+	}{
+		{name: "empty", endpoints: map[string]endpointLoad{"endpoint-a": {0, 0}}, wantSaturation: 0.0},
+		// Single endpoint: saturation is the more saturated of its two dimensions.
+		{name: "tokens_dominate", endpoints: map[string]endpointLoad{"endpoint-a": {2, 80}}, wantSaturation: 0.8},   // max(0.2, 0.8)
+		{name: "requests_dominate", endpoints: map[string]endpointLoad{"endpoint-a": {9, 10}}, wantSaturation: 0.9}, // max(0.9, 0.1)
+		{name: "request_dimension_saturates_first", endpoints: map[string]endpointLoad{"endpoint-a": {10, 5}}, wantSaturation: 1.0},
+		{name: "token_dimension_saturates_first", endpoints: map[string]endpointLoad{"endpoint-a": {1, 100}}, wantSaturation: 1.0},
+		// Distinct endpoints saturated on different dimensions each report 1.0, so the pool
+		// averages to 1.0.
+		{
+			name:           "endpoints_saturated_on_different_dimensions",
+			endpoints:      map[string]endpointLoad{"endpoint-a": {10, 0}, "endpoint-b": {0, 100}},
+			wantSaturation: 1.0,
+		},
+		// One saturated endpoint and one idle endpoint average to the midpoint.
+		{
+			name:           "per_endpoint_average",
+			endpoints:      map[string]endpointLoad{"endpoint-a": {10, 0}, "endpoint-b": {0, 0}},
+			wantSaturation: 0.5, // mean(1.0, 0.0)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			ctx := context.Background()
+			detector := newDetector("test-detector", config, logr.Discard())
+
+			candidates := make([]datalayer.Endpoint, 0, len(tc.endpoints))
+			for name, l := range tc.endpoints {
+				reg.update(fullEndpointName(name), func(load *attrconcurrency.InFlightLoad) {
+					load.Requests = l.requests
+					load.Tokens = l.tokens
+				})
+				candidates = append(candidates, newFakeEndpoint(reg, name))
+			}
+
+			got := detector.Saturation(ctx, candidates)
+			require.InDelta(t, tc.wantSaturation, got, 1e-6, "hybrid saturation mismatch")
+		})
+	}
+}
+
+// TestDetector_HybridFilter verifies hybrid mode drops an endpoint when either dimension hits its limit,
+// and fails open when all endpoints hit their limits.
+func TestDetector_HybridFilter(t *testing.T) {
+	t.Parallel()
+
+	// headroom 0.0 -> limits are exactly maxConcurrency (10) and maxTokenConcurrency (100).
+	config := config{
+		mode:                modeHybrid,
+		maxConcurrency:      10,
+		maxTokenConcurrency: 100,
+	}
+	ctx := context.Background()
+
+	tests := []struct {
+		name     string
+		requests int64
+		tokens   int64
+		wantKept int
+	}{
+		{name: "below_both_limits", requests: 5, tokens: 50, wantKept: 2},
+		{name: "request_limit_reached", requests: 10, tokens: 50, wantKept: 1},
+		{name: "token_limit_reached", requests: 5, tokens: 100, wantKept: 1},
+		{name: "both_over", requests: 20, tokens: 200, wantKept: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			detector := newDetector("test-detector", config, logr.Discard())
+			endpointName := "endpoint-a"
+			reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+				load.Requests = tc.requests
+				load.Tokens = tc.tokens
+			})
+
+			kept := detector.Filter(ctx, nil, []fwksched.Endpoint{
+				newStubSchedulingEndpoint(reg, endpointName),
+				newStubSchedulingEndpoint(reg, cleanEndpoint),
+			})
+			require.Len(t, kept, tc.wantKept, "hybrid filter mismatch")
+		})
+	}
+
+	t.Run("all_over_fail_open", func(t *testing.T) {
+		t.Parallel()
+		reg := newLocalRegistry()
+		detector := newDetector("test-detector", config, logr.Discard())
+		endpointA := "endpoint-a"
+		endpointB := "endpoint-b"
+		reg.update(fullEndpointName(endpointA), func(load *attrconcurrency.InFlightLoad) {
+			load.Requests = 10
+			load.Tokens = 50
+		})
+		reg.update(fullEndpointName(endpointB), func(load *attrconcurrency.InFlightLoad) {
+			load.Requests = 5
+			load.Tokens = 100
+		})
+
+		kept := detector.Filter(ctx, nil, []fwksched.Endpoint{
+			newStubSchedulingEndpoint(reg, endpointA),
+			newStubSchedulingEndpoint(reg, endpointB),
+		})
+		require.Len(t, kept, 2, "hybrid filter should fail open when all endpoints exceed limits")
+	})
 }
 
 // TestDetector_ConcurrencyStress performs race condition check.
@@ -565,12 +884,12 @@ func TestDetector_NilMetadataEndpoint(t *testing.T) {
 // --- Test Helpers & Mocks ---
 
 func simulatePreRequest(_ context.Context, reg *localRegistry, req *fwksched.InferenceRequest, result *fwksched.SchedulingResult) {
-	endpointName := result.ProfileResults[result.PrimaryProfileName].TargetEndpoints[0].GetMetadata().NamespacedName.Name
+	endpointName := result.ProfileResults[result.PrimaryProfileName].TargetEndpoints[0].GetMetadata().ID.Name
 	id := fullEndpointName(endpointName)
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Requests++
 		if req != nil {
-			load.Tokens += inflightload.NewSimpleTokenEstimator().Estimate(req)
+			load.Tokens += simulatedTokenLoad(req)
 		}
 	})
 }
@@ -579,11 +898,11 @@ func simulateResponseBody(_ context.Context, reg *localRegistry, req *fwksched.I
 	if metadata == nil || resp == nil || !resp.EndOfStream {
 		return
 	}
-	id := metadata.NamespacedName.String()
+	id := metadata.ID.String()
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Requests--
 		if req != nil {
-			load.Tokens -= inflightload.NewSimpleTokenEstimator().Estimate(req)
+			load.Tokens -= simulatedTokenLoad(req)
 		}
 	})
 }
@@ -602,9 +921,8 @@ func driveLoad(_ context.Context, reg *localRegistry, _ *detector, endpointName 
 func driveTokenLoad(_ context.Context, reg *localRegistry, _ *detector, endpointName string, requests []*fwksched.InferenceRequest) {
 	id := fullEndpointName(endpointName)
 	var total int64
-	estimator := inflightload.NewSimpleTokenEstimator()
 	for _, r := range requests {
-		total += estimator.Estimate(r)
+		total += simulatedTokenLoad(r)
 	}
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Tokens += total
@@ -642,20 +960,22 @@ func (e *liveEndpoint) UpdateMetrics(*datalayer.Metrics)             {}
 func (e *liveEndpoint) String() string                               { return e.id }
 
 // liveEndpoint also implements AttributeMap.
-func (e *liveEndpoint) Get(key string) (datalayer.Cloneable, bool) {
-	if key == attrconcurrency.InFlightLoadDataKey.String() {
+func (e *liveEndpoint) Get(key fwkplugin.DataKey) (datalayer.Cloneable, bool) {
+	if key == attrconcurrency.InFlightLoadDataKey {
 		return e.reg.get(e.id), true
 	}
 	return nil, false
 }
-func (e *liveEndpoint) Put(string, datalayer.Cloneable) {}
-func (e *liveEndpoint) Keys() []string                  { return []string{attrconcurrency.InFlightLoadDataKey.String()} }
-func (e *liveEndpoint) Clone() datalayer.AttributeMap   { return e }
+func (e *liveEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable) {}
+func (e *liveEndpoint) Keys() []fwkplugin.DataKey {
+	return []fwkplugin.DataKey{attrconcurrency.InFlightLoadDataKey}
+}
+func (e *liveEndpoint) Clone() datalayer.AttributeMap { return e }
 
 func newFakeEndpoint(reg *localRegistry, name string) datalayer.Endpoint {
 	id := fullEndpointName(name)
 	return &liveEndpoint{
-		metadata: &datalayer.EndpointMetadata{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}},
+		metadata: &datalayer.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "default"}},
 		reg:      reg,
 		id:       id,
 	}
@@ -667,37 +987,56 @@ type liveSchedulingEndpoint struct {
 	metadata *datalayer.EndpointMetadata
 	reg      *localRegistry
 	id       string
+	// incomingTokens is the uncached-token cost the current request would add to this endpoint.
+	incomingTokens int64
 }
 
 func newStubSchedulingEndpoint(reg *localRegistry, name string) *liveSchedulingEndpoint {
 	return &liveSchedulingEndpoint{
-		metadata: &datalayer.EndpointMetadata{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}},
+		metadata: &datalayer.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "default"}},
 		reg:      reg,
 		id:       fullEndpointName(name),
 	}
 }
 
 func (f *liveSchedulingEndpoint) GetMetadata() *datalayer.EndpointMetadata { return f.metadata }
-func (f *liveSchedulingEndpoint) Get(key string) (datalayer.Cloneable, bool) {
-	if key == attrconcurrency.InFlightLoadDataKey.String() {
+func (f *liveSchedulingEndpoint) Get(key fwkplugin.DataKey) (datalayer.Cloneable, bool) {
+	switch key {
+	case attrconcurrency.InFlightLoadDataKey:
 		return f.reg.get(f.id), true
+	case attrconcurrency.UncachedRequestTokensDataKey:
+		return &attrconcurrency.UncachedRequestTokens{Tokens: f.incomingTokens}, true
 	}
 	return nil, false
 }
-func (f *liveSchedulingEndpoint) Put(string, datalayer.Cloneable) {}
-func (f *liveSchedulingEndpoint) Keys() []string {
-	return []string{attrconcurrency.InFlightLoadDataKey.String()}
+func (f *liveSchedulingEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable) {}
+func (f *liveSchedulingEndpoint) Keys() []fwkplugin.DataKey {
+	return []fwkplugin.DataKey{attrconcurrency.InFlightLoadDataKey, attrconcurrency.UncachedRequestTokensDataKey}
 }
 func (f *liveSchedulingEndpoint) String() string                { return f.id }
 func (f *liveSchedulingEndpoint) Clone() datalayer.AttributeMap { return f }
 
+// simulatedTokenLoad models the per-request token contribution these saturation
+// tests rely on: input tokens plus a fixed 3:2 output allowance (1 input -> 3
+// total, 4 input -> 10 total). It is deliberately local so the saturation math
+// stays independent of the production in-flight token estimator's policy, which
+// derives output tokens from the outlen-bucket attribute rather than a fixed ratio.
+func simulatedTokenLoad(req *fwksched.InferenceRequest) int64 {
+	if req == nil || req.Body == nil || req.Body.TokenizedRequest == nil {
+		return 0
+	}
+	input := int64(req.Body.TokenizedRequest.TokenCount())
+	// round(input * 1.5) via integer half-up, matching the numbers these tests assert.
+	return input + (input*3+1)/2
+}
+
 // makeTokenRequest builds a request with inputTokens tokenized input tokens.
-// The estimator then derives total tokens as inputTokens * (1 + OutputRatio).
+// simulatedTokenLoad then derives total tokens as inputTokens + round(inputTokens * 1.5).
 func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequest {
 	return &fwksched.InferenceRequest{
 		RequestID: requestID,
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, inputTokens)}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, inputTokens)}}},
 		},
 	}
 }
@@ -706,16 +1045,16 @@ func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequ
 // has not been populated yet.
 type nilMetadataEndpoint struct{}
 
-func (e *nilMetadataEndpoint) GetMetadata() *datalayer.EndpointMetadata     { return nil }
-func (e *nilMetadataEndpoint) UpdateMetadata(m *datalayer.EndpointMetadata) {}
-func (e *nilMetadataEndpoint) GetAttributes() datalayer.AttributeMap        { return e }
-func (e *nilMetadataEndpoint) GetMetrics() *datalayer.Metrics               { return nil }
-func (e *nilMetadataEndpoint) UpdateMetrics(*datalayer.Metrics)             {}
-func (e *nilMetadataEndpoint) String() string                               { return "nil-metadata" }
-func (e *nilMetadataEndpoint) Get(string) (datalayer.Cloneable, bool)       { return nil, false }
-func (e *nilMetadataEndpoint) Put(string, datalayer.Cloneable)              {}
-func (e *nilMetadataEndpoint) Keys() []string                               { return nil }
-func (e *nilMetadataEndpoint) Clone() datalayer.AttributeMap                { return e }
+func (e *nilMetadataEndpoint) GetMetadata() *datalayer.EndpointMetadata          { return nil }
+func (e *nilMetadataEndpoint) UpdateMetadata(m *datalayer.EndpointMetadata)      {}
+func (e *nilMetadataEndpoint) GetAttributes() datalayer.AttributeMap             { return e }
+func (e *nilMetadataEndpoint) GetMetrics() *datalayer.Metrics                    { return nil }
+func (e *nilMetadataEndpoint) UpdateMetrics(*datalayer.Metrics)                  {}
+func (e *nilMetadataEndpoint) String() string                                    { return "nil-metadata" }
+func (e *nilMetadataEndpoint) Get(fwkplugin.DataKey) (datalayer.Cloneable, bool) { return nil, false }
+func (e *nilMetadataEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable)        {}
+func (e *nilMetadataEndpoint) Keys() []fwkplugin.DataKey                         { return nil }
+func (e *nilMetadataEndpoint) Clone() datalayer.AttributeMap                     { return e }
 
 func TestDetector_NilEndpointInList(t *testing.T) {
 	t.Parallel()

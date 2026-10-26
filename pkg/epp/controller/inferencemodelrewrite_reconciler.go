@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +20,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -36,8 +37,9 @@ import (
 
 type InferenceModelRewriteReconciler struct {
 	client.Reader
-	Datastore datastore.Datastore
-	PoolGKNN  common.GKNN
+	Datastore       datastore.Datastore
+	PoolGKNN        common.GKNN
+	RunOnNonLeaders bool
 }
 
 func (c *InferenceModelRewriteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -53,12 +55,6 @@ func (c *InferenceModelRewriteReconciler) Reconcile(ctx context.Context, req ctr
 			return ctrl.Result{}, fmt.Errorf("unable to get InferenceModelRewrite - %w", err)
 		}
 		notFound = true
-	}
-
-	// Keep compatibility while surfacing migration guidance for legacy group users.
-	if strings.HasPrefix(infModelRewrite.APIVersion, "inference.networking.x-k8s.io/") {
-		logger.Info("DEPRECATION: apiVersion inference.networking.x-k8s.io/v1alpha2/InferenceModelRewrite is deprecated",
-			"replacement", "llm-d.ai/v1alpha2/InferenceModelRewrite")
 	}
 
 	isDeleted := !infModelRewrite.DeletionTimestamp.IsZero()
@@ -81,6 +77,7 @@ func (c *InferenceModelRewriteReconciler) Reconcile(ctx context.Context, req ctr
 }
 
 func (c *InferenceModelRewriteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	needLeaderElection := !c.RunOnNonLeaders
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha2.InferenceModelRewrite{}).
 		WithEventFilter(predicate.Funcs{
@@ -91,6 +88,7 @@ func (c *InferenceModelRewriteReconciler) SetupWithManager(mgr ctrl.Manager) err
 			DeleteFunc:  func(e event.DeleteEvent) bool { return c.eventPredicate(e.Object.(*v1alpha2.InferenceModelRewrite)) },
 			GenericFunc: func(e event.GenericEvent) bool { return c.eventPredicate(e.Object.(*v1alpha2.InferenceModelRewrite)) },
 		}).
+		WithOptions(controller.Options{NeedLeaderElection: &needLeaderElection}).
 		Complete(c)
 }
 

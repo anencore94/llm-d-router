@@ -24,6 +24,20 @@ The plugin config supports:
 -   `scheme` (default "http"): The protocol scheme to use for metrics retrieval.
 -   `path` (default "/metrics"): The URL path to use for metrics retrieval.
 -   `insecureSkipVerify` (default true): Whether to skip TLS certificate verification when using the "https" scheme.
+-   `caCertPath`: PEM CA bundle to verify the target's server cert.
+-   `clientCertPath` / `clientKeyPath`: client certificate for mTLS. Set both together.
+-   `interval` (string, optional): Scrape period (e.g. `"1s"`). Rounded to the nearest
+    multiple of `--refresh-metrics-interval` (default 50ms). Omit to scrape every
+    base tick.
+-   `families` (list of strings, optional): Metric families to keep in addition to the ones
+    the source's extractors declare. Every other line of the response is dropped before
+    parsing, which cuts the scrape's CPU and allocations when the model server exposes far
+    more families than the extractors read. `core-metrics-extractor` declares the metrics of
+    every configured engine, `multicluster-metrics-extractor` its two pool metrics. The list
+    must cover the families of any other extractor on the source; when it is omitted, such an
+    extractor makes the source parse the whole response. A family is named as it appears in
+    the `# TYPE` line: a counter by its `_total` name, a histogram or summary by its base name,
+    which keeps its `_bucket`, `_sum` and `_count` samples.
 
 ### Example Configuration
 
@@ -33,4 +47,19 @@ parameters:
   scheme: "http"
   path: "/metrics"
   insecureSkipVerify: true
+  interval: "1s"
 ```
+
+Keeping a vLLM counter for an extractor that does not declare its families, along with the
+families the declaring extractors read. All other metrics are dropped before parsing:
+
+```yaml
+type: metrics-data-source
+parameters:
+  families:
+  - vllm:prompt_tokens_total
+```
+
+## Multi-cluster support
+
+`multicluster-metrics-data-source` is the cluster-scoped variant. It scrapes a peer cluster's metrics like the pod source, and a distinct type lets a config pair it with `multicluster-metrics-extractor` independently of the pod pipeline. Because it crosses a cluster trust boundary it verifies the peer certificate by default, unlike the pod source. Set a `caCertPath` for a private cluster CA, or `insecureSkipVerify` to opt out. The response payload is size-capped. See the [wiring example](../../../README.md#example).

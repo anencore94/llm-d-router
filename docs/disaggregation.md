@@ -45,6 +45,40 @@ All topologies are driven by the unified `disagg-profile-handler` plugin, which 
 
 ## Request Lifecycle
 
+### Routing headers
+
+EPP passes its stage decisions to the sidecar in three headers:
+`x-llm-d-prefiller-host-port`, `x-llm-d-encoder-hosts-ports` and
+`x-llm-d-kv-cache-source-host-port`. EPP also sends each under its
+pre-convention name (`x-prefiller-host-port`, `x-encoder-hosts-ports`,
+`x-kv-cache-source-host-port`), so a sidecar that predates the rename still
+routes. The old names are deprecated and will be removed.
+
+The sidecar strips every spelling before forwarding, and EPP drops any value a
+client supplies, so these headers are internal to the EPP-to-sidecar hop and are
+never read from or passed to a model server.
+
+When both spellings are present the sidecar reads the old one, against the usual
+preference for the current name. Sanitization was deployed under the old name,
+so an EPP that predates the rename strips a client-supplied old name but
+forwards the `x-llm-d-` one untouched; preferring the old name keeps a
+client-supplied `x-llm-d-` value from overriding the target that EPP chose. An
+upgraded EPP writes both with the same value, so the order changes nothing once
+EPP is upgraded, and the `x-llm-d-` name is read on its own once the old names
+are removed.
+
+#### Upgrade order
+
+**Upgrade EPP before rolling the decode and sidecar pods.** Until EPP is
+upgraded it does not strip client-supplied `x-llm-d-` routing headers on
+ingress. On a request that EPP leaves undisaggregated there is no old-name value
+to prefer, so a client-supplied `x-llm-d-` header would reach an upgraded
+sidecar as the only stage target. Upgrading EPP first means every inbound
+spelling is rejected at ingress before any sidecar reads it. This matters most
+with `--enable-ssrf-protection=false` (the default), where the sidecar does not
+check a target against the InferencePool; see
+[SSRF Protection](#ssrf-protection).
+
 ### P/D (Prefill/Decode)
 
 1. **User Request** – Sent via OpenAI API to the Envoy Proxy
@@ -52,8 +86,8 @@ All topologies are driven by the unified `disagg-profile-handler` plugin, which 
    1. **Decode**: always runs first, selects a decode pod
    2. **Prefill** (optional): the PD decider evaluates prompt length and prefix-cache hit; if disaggregation is warranted, a prefill pod is selected
 3. **Execution** – Request lands on Decode Worker:
-   - If `x-prefiller-host-port` header doesn't exist → runs both stages locally
-   - If `x-prefiller-host-port` header exists → sidecar sends prefill to the selected Prefill Worker, then runs decode locally
+   - If `x-llm-d-prefiller-host-port` header doesn't exist → runs both stages locally
+   - If `x-llm-d-prefiller-host-port` header exists → sidecar sends prefill to the selected Prefill Worker, then runs decode locally
 4. **Response Flow** – decode sidecar → Envoy → EPP → User
 
 ### E/PD (Encode/Prefill-Decode)
@@ -65,7 +99,7 @@ For multimodal requests (images, video, audio), the encode stage can be disaggre
    1. **Decode**: selects a decode pod
    2. **Encode** (optional): the encode decider checks for multimodal content; if present, an encode pod is selected
 3. **Execution** – Request lands on Decode Worker:
-   - If encode was scheduled → sidecar sends encoding work to the selected Encode Worker(s) via the `x-encoder-hosts-ports` header
+   - If encode was scheduled → sidecar sends encoding work to the selected Encode Worker(s) via the `x-llm-d-encoder-hosts-ports` header
    - Encode Worker processes multimodal content and returns encoding metadata (embedding references)
    - Decode Worker reads embeddings via EC_Connector and runs prefill + decode locally
 4. **Response Flow** – decode sidecar → Envoy → EPP → User
@@ -80,9 +114,9 @@ The full three-stage pipeline combines both encode and prefill disaggregation:
    2. **Encode** (optional): if multimodal content is detected, an encode pod is selected
    3. **Prefill** (optional): if the PD decider determines disaggregation is beneficial, a prefill pod is selected
 3. **Execution** – Request lands on Decode Worker:
-   - If encode was scheduled → sidecar sends encoding work to the selected Encode Worker(s) via the `x-encoder-hosts-ports` header
+   - If encode was scheduled → sidecar sends encoding work to the selected Encode Worker(s) via the `x-llm-d-encoder-hosts-ports` header
    - Encode Worker processes multimodal content and returns encoding metadata (embedding references)
-   - If prefill was scheduled → sidecar sends prefill to Prefill Worker via the `x-prefiller-host-port` header
+   - If prefill was scheduled → sidecar sends prefill to Prefill Worker via the `x-llm-d-prefiller-host-port` header
    - Prefill Worker reads embeddings via EC_Connector and executes prefill operation
    - Decode Worker runs decode locally
 4. **Response Flow** – decode sidecar → Envoy → EPP → User
@@ -125,7 +159,7 @@ sequenceDiagram
   participant D as Decode Worker(vLLM)
 
   C->>I: Multimodal Inference Request
-  I->>DS: Request with x-encoder-hosts-ports header
+  I->>DS: Request with x-llm-d-encoder-hosts-ports header
   DS->>E: Send multimodal content for encoding
   E-->>E: Process images/video/audio
   E->>DS: Encoding metadata (embedding references)
@@ -149,7 +183,7 @@ sequenceDiagram
   participant D as Decode Worker(vLLM)
 
   C->>I: Multimodal Inference Request
-  I->>DS: Request with x-encoder-hosts-ports <br/> and x-prefiller-host-port headers
+  I->>DS: Request with x-llm-d-encoder-hosts-ports <br/> and x-llm-d-prefiller-host-port headers
   DS->>E: Send multimodal content for encoding
   E-->>E: Process images/video/audio
   E->>DS: Encoding metadata (embedding references)
@@ -235,7 +269,6 @@ By default, llm-d uses the label key `llm-d.ai/role` with values:
 - `"encode-decode"` → pods capable of both encode and decode (E/PD, rare)
 - `"prefill-decode"` → pods capable of both prefill and decode
 - `"encode-prefill-decode"` → pods capable of all three stages
-- `"both"` → **deprecated** (use `"prefill-decode"` instead)
 
 However, external systems may use alternative labels like:
 ```yaml
@@ -246,9 +279,6 @@ role: decode
 
 To accommodate this **without code changes**, you can configure the **EndpointPickerConfig** to use the generic `label-selector-filter` plugin instead of the hardcoded `encode-filter` / `prefill-filter` / `decode-filter`.
 
-> [!NOTE]
-> The previous filter type `by-label` is deprecated. Use `label-selector-filter` with standard Kubernetes label selector syntax instead.
-
 ### Configuration Examples
 
 #### P/D Configuration
@@ -256,7 +286,7 @@ To accommodate this **without code changes**, you can configure the **EndpointPi
 Below is a minimal `EndpointPickerConfig` for P/D disaggregation using custom labels:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
   # Prefill selection: match Pods with label role=prefill
@@ -275,16 +305,18 @@ plugins:
         - key: "role"
           operator: In
           values: ["decode"]
-  - type: prefix-cache-scorer
+  - type: approx-prefix-cache-producer
     parameters:
       autoTune: false
       blockSizeTokens: 5
-      maxPrefixBlocksToMatch: 256
+      maxPrefixTokensToMatch: 1280
       lruCapacityPerServer: 31250
+  - type: prefix-cache-scorer
   - type: max-score-picker
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 8
+      promptTokens: 0
   - type: disagg-profile-handler
     parameters:
       profiles:
@@ -310,7 +342,7 @@ schedulingProfiles:
 Below is an `EndpointPickerConfig` for full E/P/D disaggregation using custom labels:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
   # Encoding selection: match Pods with label role=encode
@@ -337,17 +369,19 @@ plugins:
         - key: "role"
           operator: In
           values: ["decode"]
-  - type: prefix-cache-scorer
+  - type: approx-prefix-cache-producer
     parameters:
       autoTune: false
       blockSizeTokens: 5
-      maxPrefixBlocksToMatch: 256
+      maxPrefixTokensToMatch: 1280
       lruCapacityPerServer: 31250
+  - type: prefix-cache-scorer
   - type: max-score-picker
   - type: always-disagg-multimodal-decider
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 8
+      promptTokens: 0
   - type: disagg-profile-handler
     parameters:
       profiles:
@@ -392,26 +426,65 @@ PD deciders determine whether prefill should be offloaded to a separate worker, 
 
 #### Prefix-Based PD Decider
 
-The `prefix-based-pd-decider` plugin makes the disaggregation decision according to the length of the non-cached suffix of the prompt relative to tokens already cached on the selected decode pod.
+The `prefix-based-pd-decider` plugin compares the request's non-cached suffix on the selected decode endpoint against a threshold. Which role the plugin fills depends on the deployment topology:
+
+- **Sidecar-based P/D deployments** wire the plugin as a `disagg-profile-handler` decider — it routes prefill remotely when the threshold is met (see [Profile Handler Configuration](#profile-handler-configuration)). Sidecar deployments do not emit `Prefer: if-available`, so the conditional-decode gate is dormant here.
+- **Coordinator-based deployments** use the default profile handler and declare the plugin at the top level. Only its `PreRequest` hook runs, enforcing the conditional-decode gate — `Prefer: if-available` requests are rejected with HTTP 412 when the same threshold would trigger remote prefill.
+
+Both roles read the same `nonCachedTokens` / `promptTokens` parameters. Declaring **two named instances** of this plugin in the same config (e.g., one wired as a decider, another as a standalone gate) with different parameters is not supported: the plugin memoizes its per-request decision keyed by plugin type, so the first instance to evaluate a given request populates the cache and the second reads that cached decision — its own parameters silently do not apply.
 
 **How It Works**
 - Once a decode pod is selected, the decider checks how many tokens from the incoming prompt have already been sent to this pod
 
-- If the remaining non-cached suffix length is longer than the configured threshold (nonCachedTokens), disaggregation is triggered – the prefill will run remotely on a prefill pod, and decode locally on the decode pod
+- If the prompt length is shorter than the configured prompt length threshold (promptTokens), the full request runs locally on the decode worker without remote prefill
 
-- If the non-cached suffix is shorter or equal to the threshold, the full request runs locally on the decode worker without remote prefill
+- If the remaining non-cached suffix length is at least the configured threshold (nonCachedTokens), disaggregation is triggered: the prefill will run remotely on a prefill pod, and decode locally on the decode pod
+
+- If the non-cached suffix is shorter than the threshold, the full request runs locally on the decode worker without remote prefill
 
 **Configuration**
 ```yaml
 - type: prefix-based-pd-decider
   parameters:
     nonCachedTokens: 8
+    promptTokens: 0
 ```
 
 **Parameter:**
 
-- `nonCachedTokens`: Number of non-cached tokens that trigger disaggregation
-  - If set to 0, disaggregation never occurs for any request
+- `nonCachedTokens`: Non-cached suffix length in tokens at which the plugin's gate fires — triggering disaggregation for normal requests, or returning HTTP 412 Precondition Failed for `Prefer: if-available` requests. `0` disables both.
+- `promptTokens`: Minimum prompt length in tokens before the plugin's routing and gating logic applies. Prompts shorter than this run locally on the decode worker without remote prefill; the 412 gate honors the same shortcut. `0` disables it.
+- `prefixMatchInfoProducerName`: Name of the prefix-cache producer whose cache state the decider reads for both the disaggregation decision and the conditional-decode 412 gate. If unspecified, the `approx-prefix-cache-producer` is used.
+
+**Conditional-decode 412 gate**
+
+Requests carrying `Prefer: if-available` (used by the coordinator's speculative early-decode step, see [coordinator_architecture.md](coordinator_architecture.md)) are gated by the plugin using the same `promptTokens` / `nonCachedTokens` thresholds as the disaggregation decision: when the chosen decode endpoint's non-cached suffix would trigger remote prefill, the plugin returns HTTP 412 Precondition Failed so the coordinator restarts the pipeline at encode/prefill/decode. Cache state is read as unweighted contiguous blocks, so a RAM-cached prefix contributes its full token count.
+
+Deployments that do not declare any conditional-decode gate plugin still reject `Prefer: if-available` requests: the director rejects unclaimed conditional-decode requests with 412 by default so a missing gate plugin surfaces as the coordinator's cache-miss fallback rather than a silent forward.
+
+A minimal coordinator-topology configuration:
+
+```yaml
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+  - type: token-producer
+  - type: approx-prefix-cache-producer
+  - type: prefix-cache-scorer
+  - type: max-score-picker
+  - type: prefix-based-pd-decider
+    parameters:
+      nonCachedTokens: 8
+schedulingProfiles:
+  - name: decode
+    plugins:
+      - pluginRef: "prefix-cache-scorer"
+      - pluginRef: "max-score-picker"
+```
+
+The plugin declares `PrefixCacheMatchInfo` and `TokenizedPrompt` as required dependencies, so a missing producer surfaces as a startup error rather than a silent per-request forward.
+
+Full P/D and E/P/D configurations that combine the decider and gate roles are in [Configuration Examples](#configuration-examples).
 
 #### Always-Disagg PD Decider
 The `always-disagg-pd-decider` is a simpler alternative used mainly for testing or benchmarking.
@@ -455,12 +528,15 @@ The `disagg-profile-handler` plugin is the entry point for all disaggregation to
 
 ### Parameters
 
+- `stageOrder` (optional, default: `decode-first`): order of execution for disaggregation stages.
+  - `decode-first`: Decode runs first, followed by Encode (optional) and Prefill (optional). The PD decider inspects the chosen decode pod's cache state to determine whether prefill should be disaggregated.
+  - `prefill-first`: Prefill runs first, followed by Encode (optional) and Decode. When the prefill profile is configured, prefill always runs, and the chosen prefill pod is published so the decode stage can apply topology affinity constraints (e.g., co-locating decode on the same rack).
 - `profiles` (optional): names of the scheduling profiles to use.
   - `decode` (default: `decode`)
   - `prefill` (default: `prefill`)
   - `encode` (default: `encode`)
 - `deciders` (optional): decider plugins that control whether each stage runs.
-  - `prefill`: enables P/D disaggregation when set.
+  - `prefill`: enables P/D disaggregation when set (used in `decode-first` mode).
   - `encode`: enables E disaggregation when set.
 
 ### Examples
@@ -473,7 +549,7 @@ No deciders are configured -- all requests are handled by the decode profile alo
 - type: disagg-profile-handler
 ```
 
-#### P/D (Prefill/Decode)
+#### P/D (Prefill/Decode, Decode-First)
 
 ```yaml
 - type: disagg-profile-handler
@@ -492,6 +568,16 @@ Custom profile names (if your scheduling profiles are not named `decode`/`prefil
       prefill: my-prefill
     deciders:
       prefill: prefix-based-pd-decider
+```
+
+#### P/D (Prefill/Decode, Prefill-First)
+
+In `prefill-first` mode, prefill runs first without requiring a PD decider, and publishes the selected prefill endpoint so subsequent decode scheduling can match against it (e.g., via topology affinity).
+
+```yaml
+- type: disagg-profile-handler
+  parameters:
+    stageOrder: prefill-first
 ```
 
 #### E/PD (Encode/Prefill-Decode)
@@ -529,15 +615,188 @@ Specifies which KV transfer protocol the sidecar uses to coordinate prefill/deco
 | `shared-storage` | `SharedStorageConnector` | KV transfer via shared filesystem |
 | `sglang` | — | SGLang disaggregation protocol |
 | `mooncake` | `MooncakeConnector` | [Mooncake](https://github.com/kvcache-ai/Mooncake) KV transfer using RDMA |
+| `offloading` | `OffloadingConnector` | KV transfer over the vLLM CPU offloading tier. The decoder pulls KV from the prefiller via the `p2p` secondary tier. |
+
+With `offloading`, the sidecar dispatches prefill and decode concurrently. It
+injects role-keyed `kv_transfer_params`, each key named for the remote party it
+describes: the prefiller receives `{"remote_decoder": {"kv_request_id": <id>}}`
+(no peer address), and the decoder receives `{"remote_prefiller":
+{"kv_request_id": <id>, "remote_host": <prefiller host>, "remote_port":
+<p2p-connector-port>}}` so it can pull KV from the prefiller. The prefiller host
+comes from the `x-llm-d-prefiller-host-port` header; the port is
+`--p2p-connector-port`.
+
+When the request also carries the `x-llm-d-kv-cache-source-host-port` header (set by
+the EPP `p2p-source-producer` to a peer holding more cached prefix than the pod
+computing the prefix), the sidecar injects an additional `remote_kv_source` key
+so vLLM pulls that cached prefix over the P2P tier instead of recomputing it.
+Under disaggregation the prefill request carries `{"remote_decoder": {...},
+"remote_kv_source": {"kv_request_id": <own id>, "remote_host": <source host>,
+"remote_port": <p2p-connector-port>}}` (the only supported multi-key
+combination); without a prefiller the decoder-only request carries
+`{"remote_kv_source": {...}}` alone. A malformed or disallowed source header is
+ignored and the request proceeds unchanged, as is any source header on a
+connector that cannot pull over the P2P tier: only `offloading`, or NIXLv2 with
+`--enable-p2p-pull`, honors it. For the pulled blocks to be servable, the source
+pod must offload its generated (decode-phase) KV: set `offload_prompt_only:
+false` in its `kv_connector_extra_config` (the default `true` offloads only
+prefill blocks).
+
+Both prefill and decode pods require the following `--kv-transfer-config`:
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "TieringOffloadingSpec",
+    "cpu_bytes_to_use": <bytes>,
+    "secondary_tiers": [{"type": "p2p", "host": "<POD_IP>", "port": <p2p-connector-port>}]
+  }
+}
+```
+
+`host` must be the pod's own IP at runtime (use the Kubernetes downward API env var `status.podIP`). `port` must match `--p2p-connector-port` (default `7777`) when each pod is a complete DP group; wide-EP worker pods instead set the compensated `P2P_BASE` (see the wide-EP paragraph below). `cpu_bytes_to_use` controls the CPU KV offload buffer size; size it to hold the KV for the expected concurrent in-flight transfers. `OffloadingConnector` is available in vLLM nightly builds from 2026-06-30 onward (commit `bec232a`, [PR #42285](https://github.com/vllm-project/vllm/pull/42285)).
+
+**Data parallelism:** the P2P tier supports `--data-parallel-size` N > 1 when
+each pod is a complete DP group (the per-pod DP deployment), or a multi-pod
+(wide-EP) group with compensated socket bases (below).
+
+- vLLM gives each DP replica its own P2P listener and offload region:
+  replica `i` serves on `<p2p-connector-port>+i`, where `i` is the
+  **global** `data_parallel_index`
+  ([PR #47636](https://github.com/vllm-project/vllm/pull/47636),
+  [PR #47987](https://github.com/vllm-project/vllm/pull/47987)). Engines
+  without those changes bind every replica to the same
+  `POD_IP:<p2p-connector-port>`, and DP > 1 fails at engine startup.
+- The sidecar serves rank `r` on its own port + `r`, so the routed
+  endpoint's port names the target rank. The sidecar injects
+  `remote_port` = `--p2p-connector-port` + `r`; a port outside the rank
+  range falls back to rank 0.
+- The endpoint port encodes the pod-local rank, which matches the global
+  index only when the pod is a whole DP group. Multi-pod DP groups (for
+  example LWS wide-EP, where pod `k`'s replicas hold global indices
+  `k*N..k*N+N-1` behind the same serving ports) must compensate the
+  configured socket base ports per pod; see the wide-EP example below.
+- Every replica maps its own offload region, so the pod's `/dev/shm` must
+  exceed N x `cpu_bytes_to_use`.
+
+**Wide-EP (multi-pod DP groups):** vLLM adds the **global**
+`data_parallel_index` to the configured P2P and KV-events base ports, while
+the router addresses an engine by pod IP plus **pod-local** rank. Each pod
+must therefore subtract its global start rank from both configured bases so
+every pod binds the same pod-local ranges and the serving-port offset again
+names the target rank. In an LWS template with `DP_SIZE_LOCAL` ranks per
+pod:
+
+```bash
+START_RANK=$(( ${LWS_WORKER_INDEX:-0} * DP_SIZE_LOCAL ))
+P2P_BASE=$((7777 - START_RANK))
+KV_EVENTS_BASE=$((5557 - START_RANK))
+```
+
+`P2P_BASE` is the P2P secondary tier port:
+
+```json
+"secondary_tiers": [{"type": "p2p", "host": "${POD_IP}", "port": ${P2P_BASE}}]
+```
+
+`KV_EVENTS_BASE` is the KV-events publisher endpoint
+(`"endpoint": "tcp://*:${KV_EVENTS_BASE}"`), so the EPP's per-rank
+subscribers (`precise-prefix-cache-producer` dials
+`podDiscoveryConfig.socketPort` + rank index) reach each rank's socket.
+With `DP_SIZE_LOCAL: 8` every pod binds P2P `7777-7784`, KV events
+`5557-5564`, and serving `8000-8007`. Only the socket bases are
+compensated; `data_parallel_index` and the global rank carried in KV-event
+batches are unchanged.
 
 ### General Sidecar Flags
+
+The sidecar's serving TLS flags are shared with the EPP and the coordinator and are
+documented in [TLS](tls.md). `--enable-tls` and `--tls-insecure-skip-verify` configure
+the sidecar's outbound connections to the encode, prefill and decode stages.
 
 | Flag | Env var | Values | Default | Description |
 |---|---|---|---|---|
 | `--enable-tls` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Enable TLS for the specified stages. Example: `--enable-tls=prefiller,decoder` |
 | `--tls-insecure-skip-verify` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Skip TLS certificate verification for the specified stages. Example: `--tls-insecure-skip-verify=prefiller` |
 | `--enable-prefiller-sampling` | `ENABLE_PREFILLER_SAMPLING` | `true` / `false` | `false` | If true, the prefill instance is selected randomly from the provided prefill host values. |
-| `--enable-ssrf-protection` | — | `true` / `false` | `false` | Enable SSRF protection using InferencePool allowlisting. |
+| `--enable-ssrf-protection` | — | `true` / `false` | `false` | Enable SSRF protection using InferencePool allowlisting. See [SSRF Protection](#ssrf-protection). |
+| `--tracing` | — | `true` / `false` | `false` | Enable OpenTelemetry tracing. See [Sidecar Tracing](#sidecar-tracing). |
+| `--enable-tool-calling-telemetry` | — | `true` / `false` | `false` | Observe tool-calling request fields. Traces and the metrics listener are configured separately. |
+| `--metrics-port` | — | port | `0` (disabled) | Serve Prometheus `/metrics` on this port. See [P/D sidecar metrics](metrics.md#pd-sidecar). |
+
+### Sidecar Tracing
+
+With `--tracing`, the sidecar exports spans under the service name `llm-d-disagg-sidecar`. It
+continues the W3C trace context of the incoming request and propagates it on its outbound requests
+to the model servers, so EPP, sidecar, and model server spans share one trace when the model server
+also exports traces.
+
+The sidecar's spans carry the same `llm_d.epp.fairness.id` and `llm_d.epp.fairness.source` as the
+EPP request spans. On sampled traces the EPP sends the pair in `x-llm-d-epp-fairness-id` and
+`x-llm-d-epp-fairness-source`, replacing any client copy; otherwise it removes client copies. The
+sidecar reads both before opening its server span and removes them before forwarding, so the model
+server never sees them. A missing, partial, or unrecognised pair is recorded as `default-flow` with
+source `default`. The headers record where the EPP resolved the identity, not who sent the request:
+keep the sidecar reachable only through the EPP, since a caller that bypasses it can set them. When
+the EPP routes straight to a model server without a sidecar, the model server receives the pair on
+sampled traces.
+
+The exporter is configured with the standard OpenTelemetry environment variables:
+
+| Env var | Default | Description |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Plaintext `localhost:4317` (gRPC) or `localhost:4318` (HTTP) | Collector endpoint. The loopback default applies only when no endpoint, insecure, or certificate variable is set. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `grpc` | `grpc` or `http/protobuf`. |
+| `OTEL_TRACES_EXPORTER` | `otlp` | `otlp`, `console` (pretty-printed spans on stdout), or `none`. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, or `parentbased_traceidratio`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `0.1` | Sampling ratio in `[0, 1]` for the `traceidratio` samplers. |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | — | Override the service name and add resource attributes such as `k8s.pod.name`. |
+
+### SSRF Protection
+
+The sidecar connects to the addresses in the `x-llm-d-prefiller-host-port` and
+`x-llm-d-encoder-hosts-ports` request headers, and tells vLLM to pull cached KV blocks
+from the address in `x-llm-d-kv-cache-source-host-port`. With
+`--enable-ssrf-protection=false` the sidecar does not check these addresses and
+logs a warning at startup. A client that can set the headers chooses the target.
+That includes any client that reaches the sidecar port without going through
+the EPP.
+
+Set `--enable-ssrf-protection=true` in deployments reachable by untrusted
+clients. The sidecar then accepts a target only when its host is the IP or name
+of a pod selected by the InferencePool. The port is not checked. A request with
+a disallowed prefill target is rejected with `403`, and disallowed encoder
+targets are dropped from the request.
+
+Enabling the flag requires:
+
+- `--inference-pool=<namespace>/<name>`, or the `INFERENCE_POOL` environment
+  variable. A value without a namespace refers to the `default` namespace. The
+  sidecar does not start when the pool is not set.
+- `--pool-group` (default `inference.networking.k8s.io`), the Kubernetes API
+  group of the InferencePool. Only `inference.networking.k8s.io` is supported.
+- `list` and `watch` permissions on `inferencepools` and on `pods` in the
+  InferencePool's namespace, granted to the service account of the decode pods:
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: pd-sidecar-ssrf-protection
+  rules:
+  - apiGroups: ["inference.networking.k8s.io"]
+    resources: ["inferencepools"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  ```
+
+  Without the `inferencepools` permissions the sidecar does not start serving.
+  Without the `pods` permissions the allowlist stays empty and every request
+  with a prefill target is rejected.
 
 ### Connector-Specific Flags
 
@@ -545,6 +804,8 @@ Specifies which KV transfer protocol the sidecar uses to coordinate prefill/deco
 |---|---|---|---|---|
 | `mooncake` | `--mooncake-bootstrap-port` | `MOONCAKE_BOOTSTRAP_PORT` | `8998` | Port used to query the Mooncake bootstrap endpoint on prefill pods. Corresponds to vLLM's `VLLM_MOONCAKE_BOOTSTRAP_PORT`. |
 | `sglang` | — | `SGLANG_BOOTSTRAP_PORT` | `8998` | Port used for the SGLang bootstrap endpoint on prefill pods. |
+| `offloading` | `--p2p-connector-port` | `P2P_CONNECTOR_PORT` | `7777` | Prefiller's OffloadingConnector P2P tier listening port (rank-0 port under data parallelism), injected as `remote_port` on the decode request so the decoder can pull KV. |
+| `nixlv2` | `--enable-p2p-pull` | — | `false` | Declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXLv2, i.e. the engines run `MultiConnector(NixlConnector + OffloadingConnector)`. NIXL moves KV prefill to decode while the OffloadingConnector pulls the cached prefix named by `x-llm-d-kv-cache-source-host-port`. Rejected at startup with any other connector; `offloading` provides the tier natively and needs no flag. |
 
 ---
 
@@ -555,3 +816,4 @@ Specifies which KV transfer protocol the sidecar uses to coordinate prefill/deco
 - vLLM: [[RFC]: Prototype Separating Vision Encoder to Its Own Worker](https://github.com/vllm-project/vllm/issues/20799)
 - vLLM: [Encoder Disaggregation for Scalable Multimodal Model Serving](https://vllm.ai/blog/vllm-epd)
 - Mooncake: [MooncakeConnector Usage Guide](https://github.com/vllm-project/vllm/blob/main/docs/features/mooncake_connector_usage.md)
+- vLLM: [OffloadingConnector / P2P secondary tier (PR #42285)](https://github.com/vllm-project/vllm/pull/42285)

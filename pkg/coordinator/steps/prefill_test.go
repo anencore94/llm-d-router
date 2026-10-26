@@ -1,0 +1,1221 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package steps
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/ec"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/kv"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
+)
+
+func TestPrefillStep_SendsCorrectGenerateRequest(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/inference/v1/generate" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get(reqcommon.EPPProfileHeaderKey) != gateway.PhasePrefill {
+			t.Fatalf("expected x-llm-d-epp-profile: prefill, got %q", r.Header.Get(reqcommon.EPPProfileHeaderKey))
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{
+				"block_id":  "block-xyz",
+				"peer_host": "10.0.0.5",
+				"peer_port": 6001,
+			},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+
+	step, err := NewPrefillStep(gwClient, map[string]any{
+		"use_openai_format": false,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-1",
+		Model:     "llama-3",
+		TokenIDs:  []int{1, 32000, 32000, 32000, 32000, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: testKwargsA, Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 3}},
+			{Modality: reqcommon.ModalityImage, Hash: "hash-b", KwargsData: testKwargsB, Placeholder: pipeline.PlaceholderRange{Offset: 4, Length: 3}},
+		},
+		ECTransferParams: []map[string]any{
+			{"hash-a": map[string]any{"peer_port": 5501, "size_bytes": 1228800, "nixl_agent_metadata_b64": "bml4..."}},
+			{"hash-b": map[string]any{"peer_port": 5502, "size_bytes": 1228800, "nixl_agent_metadata_b64": "QWdlbnQ..."}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	err = step.Execute(context.Background(), reqCtx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify request_id
+	if prefillBody["request_id"] != "req-1" {
+		t.Fatalf("expected request_id=req-1, got %v", prefillBody["request_id"])
+	}
+
+	// Verify model
+	if prefillBody["model"] != "llama-3" {
+		t.Fatalf("expected model=llama-3, got %v", prefillBody["model"])
+	}
+
+	// Verify token_ids
+	tokenIDs, ok := prefillBody["token_ids"].([]any)
+	if !ok || len(tokenIDs) != 8 {
+		t.Fatalf("expected 8 token_ids, got %v", prefillBody["token_ids"])
+	}
+
+	// Verify features
+	features, ok := prefillBody["features"].(map[string]any)
+	if !ok {
+		t.Fatal("expected features in prefill request")
+	}
+	mmHashes, _ := features["mm_hashes"].(map[string]any)
+	imageHashes, _ := mmHashes[string(reqcommon.ModalityImage)].([]any)
+	if len(imageHashes) != 2 {
+		t.Fatalf("expected 2 mm_hashes, got %d", len(imageHashes))
+	}
+	if imageHashes[0] != "hash-a" || imageHashes[1] != "hash-b" {
+		t.Fatalf("unexpected mm_hashes: %v", imageHashes)
+	}
+
+	// Verify kwargs_data carries per-image base64 tensors
+	kwargsData, ok := features["kwargs_data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected kwargs_data map in prefill, got %T", features["kwargs_data"])
+	}
+	imageKwargs, _ := kwargsData[string(reqcommon.ModalityImage)].([]any)
+	if len(imageKwargs) != 2 || imageKwargs[0] != testKwargsA || imageKwargs[1] != testKwargsB {
+		t.Fatalf("expected kwargs_data.image=[%s,%s], got %v", testKwargsA, testKwargsB, imageKwargs)
+	}
+
+	// Verify sampling_params carries only the capped generation fields, not the
+	// transfer params (those are top level in generate format).
+	samplingParams, ok := prefillBody["sampling_params"].(map[string]any)
+	if !ok {
+		t.Fatal("expected sampling_params in body")
+	}
+	if samplingParams["max_tokens"] != float64(1) {
+		t.Fatalf("expected sampling_params.max_tokens=1, got %v", samplingParams["max_tokens"])
+	}
+	// The request body is built from RequestContext, so this guards against the branch
+	// starting to forward client sampling_params.
+	if _, ok := samplingParams["min_tokens"]; ok {
+		t.Fatalf("expected sampling_params.min_tokens to be stripped, got %v", samplingParams["min_tokens"])
+	}
+	// The transfer params are no longer nested under extra_args.
+	if _, ok := samplingParams["extra_args"]; ok {
+		t.Fatalf("expected no sampling_params.extra_args in generate format, got %v", samplingParams["extra_args"])
+	}
+
+	// Verify kv_transfer_params is a top-level field in generate format.
+	kvParams, ok := prefillBody["kv_transfer_params"].(map[string]any)
+	if !ok {
+		t.Fatal("expected top-level kv_transfer_params in generate format")
+	}
+	if kvParams["do_remote_decode"] != true {
+		t.Fatalf("expected kv_transfer_params.do_remote_decode=true, got %v", kvParams["do_remote_decode"])
+	}
+
+	// Verify ec_transfer_params is a top-level flat map keyed by mm_hash.
+	ecParams, ok := prefillBody["ec_transfer_params"].(map[string]any)
+	if !ok {
+		t.Fatal("expected top-level ec_transfer_params in generate format")
+	}
+	if len(ecParams) != 2 {
+		t.Fatalf("expected 2 ec_transfer_params entries, got %d: %v", len(ecParams), ecParams)
+	}
+	for _, want := range []string{"hash-a", "hash-b"} {
+		if _, ok := ecParams[want]; !ok {
+			t.Errorf("missing hash %q in ec_transfer_params: %v", want, ecParams)
+		}
+	}
+
+	// Verify response populated KVTransferParams
+	if reqCtx.KVTransferParams["block_id"] != "block-xyz" {
+		t.Fatalf("expected block_id=block-xyz, got %v", reqCtx.KVTransferParams["block_id"])
+	}
+}
+
+func TestPrefillStep_GenerateUsesMMMetadataWhenECPresent(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-xyz"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{
+		"use_openai_format": false,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-meta",
+		Model:     "llama-3",
+		TokenIDs:  []int{1, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: testKwargsA, MMMetadata: testMetadataA, Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 2}},
+		},
+		ECTransferParams: []map[string]any{
+			{"hash-a": map[string]any{"peer_port": 5501, "size_bytes": 1228800, "nixl_agent_metadata_b64": "bml4..."}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	features, ok := prefillBody["features"].(map[string]any)
+	if !ok {
+		t.Fatal("expected features in prefill request")
+	}
+
+	// The covered entry ships mm_metadata[i] with a null kwargs_data[i] slot.
+	// Both fields stay present so vLLM's per-item merge can reassemble the
+	// entry from whichever side is non-null.
+	kw, ok := features["kwargs_data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected kwargs_data present (with null entry), got %T", features["kwargs_data"])
+	}
+	kwItems, _ := kw[string(reqcommon.ModalityImage)].([]any)
+	if len(kwItems) != 1 || kwItems[0] != nil {
+		t.Fatalf("expected kwargs_data.image=[null], got %#v", kwItems)
+	}
+
+	md, ok := features["mm_metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mm_metadata map, got %T", features["mm_metadata"])
+	}
+	items, _ := md[string(reqcommon.ModalityImage)].([]any)
+	if len(items) != 1 || items[0] != testMetadataA {
+		t.Fatalf("unexpected mm_metadata: %#v", items)
+	}
+}
+
+// TestPrefillStep_GenerateFallsBackToKwargsWhenNoEC pins the per-entry "no
+// EC" decision: an entry whose encoder returned no descriptor falls back to
+// kwargs_data regardless of whether the render supplied metadata, and
+// mm_metadata[i] is null.
+func TestPrefillStep_GenerateFallsBackToKwargsWhenNoEC(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-xyz"},
+		})
+	}))
+	defer server.Close()
+
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		"use_openai_format": false,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-no-ec",
+		Model:     "llama-3",
+		TokenIDs:  []int{1, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: testKwargsA, MMMetadata: testMetadataA, Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 2}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	features, ok := prefillBody["features"].(map[string]any)
+	if !ok {
+		t.Fatal("expected features in prefill request")
+	}
+
+	kw, ok := features["kwargs_data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected kwargs_data present, got %T", features["kwargs_data"])
+	}
+	kwItems, _ := kw[string(reqcommon.ModalityImage)].([]any)
+	if len(kwItems) != 1 || kwItems[0] != testKwargsA {
+		t.Fatalf("expected kwargs_data.image=[%q], got %#v", testKwargsA, kwItems)
+	}
+
+	md, ok := features["mm_metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mm_metadata present (with null entry), got %T", features["mm_metadata"])
+	}
+	mdItems, _ := md[string(reqcommon.ModalityImage)].([]any)
+	if len(mdItems) != 1 || mdItems[0] != nil {
+		t.Fatalf("expected mm_metadata.image=[null], got %#v", mdItems)
+	}
+}
+
+// TestPrefillStep_GeneratePartialECCoverage_SplitsPerEntry covers the partial
+// EC coverage case: one encode sub-request returned a descriptor for hash-a
+// but not for hash-b (nixlEC.MergeEncodeResponse logs a warning and continues
+// rather than failing on a missing descriptor). Per entry, hash-a ships
+// mm_metadata with a null kwargs_data slot, and hash-b ships kwargs_data with
+// a null mm_metadata slot. Both fields are present so vLLM's per-item zip
+// merge (merge_mm_kwargs_items) reconstructs each entry from the side that
+// carries data.
+func TestPrefillStep_GeneratePartialECCoverage_SplitsPerEntry(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-xyz"},
+		})
+	}))
+	defer server.Close()
+
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		"use_openai_format": false,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-partial",
+		Model:     "llama-3",
+		TokenIDs:  []int{1, 32000, 32000, 32000, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: testKwargsA, MMMetadata: testMetadataA, Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 3}},
+			{Modality: reqcommon.ModalityImage, Hash: "hash-b", KwargsData: testKwargsB, MMMetadata: testMetadataB, Placeholder: pipeline.PlaceholderRange{Offset: 4, Length: 3}},
+		},
+		// A is covered, B is not: encode returned a descriptor for A only.
+		ECTransferParams: []map[string]any{
+			{"hash-a": map[string]any{"peer_port": 5501, "size_bytes": 1228800}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	features, ok := prefillBody["features"].(map[string]any)
+	if !ok {
+		t.Fatal("expected features in prefill request")
+	}
+
+	kw, _ := features["kwargs_data"].(map[string]any)[string(reqcommon.ModalityImage)].([]any)
+	if len(kw) != 2 {
+		t.Fatalf("expected 2 kwargs_data entries, got %d", len(kw))
+	}
+	if kw[0] != nil {
+		t.Errorf("kwargs_data[0] = %#v, want null (covered by EC+metadata)", kw[0])
+	}
+	if kw[1] != testKwargsB {
+		t.Errorf("kwargs_data[1] = %#v, want %q (no EC coverage)", kw[1], testKwargsB)
+	}
+
+	md, _ := features["mm_metadata"].(map[string]any)[string(reqcommon.ModalityImage)].([]any)
+	if len(md) != 2 {
+		t.Fatalf("expected 2 mm_metadata entries, got %d", len(md))
+	}
+	if md[0] != testMetadataA {
+		t.Errorf("mm_metadata[0] = %#v, want %q", md[0], testMetadataA)
+	}
+	if md[1] != nil {
+		t.Errorf("mm_metadata[1] = %#v, want null (no EC coverage)", md[1])
+	}
+}
+
+func TestPrefillStep_CompletionsFormat(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reqcommon.PathCompletions {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get(reqcommon.EPPProfileHeaderKey) != gateway.PhasePrefill {
+			t.Fatalf("expected x-llm-d-epp-profile: prefill, got %q", r.Header.Get(reqcommon.EPPProfileHeaderKey))
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-1", "peer_host": "10.0.0.5", "peer_port": 6001},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:         "req-compl",
+		OriginalPath:      reqcommon.PathCompletions,
+		Model:             "test-model",
+		TokenIDs:          []int{1, 2345, 6789},
+		MultimodalEntries: nil,
+		KVTransferParams:  make(map[string]any),
+	}
+
+	err = step.Execute(context.Background(), reqCtx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := prefillBody["token_ids"]; ok {
+		t.Fatal("completions format should not have token_ids field")
+	}
+	prompt, ok := prefillBody["prompt"].([]any)
+	if !ok || len(prompt) != 3 {
+		t.Fatalf("expected prompt with 3 token_ids, got %v", prefillBody["prompt"])
+	}
+	if prefillBody["request_id"] != "req-compl" {
+		t.Fatalf("expected request_id, got %v", prefillBody["request_id"])
+	}
+	// The request body is built from RequestContext, so this guards against the branch
+	// starting to forward client limits.
+	if prefillBody["max_tokens"] != float64(1) {
+		t.Fatalf("expected max_tokens=1, got %v", prefillBody["max_tokens"])
+	}
+	if _, ok := prefillBody["min_tokens"]; ok {
+		t.Fatalf("expected min_tokens to be stripped, got %v", prefillBody["min_tokens"])
+	}
+	// The legacy Completions API does not define max_completion_tokens.
+	if _, ok := prefillBody["max_completion_tokens"]; ok {
+		t.Fatalf("completions request carries max_completion_tokens=%v", prefillBody["max_completion_tokens"])
+	}
+	// Completions format has top-level kv_transfer_params
+	kvParams, ok := prefillBody["kv_transfer_params"].(map[string]any)
+	if !ok {
+		t.Fatal("expected kv_transfer_params in completions format")
+	}
+	if kvParams["do_remote_decode"] != true {
+		t.Fatalf("expected do_remote_decode=true, got %v", kvParams["do_remote_decode"])
+	}
+}
+
+func TestPrefillStep_CompletionsFormat_NoRenderedTokens(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-1", "peer_host": "10.0.0.5", "peer_port": 6001},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:        "req-compl",
+		OriginalPath:     reqcommon.PathCompletions,
+		Model:            "test-model",
+		TokenIDs:         nil,
+		Body:             map[string]any{"prompt": "Hello"},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["prompt"] != "Hello" {
+		t.Fatalf("expected original prompt to pass through, got %v", prefillBody["prompt"])
+	}
+}
+
+// A declared Content-Length longer than the 503 body cuts the TRACE pre-read
+// short; the step must still report the 503.
+func TestPrefillStep_UpstreamStatusSurvivesInterruptedTraceRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":"overloaded`)
+	}))
+	defer server.Close()
+
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqCtx := &pipeline.RequestContext{
+		RequestID:        "req-trace",
+		OriginalPath:     reqcommon.PathCompletions,
+		Model:            "test-model",
+		Body:             map[string]any{"prompt": "Hello"},
+		KVTransferParams: make(map[string]any),
+	}
+
+	logger := funcr.NewJSON(func(string) {}, funcr.Options{Verbosity: logutil.TRACE})
+	err = step.Execute(log.IntoContext(context.Background(), logger), reqCtx)
+	var upstream *pipeline.UpstreamError
+	if !errors.As(err, &upstream) || upstream.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected UpstreamError 503, got %v", err)
+	}
+}
+
+func TestPrefillStep_ChatCompletionsFormat(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reqcommon.PathChatCompletions {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get(reqcommon.EPPProfileHeaderKey) != gateway.PhasePrefill {
+			t.Fatalf("expected x-llm-d-epp-profile: prefill, got %q", r.Header.Get(reqcommon.EPPProfileHeaderKey))
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-2", "peer_host": "10.0.0.5", "peer_port": 6001},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{
+		ParamECConnector: ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-chat",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        "test-model",
+		TokenIDs:     []int{1, 32000, 32000, 32000, 2345},
+		Body: map[string]any{
+			"model":  "test-model",
+			"stream": false,
+			"messages": []any{
+				map[string]any{"role": "user", "content": "hello"},
+			},
+		},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: "dGVuc29y", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 3}},
+		},
+		ECTransferParams: []map[string]any{
+			{"hash-a": map[string]any{"peer_port": 5501, "size_bytes": 1228800, "nixl_agent_metadata_b64": "bml4..."}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	err = step.Execute(context.Background(), reqCtx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["model"] != "test-model" {
+		t.Fatalf("expected model from original body, got %v", prefillBody["model"])
+	}
+	if _, ok := prefillBody["messages"]; !ok {
+		t.Fatal("expected messages from original body in chat format")
+	}
+
+	// Verify no tokens field (dead field, never consumed downstream)
+	if _, ok := prefillBody["tokens"]; ok {
+		t.Fatal("chat format should not have a tokens field")
+	}
+
+	// Verify ec_transfer_params is forwarded in chat format
+	ecParams, ok := prefillBody["ec_transfer_params"].(map[string]any)
+	if !ok {
+		t.Fatal("expected ec_transfer_params in chat format prefill body")
+	}
+	ecEntry, ok := ecParams["hash-a"].(map[string]any)
+	if !ok || len(ecEntry) == 0 {
+		t.Errorf("ec_transfer_params[hash-a] missing or empty: %v", ecParams["hash-a"])
+	}
+
+	// Verify top-level kv_transfer_params
+	if _, ok := prefillBody["kv_transfer_params"]; !ok {
+		t.Fatal("expected kv_transfer_params in chat format")
+	}
+	// Verify no top-level token_ids
+	if _, ok := prefillBody["token_ids"]; ok {
+		t.Fatal("chat format should not have top-level token_ids")
+	}
+	if _, ok := prefillBody["request_id"]; ok {
+		t.Fatal("chat format should not have request_id (uses original body)")
+	}
+}
+
+func TestPrefillStep_ResponsesFormat(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reqcommon.PathResponses {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-3"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{
+		ParamECConnector: ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-responses",
+		OriginalPath: reqcommon.PathResponses,
+		Model:        "test-model",
+		TokenIDs:     []int{1, 2345},
+		Body: map[string]any{
+			"model":             "test-model",
+			"input":             "hello",
+			"max_output_tokens": 800,
+			"store":             true,
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	err = step.Execute(context.Background(), reqCtx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["model"] != "test-model" {
+		t.Fatalf("expected model from original body, got %v", prefillBody["model"])
+	}
+	if _, ok := prefillBody["input"]; !ok {
+		t.Fatal("expected input from original body in responses format")
+	}
+	// Verify no tokens field (dead field, never consumed downstream)
+	if _, ok := prefillBody["tokens"]; ok {
+		t.Fatal("prefill request should not have a tokens field")
+	}
+	if _, ok := prefillBody["kv_transfer_params"]; !ok {
+		t.Fatal("expected kv_transfer_params in responses format")
+	}
+	// The Responses API caps output on max_output_tokens, so the client value
+	// is rewritten rather than left to run the prefiller to completion.
+	if prefillBody["max_output_tokens"] != float64(1) {
+		t.Fatalf("expected max_output_tokens=1, got %v", prefillBody["max_output_tokens"])
+	}
+	// store defaults to true in the Responses schema, so a prefill step that
+	// forwarded it would ask a store-enabled worker to retain its output.
+	if prefillBody["store"] != false {
+		t.Fatalf("expected store=false, got %v", prefillBody["store"])
+	}
+	// The Responses API defines neither field, so capping them would put an
+	// unknown field on the wire.
+	if _, ok := prefillBody["max_tokens"]; ok {
+		t.Fatalf("responses request carries max_tokens=%v", prefillBody["max_tokens"])
+	}
+	if _, ok := prefillBody["max_completion_tokens"]; ok {
+		t.Fatalf("responses request carries max_completion_tokens=%v", prefillBody["max_completion_tokens"])
+	}
+}
+
+func TestPrefillStep_MessagesFormat(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reqcommon.PathMessages {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-4"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{
+		ParamKVConnector: kv.NIXL,
+		ParamECConnector: ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-messages",
+		OriginalPath: reqcommon.PathMessages,
+		Model:        "test-model",
+		Body: map[string]any{
+			"model":      "test-model",
+			"max_tokens": 800,
+			"stream":     true,
+			"thinking":   map[string]any{"type": "enabled", "budget_tokens": 512},
+			"messages":   []any{map[string]any{"role": "user", "content": "hello"}},
+		},
+		ECTransferParams: []map[string]any{{"hash-x": map[string]any{"peer_host": "10.0.0.1"}}},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := prefillBody["messages"].([]any); !ok {
+		t.Fatal("expected the client's messages array in the prefill body")
+	}
+	if prefillBody["max_tokens"] != float64(1) {
+		t.Fatalf("expected max_tokens=1, got %v", prefillBody["max_tokens"])
+	}
+	if prefillBody["stream"] != false {
+		t.Fatalf("expected stream=false, got %v", prefillBody["stream"])
+	}
+	// The Messages API defines no max_completion_tokens, so capping it would put
+	// an unknown field on the wire.
+	if _, ok := prefillBody["max_completion_tokens"]; ok {
+		t.Fatalf("messages request carries max_completion_tokens=%v", prefillBody["max_completion_tokens"])
+	}
+	// vLLM rejects thinking.budget_tokens >= max_tokens unless the request is a
+	// remote-decode prefill, so the prefill keeps the client's thinking only
+	// alongside do_remote_decode.
+	kvParams, ok := prefillBody["kv_transfer_params"].(map[string]any)
+	if !ok || kvParams["do_remote_decode"] != true {
+		t.Fatalf("expected kv_transfer_params with do_remote_decode=true, got %v", prefillBody["kv_transfer_params"])
+	}
+	if _, ok := prefillBody["ec_transfer_params"]; !ok {
+		t.Fatal("expected ec_transfer_params in the prefill body")
+	}
+	if reqCtx.KVTransferParams["block_id"] != "block-4" {
+		t.Fatalf("expected the prefill response's kv_transfer_params kept, got %v", reqCtx.KVTransferParams)
+	}
+}
+
+func TestPrefillStep_ChatCompletionsFormat_ForcesNonStreaming(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reqcommon.PathChatCompletions {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get(reqcommon.EPPProfileHeaderKey) != gateway.PhasePrefill {
+			t.Fatalf("expected x-llm-d-epp-profile: prefill, got %q", r.Header.Get(reqcommon.EPPProfileHeaderKey))
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-3"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-chat-stream",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        "test-model",
+		Body: map[string]any{
+			"model":          "test-model",
+			"stream":         true,
+			"stream_options": map[string]any{"include_usage": true},
+			"messages": []any{
+				map[string]any{"role": "user", "content": "hello"},
+			},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["stream"] != false {
+		t.Fatalf("expected prefill request to force stream=false, got %v", prefillBody["stream"])
+	}
+	if _, ok := prefillBody["stream_options"]; ok {
+		t.Fatalf("expected stream_options to be stripped from prefill request, got %v", prefillBody["stream_options"])
+	}
+}
+
+// TestPrefillStep_ChatCompletionsFormat_CapsMaxCompletionTokens is a
+// regression test: buildPrefillBody used to clone the client's body and only
+// overwrite max_tokens, so a client-supplied max_completion_tokens survived
+// at its original, uncapped value alongside the newly-capped max_tokens=1.
+func TestPrefillStep_ChatCompletionsFormat_CapsMaxCompletionTokens(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-4"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-chat-max-completion-tokens",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        "test-model",
+		Body: map[string]any{
+			"model":                 "test-model",
+			"max_completion_tokens": 100,
+			"messages": []any{
+				map[string]any{"role": "user", "content": "hello"},
+			},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["max_tokens"] != float64(1) {
+		t.Fatalf("expected prefill request max_tokens=1, got %v", prefillBody["max_tokens"])
+	}
+	if prefillBody["max_completion_tokens"] != float64(1) {
+		t.Fatalf("expected prefill request max_completion_tokens capped to 1, got %v", prefillBody["max_completion_tokens"])
+	}
+}
+
+// TestPrefillStep_ChatCompletionsFormat_StripsClientMinTokens covers the one
+// coordinator path where a client-supplied min_tokens reaches the capped body:
+// chat-completions clones reqCtx.Body, while the generate and completions requests
+// build fresh bodies that never carry it. reqcommon.CapSingleToken documents why
+// min_tokens is stripped.
+func TestPrefillStep_ChatCompletionsFormat_StripsClientMinTokens(t *testing.T) {
+	var prefillBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &prefillBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kv_transfer_params": map[string]any{"block_id": "block-5"},
+		})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-chat-min-tokens",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        "test-model",
+		Body: map[string]any{
+			"model":      "test-model",
+			"min_tokens": 50,
+			"max_tokens": 200,
+			"messages": []any{
+				map[string]any{"role": "user", "content": "hello"},
+			},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if prefillBody["max_tokens"] != float64(1) {
+		t.Fatalf("expected prefill request max_tokens=1, got %v", prefillBody["max_tokens"])
+	}
+	if _, ok := prefillBody["min_tokens"]; ok {
+		t.Fatalf("expected client min_tokens to be stripped, got %v", prefillBody["min_tokens"])
+	}
+}
+
+// TestSharedStorage_OmitsECTransferParams_InPrefillBody verifies that the
+// ec-shared-storage EC connector never emits an ec_transfer_params field on
+// the prefill body, in every prefill wire format (chat-completions,
+// completions, generate). A regression that set the field unconditionally
+// would send "ec_transfer_params": null and silently break ec-shared-storage
+// deployments, where the consumer reads embeddings from shared storage.
+func TestSharedStorage_OmitsECTransferParams_InPrefillBody(t *testing.T) {
+	cases := []struct {
+		name         string
+		useOpenAI    bool
+		originalPath string
+		body         map[string]any
+	}{
+		{
+			name:         "ChatCompletions",
+			useOpenAI:    true,
+			originalPath: reqcommon.PathChatCompletions,
+			body: map[string]any{
+				"model":    "m",
+				"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			},
+		},
+		{name: "Completions", useOpenAI: true, originalPath: reqcommon.PathCompletions},
+		{name: "Generate", useOpenAI: false, originalPath: reqcommon.PathChatCompletions},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ = io.ReadAll(r.Body)
+				_ = json.NewEncoder(w).Encode(map[string]any{"kv_transfer_params": map[string]any{}})
+			}))
+			defer server.Close()
+
+			step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+				"use_openai_format": tc.useOpenAI,
+				ParamECConnector:    ec.SharedStorage,
+			})
+			if err != nil {
+				t.Fatalf("NewPrefillStep: %v", err)
+			}
+
+			reqCtx := &pipeline.RequestContext{
+				RequestID:        "req",
+				OriginalPath:     tc.originalPath,
+				Model:            "m",
+				TokenIDs:         []int{1, 2, 3},
+				Body:             tc.body,
+				KVTransferParams: make(map[string]any),
+			}
+			if err := step.Execute(context.Background(), reqCtx); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			var parsed map[string]any
+			if err := json.Unmarshal(raw, &parsed); err != nil {
+				t.Fatalf("unmarshal prefill body: %v", err)
+			}
+			if _, ok := parsed["ec_transfer_params"]; ok {
+				t.Errorf("ec-shared-storage must not set ec_transfer_params; body=%s", raw)
+			}
+		})
+	}
+}
+
+// TestPrefillStep_ConflictingECParams_RejectsRequest verifies the load-bearing
+// "reject the request" contract end to end: when two encode responses carry
+// conflicting descriptors for the same mm_hash, PrefillStep.Execute must fail
+// and never reach the gateway. The unit-level conflict test
+// (TestNIXL_MergeAndPrepare_DuplicateHashes_Conflict) covers the connector in
+// isolation; this confirms the error propagates through the step boundary.
+func TestPrefillStep_ConflictingECParams_RejectsRequest(t *testing.T) {
+	gatewayHit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatewayHit = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"kv_transfer_params": map[string]any{}})
+	}))
+	defer server.Close()
+
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		"use_openai_format": false,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-conflict",
+		Model:     "test-model",
+		TokenIDs:  []int{1, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 1}},
+		},
+		ECTransferParams: []map[string]any{
+			{"hash-a": map[string]any{"peer_port": 5501}},
+			{"hash-a": map[string]any{"peer_port": 5599}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err == nil {
+		t.Fatal("expected Execute to fail on conflicting ec_transfer_params descriptors")
+	}
+	if gatewayHit {
+		t.Error("conflicting descriptors must reject the request before contacting the gateway")
+	}
+}
+
+// TestPrefillStep_CapturesPeerTopologyHeader verifies that the x-llm-d-peer-topology
+// response header set by the prefill EPP's topology-stamp-handler is captured
+// into reqCtx.PeerTopology for later forwarding to the decode request.
+func TestPrefillStep_CapturesPeerTopologyHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(reqcommon.PeerTopologyHeaderKey, "host=node12,zone=us-east1-a")
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+
+	step, err := NewPrefillStep(gwClient, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:        "req-1",
+		Model:            "test",
+		OriginalPath:     reqcommon.PathVLLMGenerate,
+		TokenIDs:         []int{1, 2345},
+		KVTransferParams: make(map[string]any),
+	}
+
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := reqCtx.PeerTopology, "host=node12,zone=us-east1-a"; got != want {
+		t.Fatalf("reqCtx.PeerTopology = %q, want %q", got, want)
+	}
+}
+
+func TestPrefillStep_GatewayError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("overloaded"))
+	}))
+	defer server.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: server.URL})
+
+	step, _ := NewPrefillStep(gwClient, map[string]any{})
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-1",
+		Model:        "test",
+		OriginalPath: reqcommon.PathVLLMGenerate,
+		TokenIDs:     []int{1, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "h1", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 1}},
+		},
+		ECTransferParams: []map[string]any{
+			{"h1": map[string]any{"peer_port": 5501, "size_bytes": 1228800, "nixl_agent_metadata_b64": "bml4..."}},
+		},
+		KVTransferParams: make(map[string]any),
+	}
+
+	err := step.Execute(context.Background(), reqCtx)
+	if err == nil {
+		t.Fatal("expected error for 503 response")
+	}
+}
+
+func TestPrefillStep_UnsupportedFormat(t *testing.T) {
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{}), map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:        "req-1",
+		Model:            "test",
+		Body:             map[string]any{},
+		KVTransferParams: make(map[string]any),
+	}
+
+	body, err := step.(*PrefillStep).buildPrefillBody(context.Background(), reqCtx, reqcommon.APIType(99))
+	if err == nil {
+		t.Fatalf("expected error for unsupported format, got body %v", body)
+	}
+	if want := "unsupported request format APIType(99): no coordinator route serves it"; err.Error() != want {
+		t.Fatalf("expected error %q, got %q", want, err.Error())
+	}
+}
+
+// TestPrefillStep_CoercesInvalidKVTransferParams verifies that a prefill
+// response whose kv_transfer_params is not a usable JSON object (non-object
+// type, explicit null, empty object, or absent) is coerced to no transfer
+// params rather than failing the prefill step, mirroring the EC NIXL
+// connector's ecParamsFromResponse. Each case must succeed and leave
+// KVTransferParams empty.
+//
+// For the kv-nixl connector a missing handshake is also surfaced with a
+// warning, because decode will recompute the whole prompt. The
+// kv-shared-storage connector returns no params by design, so no warning is
+// expected there.
+func TestPrefillStep_CoercesInvalidKVTransferParams(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     map[string]any
+		kvConn   string
+		wantWarn bool
+	}{
+		{name: "NonObjectString", body: map[string]any{"kv_transfer_params": "not-an-object"}, kvConn: kv.NIXL, wantWarn: true},
+		{name: "NonObjectArray", body: map[string]any{"kv_transfer_params": []any{1, 2}}, kvConn: kv.NIXL, wantWarn: true},
+		{name: "ExplicitNull", body: map[string]any{"kv_transfer_params": nil}, kvConn: kv.NIXL, wantWarn: true},
+		{name: "EmptyObject", body: map[string]any{"kv_transfer_params": map[string]any{}}, kvConn: kv.NIXL, wantWarn: true},
+		{name: "FieldAbsent", body: map[string]any{"other": "field"}, kvConn: kv.NIXL, wantWarn: true},
+		{name: "SharedStorageNull", body: map[string]any{"kv_transfer_params": nil}, kvConn: kv.SharedStorage, wantWarn: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(tc.body)
+			}))
+			defer server.Close()
+
+			step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+				"use_openai_format": false,
+				ParamKVConnector:    tc.kvConn,
+				ParamECConnector:    ec.NIXL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			sink := &logCaptureSink{}
+			ctx := log.IntoContext(context.Background(), logr.New(sink))
+
+			reqCtx := &pipeline.RequestContext{
+				RequestID:        "req-1",
+				Model:            "test-model",
+				TokenIDs:         []int{1, 2345},
+				KVTransferParams: make(map[string]any),
+			}
+
+			if err := step.Execute(ctx, reqCtx); err != nil {
+				t.Fatalf("invalid kv_transfer_params should be coerced, not fail the prefill: %v", err)
+			}
+			if len(reqCtx.KVTransferParams) != 0 {
+				t.Fatalf("expected no kv_transfer_params recorded, got %v", reqCtx.KVTransferParams)
+			}
+			gotWarn := countLogMsgs(sink.infos, "prefill returned no kv_transfer_params")
+			if tc.wantWarn && gotWarn == 0 {
+				t.Fatalf("expected a warning log for missing kv_transfer_params with %s, infos=%v", tc.kvConn, sink.infos)
+			}
+			if !tc.wantWarn && gotWarn > 0 {
+				t.Fatalf("did not expect a warning log for %s, infos=%v", tc.kvConn, sink.infos)
+			}
+		})
+	}
+}
+
+func TestPrefillStep_DebugRequestRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"kv_transfer_params": nil})
+	}))
+	defer server.Close()
+
+	step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		"use_openai_format": false,
+		ParamKVConnector:    kv.SharedStorage,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger, records := captureLogger(logutil.DEBUG)
+	reqCtx := &pipeline.RequestContext{
+		RequestID:        "req-1",
+		Model:            "test-model",
+		TokenIDs:         []int{1, 2345},
+		KVTransferParams: make(map[string]any),
+		OriginalHeaders:  http.Header{"Authorization": {"Bearer secret"}},
+	}
+	if err := step.Execute(log.IntoContext(context.Background(), logger), reqCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{
+		`"msg"="request body"`,
+		`"path"="` + reqcommon.PathVLLMGenerate + `"`,
+		`"bodyLen"=`,
+		`"authorization"="[REDACTED]"`,
+		`"x-request-id"="req-1"`,
+	}
+	if got := countRecords(records(), want...); got != 1 {
+		t.Errorf("%d records contain %v, want 1, records=%v", got, want, records())
+	}
+	if got := countRecords(records(), "Bearer secret"); got != 0 {
+		t.Errorf("%d records contain the authorization value, want 0, records=%v", got, records())
+	}
+}
+
+// countLogMsgs counts the captured info lines whose message contains substr.
+func countLogMsgs(infos []capturedLog, substr string) int {
+	n := 0
+	for _, c := range infos {
+		if strings.Contains(c.msg, substr) {
+			n++
+		}
+	}
+	return n
+}

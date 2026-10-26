@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,12 @@ import "testing"
 //
 // When the fixtures in test/e2e/configs_test.go are updated, mirror them here.
 var e2eConfigsForSmoke = map[string]string{
-	"simpleConfig": `apiVersion: llm-d.ai/v1alpha1
+	"simpleConfig": `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: decode-filter
@@ -40,46 +40,13 @@ schedulingProfiles:
   - pluginRef: prefix-cache-scorer
     weight: 2
 `,
-	"deprecatedPdConfig": `apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- type: prefill-header-handler
-- type: approx-prefix-cache-producer
-  parameters:
-    blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
-    lruCapacityPerServer: 256
-- type: prefix-cache-scorer
-- type: prefill-filter
-- type: decode-filter
-- type: max-score-picker
-- type: prefix-based-pd-decider
-  parameters:
-    nonCachedTokens: 16
-- type: pd-profile-handler
-  parameters:
-    deciderPluginName: prefix-based-pd-decider
-schedulingProfiles:
-- name: prefill
-  plugins:
-  - pluginRef: prefill-filter
-  - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
-    weight: 2
-- name: decode
-  plugins:
-  - pluginRef: decode-filter
-  - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
-    weight: 2
-`,
-	"pdConfig": `apiVersion: llm-d.ai/v1alpha1
+	"pdConfig": `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: prefill-filter
@@ -106,7 +73,88 @@ schedulingProfiles:
   - pluginRef: prefix-cache-scorer
     weight: 2
 `,
-	"epdConfig": `apiVersion: llm-d.ai/v1alpha1
+	"pdTopologyConfig": `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: approx-prefix-cache-producer
+  parameters:
+    maxPrefixTokensToMatch: 16384
+    lruCapacityPerServer: 31250
+- type: prefix-cache-scorer
+- type: queue-scorer
+- type: prefill-filter
+- type: decode-filter
+- type: max-score-picker
+- type: topology-extractor
+- type: topology-affinity-filter
+- type: topology-affinity-scorer
+- type: disagg-profile-handler
+  parameters:
+    deciders:
+      prefill: prefix-based-pd-decider
+- type: prefix-based-pd-decider
+  parameters:
+    nonCachedTokens: 16
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: topology-affinity-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 1
+  - pluginRef: topology-affinity-scorer
+    weight: 1
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 1
+`,
+	"coordinatorPrefillTopologyConfig": `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: prefill-filter
+- type: max-score-picker
+- type: topology-extractor
+- type: topology-stamp-handler
+  parameters:
+    profileName: default
+- type: single-profile-handler
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: max-score-picker
+`,
+	"coordinatorDecodeTopologyConfig": `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: decode-filter
+- type: max-score-picker
+- type: topology-extractor
+- type: topology-affinity-filter
+  parameters:
+    peerTopologyHeader: x-llm-d-peer-topology
+- type: topology-affinity-scorer
+  parameters:
+    peerTopologyHeader: x-llm-d-peer-topology
+- type: single-profile-handler
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: topology-affinity-filter
+  - pluginRef: max-score-picker
+  - pluginRef: topology-affinity-scorer
+    weight: 1
+`,
+	"epdConfig": `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: encode-filter
@@ -115,7 +163,7 @@ plugins:
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: max-score-picker
@@ -145,12 +193,41 @@ schedulingProfiles:
   - pluginRef: prefix-cache-scorer
     weight: 2
 `,
-	"decodeOnlyConfig": `apiVersion: llm-d.ai/v1alpha1
+	// Regression test for #1471: a precise-prefix-cache-producer paired with
+	// an explicit vllm-backed token-producer must load cleanly through the full
+	// runner path, which is where ValidateAndOrderDataDependencies runs Level-2
+	// attribute validation (after auto-defaults, order-independent). The mirror
+	// case (no token-producer or estimate-backed) is covered by the unit test
+	// TestTokenProducerDependencyValidation in the preciseprefixcache producer package.
+	"preciseConfigWithVLLMTokenProducer": `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: token-producer
+  parameters:
+    modelName: test-model
+    vllm:
+      url: http://localhost:9999
+- type: precise-prefix-cache-producer
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: precise-prefix-cache-producer
+- type: decode-filter
+- type: max-score-picker
+- type: single-profile-handler
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+`,
+	"decodeOnlyConfig": `apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: encode-filter
@@ -165,6 +242,58 @@ schedulingProfiles:
   - pluginRef: max-score-picker
   - pluginRef: prefix-cache-scorer
     weight: 2
+`,
+	"gpuUtilConfig": `apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: dcgm-data-source
+  name: dcgm-source
+  parameters:
+    port: 9400
+- type: dcgm-extractor
+  name: dcgm-extractor
+- type: endpoint-attribute-filter
+  name: gpu-utilization-filter
+  parameters:
+    attribute: "GPUUtilization"
+    producer: "dcgm-extractor"
+    onMissing: "Pass"
+    fallbackOnEmpty: true
+    algorithm:
+      type: "threshold"
+      threshold:
+        operator: "LessThanOrEqual"
+        value: 0.90
+- type: endpoint-attribute-scorer
+  name: gpu-utilization-scorer
+  parameters:
+    attributeKey: "GPUUtilization"
+    producer: "dcgm-extractor"
+    algorithm:
+      type: "linear_lower_is_better"
+      normalization:
+        fixedRange:
+          min: 0.0
+          max: 1.0
+- type: kv-cache-utilization-scorer
+- type: max-score-picker
+- type: single-profile-handler
+- type: decode-filter
+dataLayer:
+  sources:
+  - pluginRef: dcgm-source
+    extractors:
+    - pluginRef: dcgm-extractor
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: gpu-utilization-filter
+  - pluginRef: gpu-utilization-scorer
+    weight: 2.0
+  - pluginRef: kv-cache-utilization-scorer
+    weight: 1.0
+  - pluginRef: max-score-picker
 `,
 }
 

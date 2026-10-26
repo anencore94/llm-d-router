@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package http
 
 import (
@@ -128,7 +144,7 @@ func TestDispatch_ExtractorFailure_ReturnsNil(t *testing.T) {
 	require.NoError(t, s.Dispatch(context.Background(), newTestEndpoint()),
 		"extractor failure must not surface as a returned error")
 	assert.Equal(t, float64(1), extDelta(t, src, ext, before),
-		"extractor failure must record one DataLayerExtractErrorsTotal increment")
+		"extractor failure must record one LlmdDataLayerExtractErrorsTotal increment")
 }
 
 func TestDispatch_ExtractorFailure_LabelsBothSrcAndExt(t *testing.T) {
@@ -211,6 +227,71 @@ func (c *cancelOnExtract) Extract(ctx context.Context, in fwkdl.PollInput[int]) 
 	err := c.stub.Extract(ctx, in)
 	c.cancel()
 	return err
+}
+
+func TestGetEndpoint_PortOverride(t *testing.T) {
+	parser := func(r io.Reader) (int, error) { return 0, nil }
+	ep := &fwkdl.EndpointMetadata{
+		Address:     "10.0.0.1",
+		NodeAddress: "192.168.1.10",
+		MetricsHost: "10.0.0.1:8000",
+	}
+
+	cases := []struct {
+		name     string
+		opts     []Option
+		wantHost string
+	}{
+		{
+			name:     "no option uses MetricsHost as-is",
+			opts:     nil,
+			wantHost: "10.0.0.1:8000",
+		},
+		{
+			name:     "WithPortOverride overrides port with pod IP",
+			opts:     []Option{WithPortOverride(9400)},
+			wantHost: "10.0.0.1:9400",
+		},
+		{
+			name:     "WithUseNodeAddress scrapes node IP with port override",
+			opts:     []Option{WithPortOverride(9400), WithUseNodeAddress()},
+			wantHost: "192.168.1.10:9400",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewHTTPDataSource("http", "/metrics", TLSOptions{SkipVerify: true}, "test", "test", parser, tc.opts...)
+			assert.NoError(t, err)
+			got := s.getEndpoint(ep)
+			assert.Equal(t, tc.wantHost, got.Host)
+			assert.Equal(t, "http", got.Scheme)
+			assert.Equal(t, "/metrics", got.Path)
+		})
+	}
+}
+
+func TestNewHTTPDataSource_UseNodeAddressWithoutPortOverride(t *testing.T) {
+	parser := func(r io.Reader) (int, error) { return 0, nil }
+	_, err := NewHTTPDataSource("http", "/metrics", TLSOptions{SkipVerify: true}, "test", "test", parser,
+		WithUseNodeAddress())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WithUseNodeAddress requires a non-zero WithPortOverride")
+}
+
+func TestGetEndpoint_UseNodeAddress_FallsBackToPodIP(t *testing.T) {
+	parser := func(r io.Reader) (int, error) { return 0, nil }
+	ep := &fwkdl.EndpointMetadata{
+		Address:     "10.0.0.1",
+		NodeAddress: "",
+		MetricsHost: "10.0.0.1:8000",
+	}
+	s, err := NewHTTPDataSource("http", "/metrics", TLSOptions{SkipVerify: true}, "test", "test", parser,
+		WithPortOverride(9400), WithUseNodeAddress())
+	require.NoError(t, err)
+	got := s.getEndpoint(ep)
+	assert.Equal(t, "10.0.0.1:9400", got.Host,
+		"empty NodeAddress must fall back to pod IP")
 }
 
 func TestAppendExtractor(t *testing.T) {

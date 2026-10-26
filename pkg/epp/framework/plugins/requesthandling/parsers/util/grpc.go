@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package grpcutil
+package parserutil
 
 import (
 	"encoding/binary"
@@ -42,8 +42,11 @@ func ParseGrpcPayload(data []byte) ([]byte, error) {
 	}
 	msgLen := binary.BigEndian.Uint32(data[1:5])
 
-	if uint32(len(data)) < gRPCPayloadHeaderLen+msgLen {
-		return nil, fmt.Errorf("incomplete gRPC payload: header indicates %d bytes, but only %d bytes are available", msgLen, uint32(len(data))-gRPCPayloadHeaderLen)
+	// Compare in uint64 so gRPCPayloadHeaderLen+msgLen cannot overflow when
+	// msgLen is near math.MaxUint32, which would wrap the check and let the
+	// slice below panic with an out-of-range low>high index.
+	if uint64(len(data)) < uint64(gRPCPayloadHeaderLen)+uint64(msgLen) {
+		return nil, fmt.Errorf("incomplete gRPC payload: header indicates %d bytes, but only %d bytes are available", msgLen, len(data)-gRPCPayloadHeaderLen)
 	}
 	return data[gRPCPayloadHeaderLen : gRPCPayloadHeaderLen+msgLen], nil
 }

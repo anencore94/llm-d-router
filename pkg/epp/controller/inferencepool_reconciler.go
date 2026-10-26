@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
@@ -36,7 +38,8 @@ import (
 // will have the proper controller that will create/manage objects on behalf of the server inferencePool.
 type InferencePoolReconciler struct {
 	client.Reader
-	Datastore datastore.Datastore
+	Datastore       datastore.Datastore
+	RunOnNonLeaders bool
 }
 
 func (c *InferencePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -72,7 +75,9 @@ func (c *InferencePoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (c *InferencePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	needLeaderElection := !c.RunOnNonLeaders
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.InferencePool{}).
+		WithOptions(controller.Options{NeedLeaderElection: &needLeaderElection}).
 		Complete(c)
 }

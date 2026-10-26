@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ import (
 
 func newEndpoint(name string, queueSize int, kvFraction float64) fwksched.Endpoint {
 	return fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: name}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: name}},
 		&fwkdl.Metrics{
 			WaitingQueueSize:    queueSize,
 			KVCacheUsagePercent: kvFraction,
@@ -93,6 +93,13 @@ func TestFactory_ZeroKVCacheUtilThreshold(t *testing.T) {
 	_, err := Factory("test", fwkplugin.StrictDecoder(json.RawMessage(`{"kvCacheUtilThreshold":0}`)), nil)
 	if err == nil {
 		t.Fatal("expected error for kvCacheUtilThreshold=0")
+	}
+}
+
+func TestFactory_KVCacheUtilThresholdAboveOne(t *testing.T) {
+	_, err := Factory("test", fwkplugin.StrictDecoder(json.RawMessage(`{"kvCacheUtilThreshold":1.5}`)), nil)
+	if err == nil {
+		t.Fatal("expected error for kvCacheUtilThreshold=1.5")
 	}
 }
 
@@ -163,7 +170,7 @@ func TestDroppableAdmittedAtZeroSaturation(t *testing.T) {
 
 func TestNilMetricsTreatedAsSaturated(t *testing.T) {
 	pod := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "stale"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "stale"}},
 		nil,
 		nil,
 	)

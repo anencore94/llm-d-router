@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,9 +36,10 @@ type Client interface {
 // Addressable supports getting an IP address and a namespaced name.
 type Addressable interface {
 	GetIPAddress() string
+	GetNodeAddress() string
 	GetPort() string
 	GetMetricsHost() string
-	GetNamespacedName() types.NamespacedName
+	GetID() types.NamespacedName
 }
 
 const (
@@ -59,6 +61,7 @@ var (
 	baseTransport = &http.Transport{
 		MaxIdleConns:        maxIdleConnections,
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		IdleConnTimeout:     maxIdleTime,
 		// TODO: set additional timeouts, transport options, etc.
 	}
 )
@@ -73,16 +76,16 @@ func (cl *client) Get(ctx context.Context, target *url.URL, ep Addressable,
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
-	resp, err := cl.Do(req)
+	resp, err := cl.Do(req) //#nosec -- target URL is constructed from operator endpoint metadata
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data from %s: %w", ep.GetNamespacedName(), err)
+		return nil, fmt.Errorf("failed to fetch data from %s: %w", ep.GetID(), err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code from %s: %v", ep.GetNamespacedName(), resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code from %s: %v", ep.GetID(), resp.StatusCode)
 	}
 
 	return parser(resp.Body)

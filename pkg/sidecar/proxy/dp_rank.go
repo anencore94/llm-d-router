@@ -18,16 +18,17 @@ package proxy
 
 import (
 	"encoding/binary"
+	"math"
 
 	"golang.org/x/crypto/blake2s"
 )
 
 // pickDPRank returns a deterministic DP rank for a request as
 // blake2s(requestID) mod dpSize. With dpSize > 1, vLLM's API servers share a
-// port via SO_REUSEPORT and the kernel may route a disagg pair's two legs to
-// different DP ranks; pinning both legs to the same rank keeps the MoRI-IO
-// handshake from addressing a peer that is not listening. dpSize <= 1 returns
-// 0 so single-DP deployments are unaffected.
+// port via SO_REUSEPORT and the kernel may route a disagg pair's prefill and
+// decode requests to different DP ranks; pinning both requests to the same rank
+// keeps the MoRI-IO handshake from addressing a peer that is not listening.
+// dpSize <= 1 returns 0 so single-DP deployments are unaffected.
 func pickDPRank(requestID string, dpSize int) int {
 	if dpSize <= 1 {
 		return 0
@@ -39,5 +40,57 @@ func pickDPRank(requestID string, dpSize int) int {
 	}
 	_, _ = h.Write([]byte(requestID))
 	sum := h.Sum(nil)
-	return int(binary.BigEndian.Uint64(sum[:8]) % uint64(dpSize))
+	// mod is bounded by dpSize, an int, so it always fits; the explicit
+	// check keeps the uint64 -> int conversion provably safe rather than
+	// relying on that invariant.
+	mod := binary.BigEndian.Uint64(sum[:8]) % uint64(dpSize)
+	if mod > uint64(math.MaxInt) {
+		return 0
+	}
+	return int(mod)
+}
+
+// pickDPRanks returns a deterministic global rank and its pod-local equivalent.
+func pickDPRanks(requestID string, dpSize, dpSizeLocal int) (global, local int) {
+	global = pickDPRank(requestID, dpSize)
+	return global, foldDPRankToLocal(global, dpSize, dpSizeLocal)
+}
+
+// foldDPRankToLocal converts a global DP rank to the range accepted by one
+// pod's API server. An unset local size preserves single-pod behavior.
+func foldDPRankToLocal(dpRank, dpSize, dpSizeLocal int) int {
+	if dpSizeLocal > 0 {
+		return dpRank % dpSizeLocal
+	}
+	if dpSize > 0 {
+		return dpRank % dpSize
+	}
+	return 0
+}
+
+// resolveDecodeDPRank prefers a valid prefill-returned global DP rank.
+// Missing or invalid values return a deterministic hash rank. The caller maps
+// that fallback to the selected prefill pod in multi-pod deployments.
+// usedReturned reports whether the prefill-provided rank was accepted.
+func resolveDecodeDPRank(prefillKV any, requestID string, dpSize int) (rank int, usedReturned bool) {
+	fallback := pickDPRank(requestID, dpSize)
+	if dpSize <= 1 {
+		// Single-DP: the rank is always 0 and the header is not set.
+		return fallback, false
+	}
+	pkv, ok := prefillKV.(map[string]any)
+	if !ok {
+		return fallback, false
+	}
+	rv, present := pkv[requestFieldRemoteDPRank]
+	if !present {
+		return fallback, false
+	}
+	if f, ok := rv.(float64); ok && f != math.Trunc(f) {
+		return fallback, false
+	}
+	if ri, ok := toInt(rv); ok && ri >= 0 && ri < dpSize {
+		return ri, true
+	}
+	return fallback, false
 }

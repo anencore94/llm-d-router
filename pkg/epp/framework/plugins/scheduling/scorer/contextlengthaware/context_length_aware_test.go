@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package contextlengthaware
 
 import (
@@ -5,15 +21,24 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/test/utils"
+)
+
+const (
+	testReusableTokensProducerName = "p2p-source"
+	testPrefillWorkRangeLabel      = "llm-d.ai/prefill-work-range"
 )
 
 // Helper functions
@@ -21,9 +46,9 @@ import (
 func createEndpoint(nsn k8stypes.NamespacedName, ipaddr string, labels map[string]string) scheduling.Endpoint {
 	return scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{
-			NamespacedName: nsn,
-			Address:        ipaddr,
-			Labels:         labels,
+			ID:      nsn,
+			Address: ipaddr,
+			Labels:  labels,
 		},
 		nil,
 		nil,
@@ -33,6 +58,17 @@ func createEndpoint(nsn k8stypes.NamespacedName, ipaddr string, labels map[strin
 func createRequest() *scheduling.InferenceRequest {
 	return &scheduling.InferenceRequest{
 		RequestID: "test-request",
+	}
+}
+
+func createHundredTokenRequest() *scheduling.InferenceRequest {
+	return &scheduling.InferenceRequest{
+		RequestID: "test-request",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, 100)}},
+			},
+		},
 	}
 }
 
@@ -54,6 +90,24 @@ func TestFactory(t *testing.T) {
 			pluginName: "empty-label",
 			jsonParams: `{"label": ""}`,
 			expectErr:  true,
+		},
+		{
+			name:       "reusable tokens producer with default label should error",
+			pluginName: "ctx-aware",
+			jsonParams: `{"reusableTokensProducerName": "p2p-source"}`,
+			expectErr:  true,
+		},
+		{
+			name:       "reusable tokens producer with explicit default label should error",
+			pluginName: "ctx-aware",
+			jsonParams: `{"label": "llm-d.ai/context-length-range", "reusableTokensProducerName": "p2p-source"}`,
+			expectErr:  true,
+		},
+		{
+			name:       "reusable tokens producer with work label",
+			pluginName: "ctx-aware",
+			jsonParams: `{"label": "llm-d.ai/prefill-work-range", "reusableTokensProducerName": "p2p-source"}`,
+			expectErr:  false,
 		},
 		{
 			name:       "malformed JSON should error",
@@ -80,6 +134,228 @@ func TestFactory(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConsumesReusableTokensOnlyWhenConfigured(t *testing.T) {
+	defaultPlugin := NewContextLengthAware("default", &contextLengthAwareParameters{
+		Label: DefaultContextLengthLabel,
+	})
+	defaultDependencies := defaultPlugin.Consumes()
+	require.Len(t, defaultDependencies.Required, 1)
+	assert.Contains(t, defaultDependencies.Required, tokenproducer.TokenizedPromptDataKey)
+
+	producerName := "session-p2p-source"
+	configuredPlugin := NewContextLengthAware("configured", &contextLengthAwareParameters{
+		Label:                      testPrefillWorkRangeLabel,
+		ReusableTokensProducerName: producerName,
+	})
+	configuredDependencies := configuredPlugin.Consumes()
+	require.Len(t, configuredDependencies.Required, 2)
+	expectedKey := attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName)
+	assert.Equal(t, attrprefix.ReusablePrefixTokens(0), configuredDependencies.Required[expectedKey])
+}
+
+func TestFactoryConfiguresReusableTokensProducer(t *testing.T) {
+	producerName := "session-p2p-source"
+	created, err := Factory("cache-aware", fwkplugin.StrictDecoder([]byte(
+		`{"label": "llm-d.ai/prefill-work-range", "reusableTokensProducerName": "session-p2p-source"}`)), nil)
+	require.NoError(t, err)
+	configured := created.(*ContextLengthAware)
+
+	assert.Equal(t, producerName, configured.reusableTokensProducerName)
+	expectedKey := attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName)
+	assert.Equal(t, expectedKey, configured.reusableTokensDataKey)
+	assert.Contains(t, configured.Consumes().Required, expectedKey)
+}
+
+func TestRoutingLengthSnapshotIgnoresLateReusableTokens(t *testing.T) {
+	producerName := testReusableTokensProducerName
+	plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+		Label:                      testPrefillWorkRangeLabel,
+		ReusableTokensProducerName: producerName,
+	})
+	request := createHundredTokenRequest()
+
+	assert.Equal(t, 100, plugin.getContextLength(request))
+	request.PutAttribute(
+		attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+		attrprefix.ReusablePrefixTokens(60),
+	)
+	assert.Equal(t, 100, plugin.getContextLength(request))
+
+	otherPlugin := NewContextLengthAware("other-cache-aware", &contextLengthAwareParameters{
+		Label:                      testPrefillWorkRangeLabel,
+		ReusableTokensProducerName: producerName,
+	})
+	assert.Equal(t, 40, otherPlugin.getContextLength(request))
+}
+
+// Filter and Score each receive a request confined to the plugin's
+// declarations, so the snapshot must survive that scope for both to agree.
+func TestRoutingLengthSnapshotSurvivesRequestScope(t *testing.T) {
+	producerName := testReusableTokensProducerName
+	plugin := NewContextLengthAware("scoped-cache-aware", &contextLengthAwareParameters{
+		Label:                      testPrefillWorkRangeLabel,
+		ReusableTokensProducerName: producerName,
+	})
+	datalayer.RegisterScopeSpecs([]fwkplugin.Plugin{plugin})
+	request := createHundredTokenRequest()
+
+	filterRequest, filterViolations := datalayer.ScopeRequest(logr.Discard(), "Filter", plugin, request)
+	assert.Equal(t, 100, plugin.getContextLength(filterRequest))
+	require.NoError(t, filterViolations.Write())
+
+	request.PutAttribute(
+		attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+		attrprefix.ReusablePrefixTokens(60),
+	)
+	scoreRequest, scoreViolations := datalayer.ScopeRequest(logr.Discard(), "Score", plugin, request)
+	assert.Equal(t, 100, plugin.getContextLength(scoreRequest))
+	require.NoError(t, scoreViolations.Write())
+}
+
+func TestReusableTokensFilter(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := []scheduling.Endpoint{
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "short"},
+			"10.0.0.1", map[string]string{testPrefillWorkRangeLabel: "1-50"}),
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "long"},
+			"10.0.0.2", map[string]string{testPrefillWorkRangeLabel: "51-100"}),
+	}
+
+	t.Run("disabled configuration keeps total length", func(t *testing.T) {
+		plugin := NewContextLengthAware("default", &contextLengthAwareParameters{
+			Label:           testPrefillWorkRangeLabel,
+			EnableFiltering: true,
+		})
+		request := createHundredTokenRequest()
+		request.PutAttribute(
+			attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(testReusableTokensProducerName),
+			attrprefix.ReusablePrefixTokens(60),
+		)
+
+		filtered := plugin.Filter(ctx, request, endpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "long", filtered[0].GetMetadata().ID.Name)
+	})
+
+	t.Run("configured producer subtracts reusable tokens", func(t *testing.T) {
+		producerName := testReusableTokensProducerName
+		plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+			Label:                      testPrefillWorkRangeLabel,
+			EnableFiltering:            true,
+			ReusableTokensProducerName: producerName,
+		})
+		request := createHundredTokenRequest()
+		request.PutAttribute(
+			attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+			attrprefix.ReusablePrefixTokens(60),
+		)
+
+		filtered := plugin.Filter(ctx, request, endpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "short", filtered[0].GetMetadata().ID.Name)
+	})
+
+	t.Run("missing runtime attribute keeps total length", func(t *testing.T) {
+		plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+			Label:                      testPrefillWorkRangeLabel,
+			EnableFiltering:            true,
+			ReusableTokensProducerName: testReusableTokensProducerName,
+		})
+
+		filtered := plugin.Filter(ctx, createHundredTokenRequest(), endpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "long", filtered[0].GetMetadata().ID.Name)
+	})
+
+	t.Run("wrong runtime attribute type keeps total length", func(t *testing.T) {
+		producerName := testReusableTokensProducerName
+		plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+			Label:                      testPrefillWorkRangeLabel,
+			EnableFiltering:            true,
+			ReusableTokensProducerName: producerName,
+		})
+		request := createHundredTokenRequest()
+		request.PutAttribute(
+			attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+			"invalid",
+		)
+
+		filtered := plugin.Filter(ctx, request, endpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "long", filtered[0].GetMetadata().ID.Name)
+	})
+
+	t.Run("positive total with a fully reusable prefix routes on one token", func(t *testing.T) {
+		producerName := testReusableTokensProducerName
+		plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+			Label:                      testPrefillWorkRangeLabel,
+			EnableFiltering:            true,
+			ReusableTokensProducerName: producerName,
+		})
+		request := createHundredTokenRequest()
+		request.PutAttribute(
+			attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+			attrprefix.ReusablePrefixTokens(120),
+		)
+
+		filtered := plugin.Filter(ctx, request, endpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "short", filtered[0].GetMetadata().ID.Name)
+	})
+
+	t.Run("unknown token count remains zero", func(t *testing.T) {
+		producerName := testReusableTokensProducerName
+		plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+			Label:                      testPrefillWorkRangeLabel,
+			EnableFiltering:            true,
+			ReusableTokensProducerName: producerName,
+		})
+		request := &scheduling.InferenceRequest{
+			RequestID: "unknown-token-count",
+			Body: &fwkrh.InferenceRequestBody{
+				TokenizedRequest: &fwkrh.TokenizedRequest{},
+			},
+		}
+		request.PutAttribute(
+			attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+			attrprefix.ReusablePrefixTokens(120),
+		)
+		unknownEndpoints := []scheduling.Endpoint{
+			createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "unknown"},
+				"10.0.0.3", map[string]string{testPrefillWorkRangeLabel: "0-0"}),
+			createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "positive"},
+				"10.0.0.4", map[string]string{testPrefillWorkRangeLabel: "1-50"}),
+		}
+
+		filtered := plugin.Filter(ctx, request, unknownEndpoints)
+		require.Len(t, filtered, 1)
+		assert.Equal(t, "unknown", filtered[0].GetMetadata().ID.Name)
+	})
+}
+
+func TestReusableTokensScore(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := []scheduling.Endpoint{
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "short"},
+			"10.0.0.1", map[string]string{testPrefillWorkRangeLabel: "1-50"}),
+		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "long"},
+			"10.0.0.2", map[string]string{testPrefillWorkRangeLabel: "51-100"}),
+	}
+	producerName := testReusableTokensProducerName
+	plugin := NewContextLengthAware("cache-aware", &contextLengthAwareParameters{
+		Label:                      testPrefillWorkRangeLabel,
+		ReusableTokensProducerName: producerName,
+	})
+	request := createHundredTokenRequest()
+	request.PutAttribute(
+		attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(producerName),
+		attrprefix.ReusablePrefixTokens(60),
+	)
+
+	scores := plugin.Score(ctx, request, endpoints)
+	assert.Greater(t, scores[endpoints[0]], scores[endpoints[1]])
 }
 
 func TestContextLengthAwareFilter(t *testing.T) {
@@ -112,7 +388,7 @@ func TestContextLengthAwareFilter(t *testing.T) {
 
 	gotNames := make([]string, len(filteredEndpoints))
 	for i, endpoint := range filteredEndpoints {
-		gotNames[i] = endpoint.GetMetadata().NamespacedName.Name
+		gotNames[i] = endpoint.GetMetadata().ID.Name
 	}
 
 	expectedEndpoints := []string{"short-range", "wide-range", "no-label"}
@@ -241,10 +517,10 @@ func TestCalculateRangeScoreFallback(t *testing.T) {
 	})
 }
 
-// TokenizedPrompt tests — plugin reads tokens from InferenceRequestBody.TokenizedPrompt
+// TokenizedRequest tests — plugin reads tokens from InferenceRequestBody.TokenizedRequest
 // as populated by the tokenizer DataProducer plugin.
 
-func TestContextLengthAwareWithTokenizedPromptOnRequest(t *testing.T) {
+func TestContextLengthAwareWithTokenizedRequestOnRequest(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
 	tokenCount := 42
@@ -273,19 +549,19 @@ func TestContextLengthAwareWithTokenizedPromptOnRequest(t *testing.T) {
 		RequestID:   "test-request",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokenIDs}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: tokenIDs}}},
 		},
 	}
 
 	filteredEndpoints := plugin.Filter(ctx, request, endpoints)
 	assert.Equal(t, 1, len(filteredEndpoints))
-	assert.Equal(t, "tight-match", filteredEndpoints[0].GetMetadata().NamespacedName.Name)
+	assert.Equal(t, "tight-match", filteredEndpoints[0].GetMetadata().ID.Name)
 }
 
-func TestContextLengthAwareNilTokenizedPromptIsZero(t *testing.T) {
+func TestContextLengthAwareNilTokenizedRequestIsZero(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
-	// Without TokenizedPrompt the context length is 0 (unknown); no protocol structs are read.
+	// Without TokenizedRequest the context length is 0 (unknown); no protocol structs are read.
 	endpoints := []scheduling.Endpoint{
 		createEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "matching-range"},
 			"10.0.0.1",
@@ -309,5 +585,24 @@ func TestContextLengthAwareNilTokenizedPromptIsZero(t *testing.T) {
 
 	filteredEndpoints := plugin.Filter(ctx, request, endpoints)
 	assert.Equal(t, 1, len(filteredEndpoints))
-	assert.Equal(t, "matching-range", filteredEndpoints[0].GetMetadata().NamespacedName.Name)
+	assert.Equal(t, "matching-range", filteredEndpoints[0].GetMetadata().ID.Name)
+}
+
+func TestAcceleratorRangeUsesConfiguredLabel(t *testing.T) {
+	const label = "llm-d.ai/accelerator-capability-range"
+	created, err := Factory("accelerator-router", fwkplugin.StrictDecoder([]byte(
+		`{"label":"llm-d.ai/accelerator-capability-range","enableFiltering":true}`)), nil)
+	require.NoError(t, err)
+	configured := created.(*ContextLengthAware)
+	endpoints := []scheduling.Endpoint{
+		createEndpoint(k8stypes.NamespacedName{Name: "small"}, "10.0.0.1", map[string]string{label: "0-100", DefaultContextLengthLabel: "101-200"}),
+		createEndpoint(k8stypes.NamespacedName{Name: "large"}, "10.0.0.2", map[string]string{label: "101-200", DefaultContextLengthLabel: "0-100"}),
+		createEndpoint(k8stypes.NamespacedName{Name: "unlabeled"}, "10.0.0.3", nil),
+	}
+	request := createHundredTokenRequest()
+	ctx := logr.NewContext(t.Context(), logr.Discard())
+	assert.Equal(t, []scheduling.Endpoint{endpoints[0], endpoints[2]}, configured.Filter(ctx, request, endpoints))
+	scores := configured.Score(ctx, request, endpoints)
+	assert.Greater(t, scores[endpoints[0]], scores[endpoints[1]])
+	assert.Equal(t, 0.5, scores[endpoints[2]])
 }

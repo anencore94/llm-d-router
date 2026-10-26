@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package nohitlru_test
 
 import (
@@ -7,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -23,8 +40,9 @@ import (
 var _ plugin.Handle = &fakeHandle{}
 
 type fakeHandle struct {
-	ctx     context.Context
-	plugins map[string]plugin.Plugin
+	ctx                context.Context
+	plugins            map[string]plugin.Plugin
+	crossReplicaSyncer plugin.Plugin
 }
 
 func newFakeHandle(ctx context.Context) *fakeHandle {
@@ -63,6 +81,18 @@ func (h *fakeHandle) Metrics() plugin.MetricsRecorder {
 	return nil
 }
 
+func (h *fakeHandle) CrossReplicaSyncer() plugin.Plugin {
+	return h.crossReplicaSyncer
+}
+
+func (h *fakeHandle) SetCrossReplicaSyncer(syncer plugin.Plugin) {
+	h.crossReplicaSyncer = syncer
+}
+
+func (h *fakeHandle) RefreshMetricsInterval() time.Duration {
+	return 0
+}
+
 type stubPlugin struct {
 	name plugin.TypedName
 }
@@ -74,7 +104,7 @@ func (p *stubPlugin) TypedName() plugin.TypedName {
 // newCold returns an endpoint without any prefix-cache match info (cold).
 func newCold(name string) scheduling.Endpoint {
 	return scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: name}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: name}},
 		&fwkdl.Metrics{},
 		nil,
 	)
@@ -83,7 +113,7 @@ func newCold(name string) scheduling.Endpoint {
 // newColdNS returns a cold endpoint in the "default" namespace.
 func newColdNS(name string) scheduling.Endpoint {
 	return scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: name, Namespace: "default"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: name, Namespace: "default"}},
 		&fwkdl.Metrics{},
 		nil,
 	)
@@ -92,7 +122,7 @@ func newColdNS(name string) scheduling.Endpoint {
 // newWarm returns an endpoint with prefix-cache match info indicating a cache hit.
 func newWarm(name string) scheduling.Endpoint {
 	ep := newCold(name)
-	ep.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(5, 10, 1))
+	ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(5, 10, 1))
 	return ep
 }
 
@@ -243,7 +273,7 @@ func TestNoHitLRUBasicFunctionality(t *testing.T) {
 
 	for endpoint, score := range scores {
 		if score < 0 || score > 1 {
-			t.Errorf("Invalid score %f for endpoint %s", score, endpoint.GetMetadata().NamespacedName.String())
+			t.Errorf("Invalid score %f for endpoint %s", score, endpoint.GetMetadata().ID.String())
 		}
 	}
 
@@ -283,11 +313,11 @@ func TestNoHitLRUPreferLeastRecentlyUsedAfterColdRequests(t *testing.T) {
 	// The NamespacedName matches the cold endpoints, so LRU tracking is shared.
 	warmEndpoints := func() []scheduling.Endpoint {
 		w := scheduling.NewEndpoint(
-			&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-a", Namespace: "default"}},
+			&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a", Namespace: "default"}},
 			&fwkdl.Metrics{},
 			nil,
 		)
-		w.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(5, 10, 1))
+		w.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(5, 10, 1))
 		return []scheduling.Endpoint{w, endpointB, endpointC}
 	}
 
@@ -316,10 +346,10 @@ func TestNoHitLRUPreferLeastRecentlyUsedAfterColdRequests(t *testing.T) {
 			}
 		}
 
-		if highestEndpoint.GetMetadata().NamespacedName.String() != expectedEndpoint.GetMetadata().NamespacedName.String() {
+		if highestEndpoint.GetMetadata().ID.String() != expectedEndpoint.GetMetadata().ID.String() {
 			t.Fatalf("expected %s to have highest score for LRU behavior, but %s had highest score (%f). All scores: %+v",
-				expectedEndpoint.GetMetadata().NamespacedName.String(),
-				highestEndpoint.GetMetadata().NamespacedName.String(),
+				expectedEndpoint.GetMetadata().ID.String(),
+				highestEndpoint.GetMetadata().ID.String(),
 				highestScore,
 				scores)
 		}
@@ -328,7 +358,7 @@ func TestNoHitLRUPreferLeastRecentlyUsedAfterColdRequests(t *testing.T) {
 	t.Run("initial cold request seeds cache", func(_ *testing.T) {
 		coldReqA := &scheduling.InferenceRequest{RequestID: "cold-1"}
 		scorer.Score(ctx, coldReqA, endpoints)
-		scorer.PreRequest(ctx, coldReqA, requestToEndpoint(endpointA))
+		_ = scorer.PreRequest(ctx, coldReqA, requestToEndpoint(endpointA))
 		assertHighestScoredPod(endpointB, "after-endpointA-used")
 	})
 
@@ -354,7 +384,7 @@ func TestNoHitLRUPreferLeastRecentlyUsedAfterColdRequests(t *testing.T) {
 				t.Fatalf("expected neutral score for warm request, got %f", score)
 			}
 		}
-		scorer.PreRequest(ctx, warmReq, requestToEndpoint(endpointB))
+		_ = scorer.PreRequest(ctx, warmReq, requestToEndpoint(endpointB))
 		postWarmReq := &scheduling.InferenceRequest{RequestID: "cold-after-warm"}
 		postWarmScores := scorer.Score(ctx, postWarmReq, endpoints)
 		if postWarmScores[endpointB] <= postWarmScores[endpointA] {
@@ -365,14 +395,14 @@ func TestNoHitLRUPreferLeastRecentlyUsedAfterColdRequests(t *testing.T) {
 	t.Run("second cold request rotates to endpointB", func(_ *testing.T) {
 		coldReqB := &scheduling.InferenceRequest{RequestID: "cold-2"}
 		scorer.Score(ctx, coldReqB, endpoints)
-		scorer.PreRequest(ctx, coldReqB, requestToEndpoint(endpointB))
+		_ = scorer.PreRequest(ctx, coldReqB, requestToEndpoint(endpointB))
 		assertHighestScoredPod(endpointC, "after-endpointB-used")
 	})
 
 	t.Run("third cold request rotates back to endpointA", func(_ *testing.T) {
 		coldReqC := &scheduling.InferenceRequest{RequestID: "cold-3"}
 		scorer.Score(ctx, coldReqC, endpoints)
-		scorer.PreRequest(ctx, coldReqC, requestToEndpoint(endpointC))
+		_ = scorer.PreRequest(ctx, coldReqC, requestToEndpoint(endpointC))
 		assertHighestScoredPod(endpointA, "after-endpointC-used")
 	})
 }
@@ -440,7 +470,7 @@ func TestNoHitLRUPrefillDecodeTracking(t *testing.T) {
 				},
 			},
 		}
-		scorer.PreRequest(ctx, req1, pdResult)
+		_ = scorer.PreRequest(ctx, req1, pdResult)
 
 		req2 := &scheduling.InferenceRequest{RequestID: "pd-request-2"}
 		prefillScores := scorer.Score(ctx, req2, prefillEndpoints)
@@ -468,7 +498,7 @@ func TestNoHitLRUPrefillDecodeTracking(t *testing.T) {
 				},
 			},
 		}
-		scorer.PreRequest(ctx, req, result)
+		_ = scorer.PreRequest(ctx, req, result)
 
 		req2 := &scheduling.InferenceRequest{RequestID: "non-pd-request-2"}
 		scores := scorer.Score(ctx, req2, decodeEndpoints)
@@ -482,7 +512,7 @@ func TestNoHitLRUPrefillDecodeTracking(t *testing.T) {
 		req := &scheduling.InferenceRequest{RequestID: "nil-result"}
 		scorer := nohitlru.NewNoHitLRU(ctx, nohitlru.NoHitLRUType, nil)
 		scorer.Score(ctx, req, decodeEndpoints)
-		scorer.PreRequest(ctx, req, nil)
+		_ = scorer.PreRequest(ctx, req, nil)
 	})
 
 	t.Run("empty profile results - graceful handling", func(_ *testing.T) {
@@ -494,7 +524,7 @@ func TestNoHitLRUPrefillDecodeTracking(t *testing.T) {
 			PrimaryProfileName: "decode",
 			ProfileResults:     map[string]*scheduling.ProfileRunResult{},
 		}
-		scorer.PreRequest(ctx, req, result)
+		_ = scorer.PreRequest(ctx, req, result)
 	})
 }
 
@@ -511,7 +541,7 @@ type dumpedLRUState struct {
 func seedCold(ctx context.Context, scorer *nohitlru.NoHitLRU, target scheduling.Endpoint, id string) {
 	req := &scheduling.InferenceRequest{RequestID: id}
 	scorer.Score(ctx, req, []scheduling.Endpoint{target})
-	scorer.PreRequest(ctx, req, &scheduling.SchedulingResult{
+	_ = scorer.PreRequest(ctx, req, &scheduling.SchedulingResult{
 		PrimaryProfileName: "p",
 		ProfileResults: map[string]*scheduling.ProfileRunResult{
 			"p": {TargetEndpoints: []scheduling.Endpoint{target}},

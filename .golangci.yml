@@ -18,8 +18,8 @@ linters:
     - durationcheck
     - errcheck
     - fatcontext
+    - forbidigo
     - ginkgolinter
-    - goconst
     - gocritic
     - govet
     - ineffassign
@@ -28,6 +28,7 @@ linters:
     - misspell
     - nakedret
     - nilnil
+    - nolintlint
     - perfsprint
     - prealloc
     - revive
@@ -45,7 +46,33 @@ linters:
         text: "avoid meaningless package names"
       - linters: [revive]
         text: "avoid package names that conflict with Go standard library package names"
+      # This alias adds no clarity (v1 disambiguates nothing) but goimports
+      # always writes it: it computes v1's "assumed name" by skipping the
+      # version segment (landing on the parent directory name), sees that
+      # differs from the real package name, and pins an explicit alias to
+      # keep the two in sync. Excluded only because make format and make
+      # lint would otherwise fight forever, not because the alias helps.
+      - linters: [revive]
+        text: 'Import alias "v[0-9]+((alpha|beta)[0-9]+)?" is redundant'
+      # Packages transferred verbatim from llm-d-kv-cache (#1862); style cleanup tracked separately
+      - path: pkg/(kvcache|kvevents)/
+        linters:
+          - revive
+          - perfsprint
+          - dupword
+          - prealloc
+      # The panic ban applies only to pkg/epp/flowcontrol (non-test files); see that package's doc.go.
+      - path-except: pkg/epp/flowcontrol/
+        linters:
+          - forbidigo
+      - path: _test\.go$
+        linters:
+          - forbidigo
   settings:
+    forbidigo:
+      forbid:
+        - pattern: ^panic$
+          msg: "pkg/epp/flowcontrol is panic-free by design (see its doc.go); validate at the boundary and return an error"
     importas:
       no-unaliased: false # unaliased imports are allowed; only enforce when an alias is used
       alias:
@@ -73,6 +100,18 @@ linters:
           alias: errcommon
         - pkg: github.com/llm-d/llm-d-router/test/utils/igw
           alias: igwtestutils
+        - pkg: github.com/llm-d/llm-d-router/test/framework/net
+          alias: fwknet
+        - pkg: github.com/llm-d/llm-d-router/test/framework/context
+          alias: fwkcontext
+        - pkg: github.com/llm-d/llm-d-router/test/framework/k8s
+          alias: fwkk8s
+        - pkg: github.com/llm-d/llm-d-router/test/framework/gaie
+          alias: fwkgaie
+        - pkg: github.com/llm-d/llm-d-router/test/framework/epp
+          alias: fwkepp
+    nolintlint:
+      require-specific: true
     revive: # see https://github.com/mgechev/revive#available-rules for all options
       rules:
         - name: blank-imports
@@ -89,6 +128,7 @@ linters:
         - name: package-comments
         - name: range
         - name: receiver-naming
+        - name: redundant-import-alias
         - name: time-naming
         - name: unexported-return
         - name: var-declaration

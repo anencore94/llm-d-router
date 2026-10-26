@@ -1,5 +1,6 @@
 /*
 Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -86,7 +87,7 @@ func TestRuntimePollingDispatch(t *testing.T) {
 			r := datalayer.NewRuntime(pollingInterval)
 			ext := mocks.NewPollingExtractor("test-extractor")
 
-			httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", true, "test-http", "test-source",
+			httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", httpds.TLSOptions{SkipVerify: true}, "test-http", "test-source",
 				parsePrometheusMetrics)
 			require.NoError(t, err)
 
@@ -102,9 +103,9 @@ func TestRuntimePollingDispatch(t *testing.T) {
 			t.Cleanup(cancel)
 
 			endpointMeta := &fwkdl.EndpointMetadata{
-				NamespacedName: types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
-				MetricsHost:    srv.Listener.Addr().String(),
-				Port:           "8000",
+				ID:          types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
+				MetricsHost: srv.Listener.Addr().String(),
+				Port:        "8000",
 			}
 
 			ep := r.NewEndpoint(ctx, endpointMeta)
@@ -138,7 +139,7 @@ func TestRuntimePollingMultipleExtractors(t *testing.T) {
 	ext1 := mocks.NewPollingExtractor("extractor-1")
 	ext2 := mocks.NewPollingExtractor("extractor-2")
 
-	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", true, "test-http", "test-source",
+	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", httpds.TLSOptions{SkipVerify: true}, "test-http", "test-source",
 		parsePrometheusMetrics)
 	require.NoError(t, err)
 
@@ -154,9 +155,9 @@ func TestRuntimePollingMultipleExtractors(t *testing.T) {
 	t.Cleanup(cancel)
 
 	endpointMeta := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
-		MetricsHost:    srv.Listener.Addr().String(),
-		Port:           "8000",
+		ID:          types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
+		MetricsHost: srv.Listener.Addr().String(),
+		Port:        "8000",
 	}
 
 	ep := r.NewEndpoint(ctx, endpointMeta)
@@ -187,7 +188,7 @@ func TestRuntimePollingEndpointLifecycle(t *testing.T) {
 	r := datalayer.NewRuntime(pollingInterval)
 	ext := mocks.NewPollingExtractor("lifecycle-extractor")
 
-	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", true, "test-http", "test-source",
+	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", httpds.TLSOptions{SkipVerify: true}, "test-http", "test-source",
 		parsePrometheusMetrics)
 	require.NoError(t, err)
 
@@ -203,9 +204,9 @@ func TestRuntimePollingEndpointLifecycle(t *testing.T) {
 	t.Cleanup(cancel)
 
 	endpointMeta := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
-		MetricsHost:    srv.Listener.Addr().String(),
-		Port:           "8000",
+		ID:          types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
+		MetricsHost: srv.Listener.Addr().String(),
+		Port:        "8000",
 	}
 
 	ep := r.NewEndpoint(ctx, endpointMeta)
@@ -241,7 +242,7 @@ func TestRuntimePollingWithoutExtractors(t *testing.T) {
 
 	r := datalayer.NewRuntime(50 * time.Millisecond)
 
-	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", true, "test-http", "test-source",
+	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", httpds.TLSOptions{SkipVerify: true}, "test-http", "test-source",
 		parsePrometheusMetrics)
 	require.NoError(t, err)
 
@@ -257,9 +258,9 @@ func TestRuntimePollingWithoutExtractors(t *testing.T) {
 	t.Cleanup(cancel)
 
 	endpointMeta := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
-		MetricsHost:    srv.Listener.Addr().String(),
-		Port:           "8000",
+		ID:          types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
+		MetricsHost: srv.Listener.Addr().String(),
+		Port:        "8000",
 	}
 
 	ep := r.NewEndpoint(ctx, endpointMeta)
@@ -280,7 +281,7 @@ func TestRuntimePollingHTTPError(t *testing.T) {
 	r := datalayer.NewRuntime(pollingInterval)
 	ext := mocks.NewPollingExtractor("error-extractor")
 
-	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", true, "test-http", "test-source",
+	httpSrc, err := httpds.NewHTTPDataSource("http", "/metrics", httpds.TLSOptions{SkipVerify: true}, "test-http", "test-source",
 		parsePrometheusMetrics)
 	require.NoError(t, err)
 
@@ -296,9 +297,9 @@ func TestRuntimePollingHTTPError(t *testing.T) {
 	t.Cleanup(cancel)
 
 	endpointMeta := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
-		MetricsHost:    srv.Listener.Addr().String(),
-		Port:           "8000",
+		ID:          types.NamespacedName{Name: "test-pod", Namespace: "test-ns"},
+		MetricsHost: srv.Listener.Addr().String(),
+		Port:        "8000",
 	}
 
 	ep := r.NewEndpoint(ctx, endpointMeta)

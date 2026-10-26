@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,14 +24,33 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// EndpointMetadata represents the relevant Kubernetes Pod state of an inference server.
+// ID uniquely identifies an endpoint. It aliases types.NamespacedName so the identity
+// can later move off the Kubernetes-specific type without churning datastore keys.
+// Every discovery source must set it uniquely.
+type ID = types.NamespacedName
+
+// EndpointMetadata describes an inference endpoint.
 type EndpointMetadata struct {
-	NamespacedName types.NamespacedName
-	PodName        string
-	Address        string
-	Port           string
-	MetricsHost    string
-	Labels         map[string]string
+	// ID is the endpoint's unique identity, and the datastore key.
+	ID      ID
+	Name    string
+	Address string
+	// NodeAddress is the node IP hosting this pod (pod.Status.HostIP).
+	// Empty for non-Kubernetes discovery sources (e.g. file discovery).
+	NodeAddress string
+	Port        string
+	MetricsHost string
+	// Labels is the endpoint's matching/filtering vocabulary: selector
+	// matching (InferencePool), bylabel filters, and special-purpose keys
+	// with producer-level handling (metricsAddress/metricsPort).
+	Labels map[string]string
+	// Attributes holds discovery-declared request-shaping data for the
+	// endpoint (e.g. a file-discovery entry's attributes section: routing
+	// hints like pathPrefix/model that plugins stamp onto outgoing
+	// requests), surfaced by the attributes-producer extractor. Kept
+	// separate from Labels so request-shaping data never becomes a
+	// selector key — and selector labels are never stamped onto requests.
+	Attributes map[string]string
 	// RankIndex is this endpoint's position in the pool's TargetPorts,
 	// identifying the pod-local rank in multi-port deployments.
 	RankIndex int
@@ -52,33 +72,39 @@ func (epm *EndpointMetadata) Clone() *EndpointMetadata {
 
 	clonedLabels := make(map[string]string, len(epm.Labels))
 	maps.Copy(clonedLabels, epm.Labels)
+	clonedAttributes := make(map[string]string, len(epm.Attributes))
+	maps.Copy(clonedAttributes, epm.Attributes)
 	return &EndpointMetadata{
-		NamespacedName: types.NamespacedName{
-			Name:      epm.NamespacedName.Name,
-			Namespace: epm.NamespacedName.Namespace,
+		ID: types.NamespacedName{
+			Name:      epm.ID.Name,
+			Namespace: epm.ID.Namespace,
 		},
-		PodName:     epm.PodName,
+		Name:        epm.Name,
 		Address:     epm.Address,
+		NodeAddress: epm.NodeAddress,
 		Port:        epm.Port,
 		MetricsHost: epm.MetricsHost,
 		Labels:      clonedLabels,
+		Attributes:  clonedAttributes,
 		RankIndex:   epm.RankIndex,
 	}
 }
 
 // Equal reports whether two EndpointMetadata values describe the same endpoint
-// metadata. A nil Labels map and an empty Labels map are treated as equal.
+// metadata. A nil map and an empty map are treated as equal.
 func (epm *EndpointMetadata) Equal(other *EndpointMetadata) bool {
 	if epm == nil || other == nil {
 		return epm == other
 	}
-	return epm.NamespacedName == other.NamespacedName &&
-		epm.PodName == other.PodName &&
+	return epm.ID == other.ID &&
+		epm.Name == other.Name &&
 		epm.Address == other.Address &&
+		epm.NodeAddress == other.NodeAddress &&
 		epm.Port == other.Port &&
 		epm.MetricsHost == other.MetricsHost &&
 		epm.RankIndex == other.RankIndex &&
-		maps.Equal(epm.Labels, other.Labels)
+		maps.Equal(epm.Labels, other.Labels) &&
+		maps.Equal(epm.Attributes, other.Attributes)
 }
 
 // GetRankIndex returns the rank index of this endpoint within the pool's
@@ -90,14 +116,30 @@ func (epm *EndpointMetadata) GetRankIndex() int {
 	return epm.RankIndex
 }
 
-// GetNamespacedName gets the namespace name of the Endpoint.
+// GetID returns the endpoint's unique identity.
+func (epm *EndpointMetadata) GetID() ID {
+	return epm.ID
+}
+
+// GetNamespacedName returns the endpoint's unique identity as a types.NamespacedName.
 func (epm *EndpointMetadata) GetNamespacedName() types.NamespacedName {
-	return epm.NamespacedName
+	if epm == nil {
+		return types.NamespacedName{}
+	}
+	return epm.ID
 }
 
 // GetIPAddress returns the Endpoint's IP address.
 func (epm *EndpointMetadata) GetIPAddress() string {
 	return epm.Address
+}
+
+// GetNodeAddress returns the IP of the node hosting this endpoint.
+func (epm *EndpointMetadata) GetNodeAddress() string {
+	if epm == nil {
+		return ""
+	}
+	return epm.NodeAddress
 }
 
 // GetPort returns the Endpoint's inference port.

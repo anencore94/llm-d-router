@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +24,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+)
+
+var (
+	testKeyK     = fwkplugin.NewDataKey("k", "test-producer")
+	testKeyK1    = fwkplugin.NewDataKey("k1", "test-producer")
+	testKeyExtra = fwkplugin.NewDataKey("extra", "test-producer")
 )
 
 type cloneableString string
@@ -32,12 +40,12 @@ func (s cloneableString) Clone() fwkdl.Cloneable { return s }
 
 func newTestMetadata(name string) *fwkdl.EndpointMetadata {
 	return &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Namespace: "ns", Name: name},
-		PodName:        name,
-		Address:        "10.0.0.1",
-		Port:           "8000",
-		MetricsHost:    "10.0.0.1:9100",
-		Labels:         map[string]string{"app": "inference"},
+		ID:          types.NamespacedName{Namespace: "ns", Name: name},
+		Name:        name,
+		Address:     "10.0.0.1",
+		Port:        "8000",
+		MetricsHost: "10.0.0.1:9100",
+		Labels:      map[string]string{"app": "inference"},
 	}
 }
 
@@ -71,7 +79,7 @@ func TestNewEndpoint_CopiesInputs(t *testing.T) {
 	meta := newTestMetadata("pod-a")
 	metrics := newTestMetrics()
 	attr := fwkdl.NewAttributes()
-	attr.Put("key", cloneableString("value"))
+	attr.Put(testKeyK, cloneableString("value"))
 
 	ep := NewEndpoint(meta, metrics, attr)
 	assert.NotNil(t, ep)
@@ -85,7 +93,7 @@ func TestNewEndpoint_CopiesInputs(t *testing.T) {
 	assert.Equal(t, 3, ep.GetMetrics().RunningRequestsSize)
 
 	// values from attribute map should be retrievable
-	v, ok := ep.Get("key")
+	v, ok := ep.Get(testKeyK)
 	assert.True(t, ok)
 	assert.Equal(t, cloneableString("value"), v)
 }
@@ -96,8 +104,8 @@ func TestNewEndpoint_NilAttributeUsesDefault(t *testing.T) {
 	assert.Empty(t, ep.Keys())
 
 	// Should still be safe to write into the default-allocated attribute map
-	ep.Put("k", cloneableString("v"))
-	v, ok := ep.Get("k")
+	ep.Put(testKeyK, cloneableString("v"))
+	v, ok := ep.Get(testKeyK)
 	assert.True(t, ok)
 	assert.Equal(t, cloneableString("v"), v)
 }
@@ -115,20 +123,20 @@ func TestEndpoint_StringContainsFields(t *testing.T) {
 
 func TestEndpoint_Clone(t *testing.T) {
 	attr := fwkdl.NewAttributes()
-	attr.Put("k", cloneableString("v"))
+	attr.Put(testKeyK, cloneableString("v"))
 	ep := NewEndpoint(newTestMetadata("pod-d"), newTestMetrics(), attr)
 
 	cloned := ep.Clone()
-	v, ok := cloned.Get("k")
+	v, ok := cloned.Get(testKeyK)
 	assert.True(t, ok)
 	assert.Equal(t, cloneableString("v"), v)
 }
 
 func TestEndpointComparer_Equal(t *testing.T) {
 	attrA := fwkdl.NewAttributes()
-	attrA.Put("k", cloneableString("v"))
+	attrA.Put(testKeyK, cloneableString("v"))
 	attrB := fwkdl.NewAttributes()
-	attrB.Put("k", cloneableString("v"))
+	attrB.Put(testKeyK, cloneableString("v"))
 
 	a := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrA)
 	b := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrB)
@@ -153,10 +161,10 @@ func TestEndpointComparer_DifferByMetrics(t *testing.T) {
 
 func TestEndpointComparer_DifferByAttributeKeys(t *testing.T) {
 	attrA := fwkdl.NewAttributes()
-	attrA.Put("k1", cloneableString("v"))
+	attrA.Put(testKeyK1, cloneableString("v"))
 	attrB := fwkdl.NewAttributes()
-	attrB.Put("k1", cloneableString("v"))
-	attrB.Put("extra", cloneableString("x"))
+	attrB.Put(testKeyK1, cloneableString("v"))
+	attrB.Put(testKeyExtra, cloneableString("x"))
 
 	a := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrA)
 	b := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrB)
@@ -166,9 +174,9 @@ func TestEndpointComparer_DifferByAttributeKeys(t *testing.T) {
 
 func TestEndpointComparer_DifferByAttributeValues(t *testing.T) {
 	attrA := fwkdl.NewAttributes()
-	attrA.Put("k", cloneableString("v1"))
+	attrA.Put(testKeyK, cloneableString("v1"))
 	attrB := fwkdl.NewAttributes()
-	attrB.Put("k", cloneableString("v2"))
+	attrB.Put(testKeyK, cloneableString("v2"))
 
 	a := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrA)
 	b := NewEndpoint(newTestMetadata("pod"), newTestMetrics(), attrB)
@@ -187,7 +195,47 @@ func TestScoredEndpointComparer(t *testing.T) {
 	assert.False(t, ScoredEndpointComparer(ScoredEndpoint{Endpoint: a, Score: 1}, ScoredEndpoint{Endpoint: other, Score: 1}))
 }
 
-func TestModalityAliases(t *testing.T) {
-	// These aliases exist for ergonomic re-export. Confirm the values line up.
-	assert.Equal(t, fwkrh.ModalityImage, ModalityImage)
+func TestProfileRunResult_FirstEndpoint(t *testing.T) {
+	first := NewEndpoint(newTestMetadata("first"), newTestMetrics(), nil)
+	second := NewEndpoint(newTestMetadata("second"), newTestMetrics(), nil)
+
+	tests := []struct {
+		name   string
+		result *ProfileRunResult
+		want   Endpoint
+	}{
+		{name: "nil result"},
+		{name: "no targets", result: &ProfileRunResult{}},
+		{name: "nil first target is returned as stored", result: &ProfileRunResult{TargetEndpoints: []Endpoint{nil, first}}},
+		{name: "first of several", result: &ProfileRunResult{TargetEndpoints: []Endpoint{first, second}}, want: first},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.result.FirstEndpoint())
+		})
+	}
+}
+
+func TestSchedulingResult_PrimaryEndpoint(t *testing.T) {
+	first := NewEndpoint(newTestMetadata("first"), newTestMetrics(), nil)
+	second := NewEndpoint(newTestMetadata("second"), newTestMetrics(), nil)
+
+	tests := []struct {
+		name   string
+		result *SchedulingResult
+		want   Endpoint
+	}{
+		{name: "nil result"},
+		{name: "no profile results", result: &SchedulingResult{PrimaryProfileName: "p"}},
+		{name: "empty primary profile name", result: &SchedulingResult{ProfileResults: map[string]*ProfileRunResult{"": {TargetEndpoints: []Endpoint{first}}}}},
+		{name: "primary profile absent", result: &SchedulingResult{PrimaryProfileName: "p", ProfileResults: map[string]*ProfileRunResult{"other": {TargetEndpoints: []Endpoint{first}}}}},
+		{name: "primary profile nil", result: &SchedulingResult{PrimaryProfileName: "p", ProfileResults: map[string]*ProfileRunResult{"p": nil}}},
+		{name: "primary profile picked none", result: &SchedulingResult{PrimaryProfileName: "p", ProfileResults: map[string]*ProfileRunResult{"p": {}}}},
+		{name: "first target of the primary profile", result: &SchedulingResult{PrimaryProfileName: "p", ProfileResults: map[string]*ProfileRunResult{"p": {TargetEndpoints: []Endpoint{first, second}}, "other": {TargetEndpoints: []Endpoint{second}}}}, want: first},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.result.PrimaryEndpoint())
+		})
+	}
 }

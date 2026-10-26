@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,20 +22,12 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 )
 
 var testFlowKey = flowcontrol.FlowKey{ID: "test-flow", Priority: 0}
-
-func TestFCFS_RequiredQueueCapabilities(t *testing.T) {
-	t.Parallel()
-	policy := newFCFS()
-	caps := policy.RequiredQueueCapabilities()
-	require.Empty(t, caps, "No required capabilities should be returned")
-}
 
 func TestFCFS_Less(t *testing.T) {
 	t.Parallel()

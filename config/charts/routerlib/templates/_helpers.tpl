@@ -53,19 +53,14 @@ llm-d.ai/igw-mode: llm-d-router-gateway
 Return the monitoring provider name.
 
 If router.monitoring.provider.name is unset/empty, default to
-prometheusoperator. For backwards compatibility, provider.name=gke still maps
-to gmp when no monitoring provider is explicitly set.
+prometheusoperator.
 */}}
 {{- define "llm-d-router.monitoring.provider.name" -}}
 {{- $monitoring := .Values.router.monitoring | default dict -}}
 {{- $mp := index $monitoring "provider" | default dict -}}
 {{- $mpName := index $mp "name" | default "" -}}
-{{- $gatewayProvider := .Values.provider | default dict -}}
-{{- $gatewayProviderName := index $gatewayProvider "name" | default "" -}}
 {{- if and (kindIs "string" $mpName) (ne (trim $mpName) "") -}}
 {{- $mpName -}}
-{{- else if eq (lower $gatewayProviderName) "gke" -}}
-gmp
 {{- else -}}
 prometheusoperator
 {{- end -}}
@@ -74,24 +69,17 @@ prometheusoperator
 {{/*
 Return the monitoring provider config object.
 
-When router.monitoring.provider.name is unset/empty, use defaults.
-For backwards compatibility, provider.gke.autopilot is still honored when
-provider.name=gke and no monitoring provider is explicitly set.
+When router.monitoring.provider.name is unset/empty, use the
+prometheusoperator defaults.
 */}}
 {{- define "llm-d-router.monitoring.provider" -}}
 {{- $monitoring := .Values.router.monitoring | default dict -}}
 {{- $mp := index $monitoring "provider" | default dict -}}
 {{- $mpName := include "llm-d-router.monitoring.provider.name" . -}}
-{{- $gatewayProvider := .Values.provider | default dict -}}
-{{- $gatewayProviderName := index $gatewayProvider "name" | default "" -}}
 {{- $resolved := dict "name" $mpName -}}
 {{- if eq (lower $mpName) "gmp" -}}
   {{- $gmp := index $mp "gmp" | default dict -}}
-  {{- $legacyGke := dict -}}
-  {{- if and (eq (lower $gatewayProviderName) "gke") (index $gatewayProvider "gke") -}}
-    {{- $legacyGke = index $gatewayProvider "gke" -}}
-  {{- end -}}
-  {{- $_ := set $resolved "gmp" (mergeOverwrite (deepCopy $legacyGke) (deepCopy $gmp)) -}}
+  {{- $_ := set $resolved "gmp" (deepCopy $gmp) -}}
 {{- else -}}
   {{- $_ := set $resolved "prometheusoperator" (index $mp "prometheusoperator" | default dict) -}}
 {{- end -}}
@@ -131,14 +119,26 @@ from the EPP selector so the proxy and EPP pods are never co-selected.
 llm-d-router-proxy: {{ include "llm-d-router.proxyName" . }}
 {{- end -}}
 
+{{/* Headless Service for active-active Envoy endpoint discovery. */}}
+{{- define "llm-d-router.proxy.discoveryServiceName" -}}
+{{- $proxy := .Values.router.proxy | default dict -}}
+{{- $gkePB := include "llm-d-router.gkePreferredBackends" . | fromYaml | default dict -}}
+{{- if and $proxy.enabled (eq (include "llm-d-router.proxyType" .) "envoy") (eq (include "llm-d-router.proxyMode" .) "service") (ne (include "llm-d-router.priorityRouting.enabled" .) "true") (not $gkePB.enabled) -}}
+  {{- if eq (include "llm-d-router.epp.allActive" .) "true" -}}
+    {{- printf "%s-discovery" (include "llm-d-router.name" .) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 ext_proc upstream host the proxy uses to reach EPP. Loopback in sidecar mode;
-the EPP Service FQDN in service mode.
+the discovery or EPP Service FQDN in service mode.
 */}}
 {{- define "llm-d-router.proxy.extProcHost" -}}
 {{- if eq (include "llm-d-router.proxyMode" .) "service" -}}
 {{- $domain := .Values.router.clusterDomain | default "cluster.local" -}}
-{{- printf "%s.%s.svc.%s" (include "llm-d-router.name" .) .Release.Namespace $domain -}}
+{{- $serviceName := include "llm-d-router.proxy.discoveryServiceName" . | default (include "llm-d-router.name" .) -}}
+{{- printf "%s.%s.svc.%s" $serviceName .Release.Namespace $domain -}}
 {{- else -}}
 127.0.0.1
 {{- end -}}
@@ -170,6 +170,82 @@ sidecar mode; overridable via router.proxy.failOpen.
 true
 {{- else -}}
 false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the standalone Envoy proxy renders a fallback route to the model
+servers. With fail-open on, ext_proc is skipped when EPP is unreachable, so
+nothing sets the destination header that original_destination_cluster routes
+on; the fallback route sends those requests to the pool through a headless
+Service instead.
+*/}}
+{{- define "llm-d-router.proxy.failOpenFallback.enabled" -}}
+{{- $proxy := include "llm-d-router.proxy" . | fromYaml | default dict -}}
+{{- if and (hasPrefix "llm-d-router-standalone" .Chart.Name) $proxy.enabled (eq (include "llm-d-router.proxyType" .) "envoy") (eq (include "llm-d-router.proxy.failOpen" .) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Name of the headless Service that selects the model-server pods for the
+fail-open fallback route.
+*/}}
+{{- define "llm-d-router.proxy.fallbackServiceName" -}}
+{{- printf "%s-model-servers" (include "llm-d-router.name" .) -}}
+{{- end -}}
+
+{{/*
+Model-server port the fail-open fallback route sends requests to: the first
+entry of router.modelServers.targetPorts.
+*/}}
+{{- define "llm-d-router.proxy.fallbackPort" -}}
+{{- $ports := .Values.router.modelServers.targetPorts | default (list (dict "number" 8000)) -}}
+{{- (first $ports).number -}}
+{{- end -}}
+
+{{/*
+Return "true" if EPP is configured with secure (TLS) serving, "false" if
+router.epp.flags.secure-serving is explicitly set to false. Defaults to true
+so that the Envoy ext_proc cluster uses TLS by default.
+*/}}
+{{- define "llm-d-router.proxy.eppSecureServing" -}}
+{{- $flags := .Values.router.epp.flags | default dict -}}
+{{- $secureServing := index $flags "secure-serving" -}}
+{{- if and (not (kindIs "invalid" $secureServing)) (eq (toString $secureServing) "false") -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Envoy health-check tls_options block for the ext_proc cluster.
+Emitted only when EPP runs with TLS (secure-serving != false).
+Callers must indent to match the surrounding YAML context.
+*/}}
+{{- define "llm-d-router.proxy.envoyExtProcTLSOptions" -}}
+{{- if eq (include "llm-d-router.proxy.eppSecureServing" .) "true" -}}
+tls_options:
+  alpn_protocols: ["h2"]
+{{- end -}}
+{{- end -}}
+
+{{/*
+Envoy transport_socket block for the ext_proc cluster.
+Emitted only when EPP runs with TLS (secure-serving != false).
+Callers must indent to match the surrounding YAML context.
+*/}}
+{{- define "llm-d-router.proxy.envoyExtProcTransportSocket" -}}
+{{- if eq (include "llm-d-router.proxy.eppSecureServing" .) "true" -}}
+transport_socket:
+  name: "envoy.transport_sockets.tls"
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+    common_tls_context:
+      validation_context:
 {{- end -}}
 {{- end -}}
 
@@ -296,7 +372,12 @@ Standalone uses proxy presets merged with explicit proxy overrides.
   {{- $proxyType := include "llm-d-router.proxyType" . -}}
   {{- $presets := index $proxy "presets" | default dict -}}
   {{- $preset := deepCopy ((index $presets $proxyType) | default dict) -}}
+  {{- $userArgs := index $proxy "args" | default list -}}
+  {{- $presetArgs := index $preset "args" | default list -}}
   {{- $resolved = mergeOverwrite $preset $proxy -}}
+  {{- if empty $userArgs -}}
+    {{- $_ := set $resolved "args" $presetArgs -}}
+  {{- end -}}
   {{- if eq $proxyType "agentgateway" -}}
     {{- $listenerPort := include "llm-d-router.standaloneProxyListenerPort" . | int -}}
     {{- $ports := index $resolved "ports" | default list -}}
@@ -367,7 +448,7 @@ binds:
         policies:
           inferenceRouting:
             endpointPicker:
-              host: {{ printf "127.0.0.1:%v" (.Values.router.epp.extProcPort | default 9002) | quote }}
+              host: {{ printf "%s:%v" (include "llm-d-router.proxy.extProcHost" .) (.Values.router.epp.extProcPort | default 9002) | quote }}
             destinationMode: passthrough
 services:
 - name: {{ $serviceName | quote }}
@@ -395,23 +476,167 @@ EPP resource validations
 {{- end -}}
 
 {{/*
+Helper to retrieve GKE preferredBackends configuration safely across chart contexts.
+*/}}
+{{- define "llm-d-router.gkePreferredBackends" -}}
+{{- $provider := .Values.provider | default dict -}}
+{{- $gke := index $provider "gke" | default dict -}}
+{{- index $gke "preferredBackends" | default dict | toYaml -}}
+{{- end -}}
+
+{{/*
 EPP generic validations
 */}}
+{{- define "llm-d-router.validations.epp.preferredBackends" -}}
+{{- $gkePB := include "llm-d-router.gkePreferredBackends" . | fromYaml | default dict -}}
+{{- if $gkePB.enabled }}
+  {{- $preferredReplicas := $gkePB.preferredReplicas | default 1 | int }}
+  {{- $defaultReplicas := $gkePB.defaultReplicas | default 1 | int }}
+  {{- if lt $preferredReplicas 1 }}
+    {{- fail ".Values.provider.gke.preferredBackends.preferredReplicas must be at least 1 when preferredBackends.enabled is true" }}
+  {{- end }}
+  {{- if lt $defaultReplicas 1 }}
+    {{- fail ".Values.provider.gke.preferredBackends.defaultReplicas must be at least 1 when preferredBackends.enabled is true" }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Helper to check if priorityRouting is enabled across chart contexts.
+*/}}
+{{- define "llm-d-router.priorityRouting.enabled" -}}
+{{- $router := .Values.router | default dict -}}
+{{- $proxy := index $router "proxy" | default dict -}}
+{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
+{{- $pr := index $proxy "priorityRouting" | default dict -}}
+{{- $enabled := index $pr "enabled" -}}
+{{- if and (not (kindIs "invalid" $enabled)) (not (kindIs "bool" $enabled)) -}}
+{{- fail (printf "priorityRouting.enabled must be a boolean, got %q" (toString $enabled)) -}}
+{{- end -}}
+{{- if and (kindIs "bool" $enabled) $enabled }}true{{ end -}}
+{{- end -}}
+
+{{- define "llm-d-router.priorityRouting.primaryReplicas" -}}
+{{- $router := .Values.router | default dict -}}
+{{- $proxy := index $router "proxy" | default dict -}}
+{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
+{{- $pr := index $proxy "priorityRouting" | default dict -}}
+{{- index $pr "primaryReplicas" | default 1 | int -}}
+{{- end -}}
+
+{{- define "llm-d-router.priorityRouting.standbyReplicas" -}}
+{{- $router := .Values.router | default dict -}}
+{{- $proxy := index $router "proxy" | default dict -}}
+{{- if empty $proxy }}{{ $proxy = .Values.proxy | default dict }}{{ end -}}
+{{- $pr := index $proxy "priorityRouting" | default dict -}}
+{{- index $pr "standbyReplicas" | default 1 | int -}}
+{{- end -}}
+
+{{- define "llm-d-router.priorityRouting.totalReplicas" -}}
+{{- $primary := include "llm-d-router.priorityRouting.primaryReplicas" . | int -}}
+{{- $standby := include "llm-d-router.priorityRouting.standbyReplicas" . | int -}}
+{{- add $primary $standby -}}
+{{- end -}}
+
+{{- define "llm-d-router.validations.epp.autoscaling" -}}
+{{- $autoscaling := .Values.router.epp.autoscaling | default dict -}}
+{{- if $autoscaling.enabled }}
+  {{- $isPriorityRouting := eq (include "llm-d-router.priorityRouting.enabled" .) "true" -}}
+  {{- if $isPriorityRouting }}
+    {{- fail "EPP autoscaling (.Values.router.epp.autoscaling.enabled=true) is not supported when priority routing is enabled (router.proxy.priorityRouting.enabled=true)" }}
+  {{- end }}
+  {{- $gkePB := include "llm-d-router.gkePreferredBackends" . | fromYaml | default dict -}}
+  {{- if $gkePB.enabled }}
+    {{- fail "EPP autoscaling (.Values.router.epp.autoscaling.enabled=true) is not supported when GKE preferredBackends is enabled" }}
+  {{- end }}
+  {{- $eppFlags := include "llm-d-router.epp.flags" . | fromYaml -}}
+  {{- if index $eppFlags "ha-enable-leader-election" }}
+    {{- fail "EPP autoscaling requires active-active replicas: router.epp.flags.ha-enable-leader-election cannot be true when router.epp.autoscaling.enabled=true" }}
+  {{- end }}
+  {{- $minReplicas := 1 }}
+  {{- if hasKey $autoscaling "minReplicas" }}
+    {{- $minReplicas = int $autoscaling.minReplicas }}
+    {{- if lt $minReplicas 1 }}
+      {{- fail ".Values.router.epp.autoscaling.minReplicas must be at least 1" }}
+    {{- end }}
+  {{- end }}
+  {{- $maxReplicas := 5 }}
+  {{- if hasKey $autoscaling "maxReplicas" }}
+    {{- $maxReplicas = int $autoscaling.maxReplicas }}
+    {{- if lt $maxReplicas 1 }}
+      {{- fail ".Values.router.epp.autoscaling.maxReplicas must be at least 1" }}
+    {{- end }}
+  {{- end }}
+  {{- if lt $maxReplicas $minReplicas }}
+    {{- fail ".Values.router.epp.autoscaling.maxReplicas must be greater than or equal to minReplicas" }}
+  {{- end }}
+  {{- if hasKey $autoscaling "targetCPUUtilizationPercentage" }}
+    {{- $cpu := int $autoscaling.targetCPUUtilizationPercentage }}
+    {{- if or (lt $cpu 1) (gt $cpu 100) }}
+      {{- fail ".Values.router.epp.autoscaling.targetCPUUtilizationPercentage must be between 1 and 100" }}
+    {{- end }}
+  {{- end }}
+  {{- if hasKey $autoscaling "targetMemoryUtilizationPercentage" }}
+    {{- $mem := int $autoscaling.targetMemoryUtilizationPercentage }}
+    {{- if or (lt $mem 1) (gt $mem 100) }}
+      {{- fail ".Values.router.epp.autoscaling.targetMemoryUtilizationPercentage must be between 1 and 100" }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
 {{- define "llm-d-router.validations.epp" -}}
 {{- include "llm-d-router.validations.deprecations" . }}
 {{- include "llm-d-router.validations.epp.resources" . }}
 {{- include "llm-d-router.validations.epp.inferenceObjectives" . }}
 {{- include "llm-d-router.validations.epp.tokenizer" . }}
+{{- include "llm-d-router.validations.epp.latencyPredictor" . }}
+{{- include "llm-d-router.validations.epp.preferredBackends" . }}
+{{- include "llm-d-router.validations.epp.autoscaling" . }}
+{{- $isPriorityRouting := eq (include "llm-d-router.priorityRouting.enabled" .) "true" -}}
+{{- if and $isPriorityRouting (ne (include "llm-d-router.proxyMode" .) "service") -}}
+{{- fail "priorityRouting is only supported when proxy mode is set to 'service' (router.proxy.mode=service)" -}}
+{{- end -}}
+{{- $eppFlags := .Values.router.epp.flags | default dict -}}
+{{- if and (or $isPriorityRouting (include "llm-d-router.proxy.discoveryServiceName" .)) (hasKey $eppFlags "health-checking") -}}
+{{- $healthChecking := index $eppFlags "health-checking" -}}
+{{- if not (kindIs "bool" $healthChecking) -}}
+{{- fail (printf ".Values.router.epp.flags.health-checking must be a boolean, got %q" (toString $healthChecking)) -}}
+{{- end -}}
+{{- if not $healthChecking -}}
+{{- if $isPriorityRouting -}}
+{{- fail "priorityRouting requires EPP's gRPC health service on port 9002 (router.epp.flags.health-checking cannot be false when priorityRouting.enabled=true)" -}}
+{{- else -}}
+{{- fail "active-active Envoy discovery requires EPP's gRPC health service (router.epp.flags.health-checking cannot be false)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
-Tokenizer validations: require modelName for the render sidecar's command args.
+Tokenizer validations: require modelName and valid flavor for the render sidecar.
 */}}
 {{- define "llm-d-router.validations.epp.tokenizer" -}}
 {{- $tokenizer := .Values.router.tokenizer | default dict }}
-{{- if and (dig "enabled" false $tokenizer) (not (dig "modelName" "" $tokenizer)) }}
+{{- if (dig "enabled" false $tokenizer) }}
+{{- if not (dig "modelName" "" $tokenizer) }}
 {{- fail ".Values.router.tokenizer.modelName is required when the tokenizer is enabled." }}
 {{- end }}
+{{- $flavor := dig "flavor" "python" $tokenizer | lower }}
+{{- if not (or (eq $flavor "python") (eq $flavor "rust")) }}
+{{- fail (printf ".Values.router.tokenizer.flavor must be one of [python, rust], got %q" (dig "flavor" "" $tokenizer)) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Latency predictor validations
+*/}}
+{{- define "llm-d-router.validations.epp.latencyPredictor" -}}
+{{- $mode := include "llm-d-router.latencyPredictor.mode" . -}}
+{{- if not (or (eq $mode "sidecar") (eq $mode "service")) -}}
+{{- fail (printf ".Values.router.latencyPredictor.mode must be one of [sidecar, service], got %q" $mode) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -442,5 +667,27 @@ Deprecation validations
 {{- end }}
 {{- if .Values.inferenceObjectives }}
 {{- fail "Top-level 'inferenceObjectives' is deprecated. Please migrate your values to 'router.inferenceObjectives'." }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Annotations for the EPP pod template.
+
+The EPP parses its plugin configuration once at startup and never re-reads the
+mounted file, so a helm upgrade that touches only a ConfigMap has to change the
+pod template or the running pod keeps its old configuration. Hash the whole
+config partial rather than one ConfigMap: it renders the plugins, proxy and
+latency-predictor ConfigMaps. In service mode the latency-predictor ConfigMaps
+belong to the predictor Deployments, so they are left out and a
+predictor-only change does not restart EPP.
+*/}}
+{{- define "llm-d-epp.podAnnotations" -}}
+{{- if eq (include "llm-d-router.latencyPredictor.mode" .) "service" -}}
+checksum/config: {{ include "llm-d-epp.router-config" . | sha256sum }}
+{{- else -}}
+checksum/config: {{ include "llm-d-epp.config" . | sha256sum }}
+{{- end }}
+{{- with .Values.router.epp.podAnnotations }}
+{{- toYaml . | nindent 0 }}
 {{- end }}
 {{- end -}}

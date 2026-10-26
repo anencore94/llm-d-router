@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,7 +32,7 @@ func TestFactory(t *testing.T) {
 	runtime := NewTestRuntime(t, 100*time.Millisecond)
 
 	pod1 := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{
+		ID: types.NamespacedName{
 			Name:      "pod1",
 			Namespace: "default",
 		},
@@ -44,7 +45,7 @@ func TestFactory(t *testing.T) {
 	assert.Nil(t, dup, "expected to fail to create a duplicate collector")
 
 	pod2 := &fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{
+		ID: types.NamespacedName{
 			Name:      "pod2",
 			Namespace: "default",
 		},

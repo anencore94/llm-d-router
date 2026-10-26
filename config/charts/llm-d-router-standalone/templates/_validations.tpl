@@ -33,10 +33,6 @@ standalone validations
   {{- if not $proxy.enabled -}}
     {{- fail ".Values.router.proxy.enabled must be true when .Values.router.proxy.mode=service" -}}
   {{- end -}}
-  {{- $proxyType := default "envoy" ($proxy.proxyType | default "envoy") | lower -}}
-  {{- if ne $proxyType "envoy" -}}
-    {{- fail (printf ".Values.router.proxy.mode=service currently supports only proxyType=envoy, got %q" $proxyType) -}}
-  {{- end -}}
   {{- $hasHTTP := false -}}
   {{- range $servicePort := (.Values.router.extraServicePorts | default (list)) -}}
     {{- if eq (toString (index $servicePort "name")) "http" -}}
@@ -62,7 +58,45 @@ standalone validations
     {{- $listenerPort := include "llm-d-router.standaloneProxyListenerPort" . -}}
     {{- $flags := .Values.router.epp.flags | default dict -}}
     {{- if and (hasKey $flags "secure-serving") (ne (toString (index $flags "secure-serving")) "false") -}}
-      {{- fail ".Values.router.epp.flags.secure-serving must be false when proxyType=agentgateway; standalone agentgateway uses plaintext gRPC to EPP over localhost" -}}
+      {{- fail ".Values.router.epp.flags.secure-serving must be false when proxyType=agentgateway; standalone agentgateway uses plaintext gRPC to EPP (over loopback in sidecar mode, or the EPP Service in service mode)" -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $autoscaling := dig "autoscaling" dict .Values.router.proxy -}}
+{{- if $autoscaling.enabled -}}
+  {{- if not $proxy.enabled -}}
+    {{- fail "Proxy autoscaling (.Values.router.proxy.autoscaling.enabled=true) requires proxy to be enabled (.Values.router.proxy.enabled=true)" -}}
+  {{- end -}}
+  {{- if ne $proxyMode "service" -}}
+    {{- fail "Proxy autoscaling (.Values.router.proxy.autoscaling.enabled=true) is only supported when proxy mode is set to 'service' (.Values.router.proxy.mode=service)" -}}
+  {{- end -}}
+  {{- $minReplicas := 1 -}}
+  {{- if hasKey $autoscaling "minReplicas" -}}
+    {{- $minReplicas = int $autoscaling.minReplicas -}}
+    {{- if lt $minReplicas 1 -}}
+      {{- fail ".Values.router.proxy.autoscaling.minReplicas must be at least 1" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $maxReplicas := 5 -}}
+  {{- if hasKey $autoscaling "maxReplicas" -}}
+    {{- $maxReplicas = int $autoscaling.maxReplicas -}}
+    {{- if lt $maxReplicas 1 -}}
+      {{- fail ".Values.router.proxy.autoscaling.maxReplicas must be at least 1" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if lt $maxReplicas $minReplicas -}}
+    {{- fail ".Values.router.proxy.autoscaling.maxReplicas must be greater than or equal to minReplicas" -}}
+  {{- end -}}
+  {{- if and (hasKey $autoscaling "targetCPUUtilizationPercentage") (not (kindIs "invalid" $autoscaling.targetCPUUtilizationPercentage)) -}}
+    {{- $cpu := int $autoscaling.targetCPUUtilizationPercentage -}}
+    {{- if or (lt $cpu 1) (gt $cpu 100) -}}
+      {{- fail ".Values.router.proxy.autoscaling.targetCPUUtilizationPercentage must be between 1 and 100" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if and (hasKey $autoscaling "targetMemoryUtilizationPercentage") (not (kindIs "invalid" $autoscaling.targetMemoryUtilizationPercentage)) -}}
+    {{- $mem := int $autoscaling.targetMemoryUtilizationPercentage -}}
+    {{- if or (lt $mem 1) (gt $mem 100) -}}
+      {{- fail ".Values.router.proxy.autoscaling.targetMemoryUtilizationPercentage must be between 1 and 100" -}}
     {{- end -}}
   {{- end -}}
 {{- end -}}

@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,8 +30,8 @@ import (
 
 func createTestEndpointWithLabels(name string, kvCacheUsage float64, runningRequestsSize, waitingQueueSize int, labels map[string]string) fwksched.Endpoint {
 	return fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: name, Namespace: "default"},
-		Labels:         labels,
+		ID:     types.NamespacedName{Name: name, Namespace: "default"},
+		Labels: labels,
 	}, &fwkdl.Metrics{
 		KVCacheUsagePercent: kvCacheUsage,
 		RunningRequestsSize: runningRequestsSize,

@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -39,12 +40,35 @@ func TestExtractMetadataValues(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		metadata map[string]*structpb.Struct
+		req      *extProcPb.ProcessingRequest
 		expected map[string]any
 	}{
 		{
-			name:     "Exact match",
-			metadata: makeFilterMetadata(),
+			name:     "Nil request",
+			req:      nil,
+			expected: nil,
+		},
+		{
+			name:     "Nil MetadataContext",
+			req:      &extProcPb.ProcessingRequest{},
+			expected: nil,
+		},
+		{
+			name: "Empty FilterMetadata",
+			req: &extProcPb.ProcessingRequest{
+				MetadataContext: &corev3.Metadata{
+					FilterMetadata: map[string]*structpb.Struct{},
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "Populated metadata",
+			req: &extProcPb.ProcessingRequest{
+				MetadataContext: &corev3.Metadata{
+					FilterMetadata: makeFilterMetadata(),
+				},
+			},
 			expected: map[string]any{
 				"key-1": map[string]any{
 					"hello":      "world",
@@ -56,13 +80,7 @@ func TestExtractMetadataValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := &extProcPb.ProcessingRequest{
-				MetadataContext: &corev3.Metadata{
-					FilterMetadata: tt.metadata,
-				},
-			}
-
-			result := ExtractMetadataValues(req)
+			result := ExtractMetadataValues(tt.req)
 			if diff := cmp.Diff(result, tt.expected); diff != "" {
 				t.Errorf("ExtractMetadataValues() unexpected response (-want +got): %v", diff)
 			}

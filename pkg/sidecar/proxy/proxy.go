@@ -20,13 +20,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -35,6 +37,8 @@ import (
 	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 )
 
@@ -43,107 +47,12 @@ const (
 
 	defaultMaxIdleConnsPerHost = 1024
 
-	requestHeaderRequestID = "x-request-id"
-
-	requestFieldKVTransferParams     = "kv_transfer_params"
-	requestFieldECTransferParams     = "ec_transfer_params"
-	requestFieldMaxTokens            = "max_tokens"
-	requestFieldMaxCompletionTokens  = "max_completion_tokens"
-	requestFieldMaxOutputTokens      = "max_output_tokens" // Used by Responses API
-	requestFieldMinTokens            = "min_tokens"
-	requestFieldSamplingParams       = "sampling_params"
-	requestFieldDoRemotePrefill      = "do_remote_prefill"
-	requestFieldDoRemoteDecode       = "do_remote_decode"
-	requestFieldRemoteBlockIDs       = "remote_block_ids"
-	requestFieldRemoteEngineID       = "remote_engine_id"
-	requestFieldRemoteHost           = "remote_host"
-	requestFieldRemotePort           = "remote_port"
-	requestFieldStream               = "stream"
-	requestFieldStreamOptions        = "stream_options"
-	requestFieldCacheHitThreshold    = "cache_hit_threshold"
-	requestFieldContinueFinalMessage = "continue_final_message"
-	requestFieldAddGenerationPrompt  = "add_generation_prompt"
-
-	// requestHeaderDataParallelRank pins a request to a specific vLLM
-	// data-parallel rank, set on both legs of a disagg pair (see pickDPRank).
-	requestHeaderDataParallelRank = "x-data-parallel-rank"
-
-	// MoRI-IO WRITE-mode kv_transfer_params fields, populated by the sidecar
-	// so the prefill engine can push KV to decode via RDMA Write.
-	requestFieldRemoteNotifyPort = "remote_notify_port"
-	requestFieldRemoteDPRank     = "remote_dp_rank"
-	// requestFieldRemoteDPRankOverride tells the decode-side connector to use
-	// the sidecar's remote_dp_rank verbatim rather than recomputing its own hash.
-	requestFieldRemoteDPRankOverride = "remote_dp_rank_override"
-	requestFieldRemoteHandshakePort  = "remote_handshake_port"
-	requestFieldTransferID           = "transfer_id"
+	// tracerScope is the OTel instrumentation scope for the sidecar proxy.
+	tracerScope = "llm-d-router/pkg/sidecar/proxy"
 
 	responseFieldChoices      = "choices"
 	responseFieldFinishReason = "finish_reason"
-
-	finishReasonCacheThreshold = "cache_threshold"
-
-	// SGLang bootstrap fields
-	requestFieldBootstrapHost = "bootstrap_host"
-	requestFieldBootstrapPort = "bootstrap_port"
-	requestFieldBootstrapRoom = "bootstrap_room"
-	// Mooncake transfer fields
-	requestFieldRemoteBootstrapAddr = "remote_bootstrap_addr"
-
-	KVConnectorNIXLV2        = constants.KVConnectorNIXLV2
-	KVConnectorSharedStorage = constants.KVConnectorSharedStorage
-	KVConnectorSGLang        = constants.KVConnectorSGLang
-	KVConnectorMooncake      = constants.KVConnectorMooncake
-	ECExampleConnector       = constants.ECExampleConnector
-	ECConnectorNIXL          = constants.ECConnectorNIXL
 )
-
-// APIType represents the type of OpenAI API being used.
-type APIType int
-
-const (
-	// APITypeChatCompletions is the Chat Completions API (/v1/chat/completions, /v1/completions)
-	APITypeChatCompletions APIType = iota
-	// APITypeResponses is the Responses API (/v1/responses)
-	APITypeResponses
-	// APITypeGenerate is vLLM's token-in generate API (/inference/v1/generate)
-	APITypeGenerate
-)
-
-// String implements fmt.Stringer so structured logs show readable API names.
-func (a APIType) String() string {
-	switch a {
-	case APITypeChatCompletions:
-		return "chat_completions"
-	case APITypeResponses:
-		return "responses"
-	case APITypeGenerate:
-		return "generate"
-	default:
-		return fmt.Sprintf("APIType(%d)", int(a))
-	}
-}
-
-// JSON request field names used for token limits in prefill/decode staging.
-// Do not mutate these slices.
-var (
-	chatCompletionTokenLimitFields = []string{requestFieldMaxTokens, requestFieldMaxCompletionTokens}
-	responsesStyleTokenLimitFields = []string{requestFieldMaxOutputTokens}
-	generateStyleTokenLimitFields  = []string{requestFieldMaxTokens, requestFieldMinTokens}
-)
-
-// tokenLimitFieldsForAPIType returns token limit field names for the given API.
-// Returned slices are shared package-level vars; callers must not mutate them.
-func tokenLimitFieldsForAPIType(api APIType) []string {
-	switch api {
-	case APITypeResponses:
-		return responsesStyleTokenLimitFields
-	case APITypeGenerate:
-		return generateStyleTokenLimitFields
-	default:
-		return chatCompletionTokenLimitFields
-	}
-}
 
 // Config represents the complete runtime configuration for the proxy server.
 type Config struct {
@@ -193,9 +102,40 @@ type Config struct {
 	SecureServing bool
 	// CertPath is the path to TLS certificates for the sidecar server.
 	CertPath string
+	// TLSMinVersion is the minimum TLS version accepted by the sidecar server.
+	TLSMinVersion uint16
+	// TLSCipherSuites are the TLS 1.2 and below cipher suites accepted by the sidecar server.
+	TLSCipherSuites []uint16
+
+	// MetricsPort is the port for the Prometheus /metrics endpoint. 0 (the
+	// default) disables it; when > 0 the sidecar serves the shared metrics
+	// registry (carrying the moriio_dns_* and llm_d_disagg_sidecar_* counters)
+	// at /metrics on that port, on a separate address from the data-plane
+	// proxy port so the model server's own /metrics path stays reachable
+	// through the proxy. Takes precedence over the MORIIO_METRICS_ADDR env
+	// var (kept for backward compatibility).
+	MetricsPort int
+	// MetricsCertDir is the directory holding tls.crt and tls.key for the
+	// metrics endpoint. Empty (the default) serves metrics over plain HTTP.
+	// Independent of SecureServing/CertPath, which apply to the data-plane
+	// listener.
+	MetricsCertDir string
 
 	// MooncakeBootstrapPort is the port used to query the Mooncake bootstrap endpoint on prefill pods.
 	MooncakeBootstrapPort int
+
+	// P2PConnectorPort is the prefiller's OffloadingConnector P2P tier listening port,
+	// injected as remote_port on the decode request so the decoder can pull KV from it.
+	// With data parallelism it is the rank-0 port: rank r's tier listens on
+	// P2PConnectorPort+r and the injected port is offset by the target's rank.
+	// Meaningful with --kv-connector=offloading or --enable-p2p-pull.
+	P2PConnectorPort int
+
+	// EnableP2PPull declares that the OffloadingConnector P2P tier is available
+	// for cached-prefix pulls even when the PD connector is not offloading, i.e.
+	// the engines run MultiConnector(NixlConnector + OffloadingConnector). It has
+	// no effect with --kv-connector=offloading, where the tier is always present.
+	EnableP2PPull bool
 
 	// EnableSSRFProtection enables SSRF protection using InferencePool allowlisting.
 	EnableSSRFProtection bool
@@ -212,23 +152,32 @@ type Config struct {
 
 	// Tracing enables OpenTelemetry tracing.
 	Tracing bool
+	// EnableToolCallingTelemetry enables tool-specific request observations.
+	EnableToolCallingTelemetry bool
 	// MoRIIOWriteMode enables MoRI-IO WRITE-mode: the sidecar populates the
-	// prefill leg's kv_transfer_params so the prefill engine pushes KV to decode
+	// prefill request's kv_transfer_params so the prefill engine pushes KV to decode
 	// via RDMA Write. Only meaningful with --kv-connector=nixlv2.
 	MoRIIOWriteMode bool
 	// MoRIIODecodeNotifyPort is the decode pod's base MoRI-IO notify port.
 	MoRIIODecodeNotifyPort int
 	// MoRIIODecodeHandshakePort is the decode pod's base MoRI-IO handshake port.
 	MoRIIODecodeHandshakePort int
-	// MoRIIODecodePodIP is decode's routable pod IP, used as the prefill leg's
+	// MoRIIODecodePodIP is decode's routable address, used as the prefill request's
 	// remote_host so prefill handshakes with decode (not itself). Must not be
-	// localhost; typically the POD_IP downward-API value.
+	// localhost; typically the POD_IP downward-API value. May be set to a
+	// Kubernetes DNS name (e.g., an LWS pod name), which is resolved to an IP at
+	// startup in Complete(); raw IPs are passed through unchanged.
 	MoRIIODecodePodIP string
 
-	// MoRIIOParallelDispatch fires the prefill and decode legs concurrently,
+	// MoRIIOParallelDispatch fires the prefill and decode requests concurrently,
 	// synthesising decode's kv_transfer_params from config instead of reading
 	// them from the prefill response. Requires MoRIIOWriteMode.
 	MoRIIOParallelDispatch bool
+	// MoRIIOParallelDecodeWaitTimeout bounds how long the parallel WRITE
+	// dispatch waits for the prefill outcome before cancelling decode, so a
+	// hung or failed prefill cannot make decode wait for KV that never
+	// arrives. Zero falls back to defaultMoRIIOParallelDecodeWaitTimeout.
+	MoRIIOParallelDecodeWaitTimeout time.Duration
 	// MoRIIOPrefillHandshakePort is the prefill pod's base MoRI-IO handshake port.
 	MoRIIOPrefillHandshakePort int
 	// MoRIIOPrefillNotifyPort is the prefill pod's base MoRI-IO notify port.
@@ -237,12 +186,12 @@ type Config struct {
 	// kv_transfer_params[tp_size] in parallel-dispatch mode.
 	MoRIIOTPSize int
 	// MoRIIODPSize is the data-parallel world size, emitted as remote_dp_size on
-	// both legs. Wide-EP (TP=1, DP>1) must set this so the decode connector
+	// both requests. Wide-EP (TP=1, DP>1) must set this so the decode connector
 	// registers RDMA notifies against every DP rank; 1 leaves the wire unchanged.
 	MoRIIODPSize int
 
 	// MoRIIORemoteHosts is the ordered list of prefill-side pod IPs across which
-	// vLLM fans out its per-DP-rank handshake, emitted as the decode leg's
+	// vLLM fans out its per-DP-rank handshake, emitted as the decode request's
 	// remote_hosts. host[i] serves DP ranks [i*MoRIIODPSizeLocal, (i+1)*...).
 	// Empty disables fan-out (single-host fallback).
 	MoRIIORemoteHosts []string
@@ -250,9 +199,20 @@ type Config struct {
 	// via pod_idx = dp_rank / MoRIIODPSizeLocal. 0 means single-pod.
 	MoRIIODPSizeLocal int
 	// MoRIIODecodeHosts is the decode-side counterpart of MoRIIORemoteHosts,
-	// emitted as the prefill leg's remote_hosts. A multi-pod deployment sets
+	// emitted as the prefill request's remote_hosts. A multi-pod deployment sets
 	// both; the lists must use opposite sides or every cross-pod handshake hangs.
+	// DNS names (e.g., LWS pod names) are automatically resolved to IPs at startup.
 	MoRIIODecodeHosts []string
+
+	// MoRIIORemoteHostSpecs / MoRIIODecodeHostSpecs / MoRIIODecodePodIPSpec hold
+	// the ORIGINAL host specs (DNS names or raw IPs) exactly as supplied on the
+	// CLI, captured in Complete() before one-shot resolution rewrites the
+	// resolved fields above. The request path re-resolves these specs through a
+	// short-TTL hostResolver so a peer pod that restarts with a new IP is picked
+	// up without a router restart. Raw-IP specs pass through unchanged.
+	MoRIIORemoteHostSpecs []string
+	MoRIIODecodeHostSpecs []string
+	MoRIIODecodePodIPSpec string
 }
 
 // MarshalJSON implements json.Marshaler for Config.
@@ -281,11 +241,12 @@ func (c Config) String() string {
 	return string(b)
 }
 
-// pdConnectorHandler handles a P/D KV connector request. The APIType lets each
-// connector decide internally which JSON fields (if any) need special handling.
-type pdConnectorHandler func(http.ResponseWriter, *http.Request, string, APIType)
+// pdConnectorHandler handles a P/D KV connector request. kvCacheSource is the
+// validated x-llm-d-kv-cache-source-host-port peer to pull cached prefix from ("" when
+// absent); the APIType selects the fields that cap the prefill request.
+type pdConnectorHandler func(http.ResponseWriter, *http.Request, string, string, reqcommon.APIType)
 
-type ecConnectorHandler func(http.ResponseWriter, *http.Request, string, []string)
+type ecConnectorHandler func(http.ResponseWriter, *http.Request, string, []string, reqcommon.APIType)
 
 // Server is the reverse proxy server
 type Server struct {
@@ -306,16 +267,107 @@ type Server struct {
 	dataParallelProxies map[string]http.Handler               // Proxies to other vLLM servers
 	forwardDataParallel bool                                  // Use special Data Parallel work around
 
-	prefillSamplerFn func(n int) int // allow test override
+	prefillSamplerFn func(n int) int        // allow test override
+	nixlRequestIDFn  func() (string, error) // allow test override
+
+	// dpBasePort is the rank-0 proxy port. Rank clones override config.Port
+	// (data_parallel.go), so rank derivation from a routed endpoint's port
+	// needs the pre-clone base. 0 disables derivation.
+	dpBasePort int
+
+	// hostResolver re-resolves MoRI-IO peer DNS specs to IPs on a short TTL so
+	// peer pod restarts are picked up on the request path. Lazily initialized
+	// via resolverOnce (clone-safe; each Server gets its own).
+	resolverOnce sync.Once
+	hostResolver *hostResolver
 
 	config Config
+
+	// HTTPListener is an optional pre-bound listener for the data-plane HTTP
+	// server. When set, startHTTP serves on it and does not call net.Listen.
+	// Reserving the port in advance of Start closes the window in which another
+	// process can take a port that was selected but not yet bound. config.Port
+	// is still used for data-parallel rank math.
+	HTTPListener net.Listener
+
+	// MetricsListener is an optional pre-bound listener for the /metrics
+	// server. When set, serveMetrics serves on it and does not call net.Listen.
+	MetricsListener net.Listener
+
+	// DataParallelListeners holds pre-bound listeners for data-parallel rank
+	// clones 1..N-1 (index 0 is rank 1). When non-empty, startDataParallel
+	// assigns each to the corresponding clone's HTTPListener instead of
+	// calling net.Listen. Production leaves this nil and clones bind from
+	// config.Port + rank.
+	DataParallelListeners []net.Listener
+}
+
+// resolver lazily initializes and returns the request-path host resolver.
+// Initialization is deferred so it can use s.logger (populated in Start) and
+// so Clone'd servers each get their own instance.
+func (s *Server) resolver() *hostResolver {
+	s.resolverOnce.Do(func() {
+		s.hostResolver = newHostResolver(s.logger, resolveTTLFromEnv())
+		s.seedResolver(s.hostResolver)
+	})
+	return s.hostResolver
+}
+
+// seedResolver primes the request-path resolver with the spec->IP mappings that
+// Complete() already resolved at startup, so the first request does not repeat
+// those lookups and a request-time DNS failure still serves the startup IP
+// instead of the raw hostname (which would hang the MoRI-IO handshake). Specs
+// and their resolved IPs are captured positionally in Complete(); a length
+// mismatch (e.g. a Config built directly in tests) skips seeding for that list.
+func (s *Server) seedResolver(r *hostResolver) {
+	seedPairs := func(specs, ips []string) {
+		if len(specs) != len(ips) {
+			return
+		}
+		for i := range specs {
+			r.seed(specs[i], ips[i])
+		}
+	}
+	seedPairs(s.config.MoRIIODecodeHostSpecs, s.config.MoRIIODecodeHosts)
+	seedPairs(s.config.MoRIIORemoteHostSpecs, s.config.MoRIIORemoteHosts)
+	r.seed(s.config.MoRIIODecodePodIPSpec, s.config.MoRIIODecodePodIP)
+}
+
+// currentDecodeHosts returns the decode-side peer IPs for the current request,
+// re-resolving the original specs through the short-TTL resolver. The request
+// context bounds any cold-start lookup so a cancelled/timed-out request cancels
+// the DNS lookup. Falls back to the boot-resolved config field when no specs
+// were captured (e.g. tests that build Config directly).
+func (s *Server) currentDecodeHosts(ctx context.Context) []string {
+	if len(s.config.MoRIIODecodeHostSpecs) == 0 {
+		return s.config.MoRIIODecodeHosts
+	}
+	return s.resolver().resolve(ctx, s.config.MoRIIODecodeHostSpecs)
+}
+
+// currentRemoteHosts is the prefill-side counterpart of currentDecodeHosts.
+func (s *Server) currentRemoteHosts(ctx context.Context) []string {
+	if len(s.config.MoRIIORemoteHostSpecs) == 0 {
+		return s.config.MoRIIORemoteHosts
+	}
+	return s.resolver().resolve(ctx, s.config.MoRIIORemoteHostSpecs)
+}
+
+// currentDecodePodIP returns decode's advertised remote_host for the current
+// request, re-resolving the original spec through the short-TTL resolver. The
+// request context bounds any cold-start lookup.
+func (s *Server) currentDecodePodIP(ctx context.Context) string {
+	if s.config.MoRIIODecodePodIPSpec == "" {
+		return s.config.MoRIIODecodePodIP
+	}
+	return s.resolver().resolveOne(ctx, s.config.MoRIIODecodePodIPSpec)
 }
 
 // NewProxy creates a new routing reverse proxy from the given Config.
 func NewProxy(config Config) *Server {
-	prefillerCache, _ := lru.New[string, http.Handler](1024)         // nolint:errcheck
-	encoderCache, _ := lru.New[string, http.Handler](1024)           // nolint:errcheck
-	mooncakeEngineIDs, _ := lru.New[string, map[string]string](1024) // nolint:errcheck
+	prefillerCache, _ := lru.New[string, http.Handler](1024)
+	encoderCache, _ := lru.New[string, http.Handler](1024)
+	mooncakeEngineIDs, _ := lru.New[string, map[string]string](1024)
 
 	server := &Server{
 		readyCh:             make(chan struct{}),
@@ -328,6 +380,10 @@ func NewProxy(config Config) *Server {
 		dataParallelProxies: map[string]http.Handler{},
 		forwardDataParallel: true,
 		prefillSamplerFn:    rand.IntN,
+		nixlRequestIDFn:     newNIXLV2RequestID,
+	}
+	if basePort, err := strconv.Atoi(config.Port); err == nil {
+		server.dpBasePort = basePort
 	}
 
 	server.setKVConnector()
@@ -363,6 +419,20 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	if s.allowlistValidator.enabled {
+		defer s.allowlistValidator.Stop()
+		if err := s.allowlistValidator.Start(ctx); err != nil {
+			return err
+		}
+	} else {
+		s.logger.Info("warning: SSRF protection is disabled; targets taken from request headers are not checked against the InferencePool",
+			"flag", "--"+enableSSRFProtection,
+			"headers", slices.Concat(
+				routing.HeaderNames(routing.PrefillEndpointHeader),
+				routing.HeaderNames(routing.EncoderEndpointsHeader),
+				routing.HeaderNames(routing.KVCacheSourceHeader)))
+	}
+
 	// Configure handlers
 	s.handler = s.createRoutes()
 
@@ -375,20 +445,20 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.startHTTP(ctx)
 	})
 
+	// Opt-in Prometheus /metrics endpoint (--metrics-port or MORIIO_METRICS_ADDR); no-op when unset.
+	s.maybeStartMetrics(ctx, grp)
+
 	return grp.Wait()
 }
 
-// Clone returns a clone of the current Server struct.
-// Note: decoderURL and decoderProxy are intentionally not copied — callers (e.g. startDataParallel)
-// always set them explicitly after cloning.
+// Clone returns a partially initialized Server that is not ready to serve requests.
+// Routes, connector handlers, decoderProxy, and listeners are not copied;
+// callers initialize them after setting the clone's serving and decoder addresses.
 func (s *Server) Clone() *Server {
 	return &Server{
 		addr:                s.addr,
 		readyCh:             make(chan struct{}),
-		handler:             s.handler,
 		allowlistValidator:  s.allowlistValidator,
-		handlePDConnector:   s.handlePDConnector,
-		handleECConnector:   s.handleECConnector,
 		prefillerURLPrefix:  s.prefillerURLPrefix,
 		encoderURLPrefix:    s.encoderURLPrefix,
 		prefillerProxies:    s.prefillerProxies,
@@ -397,6 +467,8 @@ func (s *Server) Clone() *Server {
 		dataParallelProxies: s.dataParallelProxies,
 		forwardDataParallel: s.forwardDataParallel,
 		prefillSamplerFn:    s.prefillSamplerFn,
+		nixlRequestIDFn:     s.nixlRequestIDFn,
+		dpBasePort:          s.dpBasePort,
 		config:              s.config,
 	}
 }
@@ -411,14 +483,14 @@ func (s *Server) newProxyTransport(scheme string, insecureSkipVerify bool) http.
 	if maxIdle <= 0 {
 		maxIdle = defaultMaxIdleConnsPerHost
 	}
-	t := http.DefaultTransport.(*http.Transport).Clone() //nolint:errcheck
-	t.MaxIdleConns = 0                                   // unlimited
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 0 // unlimited
 	t.MaxIdleConnsPerHost = maxIdle
 	t.MaxConnsPerHost = 0 // unlimited
 	t.IdleConnTimeout = 90 * time.Second
 	if scheme == schemeHTTPS {
 		t.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: insecureSkipVerify, //nolint:gosec
+			InsecureSkipVerify: insecureSkipVerify, //#nosec
 			MinVersion:         tls.VersionTLS12,
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -436,22 +508,30 @@ func (s *Server) newProxyTransport(scheme string, insecureSkipVerify bool) http.
 func (s *Server) setKVConnector() {
 
 	switch s.config.KVConnector {
-	case KVConnectorSharedStorage:
-		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ APIType) {
-			s.handleSharedStorage(w, r, host)
+	case constants.KVConnectorSharedStorage:
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ string, apiType reqcommon.APIType) {
+			s.handleSharedStorage(w, r, host, apiType)
 		}
-	case KVConnectorSGLang:
-		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ APIType) {
+	case constants.KVConnectorSGLang:
+		// SGLang sends the same body to the prefill and decode requests and caps no
+		// output tokens, so it does not use the API type.
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ string, _ reqcommon.APIType) {
 			s.handleSGLang(w, r, host)
 		}
-	case KVConnectorMooncake:
-		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ APIType) {
-			s.handleMooncake(w, r, host)
+	case constants.KVConnectorMooncake:
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ string, apiType reqcommon.APIType) {
+			s.handleMooncake(w, r, host, apiType)
 		}
-	case KVConnectorNIXLV2:
+	case constants.KVConnectorOffloading:
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, kvCacheSource string, apiType reqcommon.APIType) {
+			s.handleP2P(w, r, host, kvCacheSource, apiType)
+		}
+	case constants.KVConnectorNIXLV2:
 		fallthrough
 	default:
-		s.handlePDConnector = s.handleNIXLV2
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, kvCacheSource string, apiType reqcommon.APIType) {
+			s.handleNIXLV2(w, r, host, kvCacheSource, apiType)
+		}
 	}
 }
 
@@ -464,9 +544,9 @@ func (s *Server) setECConnector() {
 	}
 
 	switch ecConnector {
-	case ECExampleConnector:
+	case constants.ECExampleConnector:
 		s.handleECConnector = s.handleECSharedStorage
-	case ECConnectorNIXL:
+	case constants.ECConnectorNIXL:
 		s.handleECConnector = s.handleECNIXL
 	default:
 		// Unknown EC connector value, skip encoder stage. Validate() should
@@ -486,11 +566,18 @@ func (s *Server) createRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("POST "+ChatCompletionsPath, s.disaggregatedPrefillHandler(APITypeChatCompletions))
-	mux.HandleFunc("POST "+CompletionsPath, s.disaggregatedPrefillHandler(APITypeChatCompletions))
-	mux.HandleFunc("POST "+MessagesPath, s.disaggregatedPrefillHandler(APITypeChatCompletions))
-	mux.HandleFunc("POST "+ResponsesPath, s.disaggregatedPrefillHandler(APITypeResponses))
-	mux.HandleFunc("POST "+GeneratePath, s.disaggregatedPrefillHandler(APITypeGenerate))
+	// DetectAPIType owns the path-to-API mapping; deriving it here keeps the
+	// served routes from drifting away from it.
+	for _, path := range []string{reqcommon.PathChatCompletions, reqcommon.PathCompletions, reqcommon.PathMessages, reqcommon.PathResponses, reqcommon.PathVLLMGenerate, reqcommon.PathSGLangGenerate} {
+		handler := s.disaggregatedPrefillHandler(reqcommon.DetectAPIType(path))
+		mux.HandleFunc("POST "+path, handler)
+		mux.HandleFunc("POST "+path+"/{$}", func(w http.ResponseWriter, r *http.Request) {
+			r = r.Clone(r.Context())
+			r.URL.Path = path
+			r.URL.RawPath = ""
+			handler(w, r)
+		})
+	}
 
 	s.decoderProxy = s.createDecoderProxyHandler(s.config.DecoderURL, s.config.InsecureSkipVerifyForDecoder)
 

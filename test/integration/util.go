@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,7 +30,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"math"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -40,13 +42,16 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pb "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vllmgrpc/api/gen"
 
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
@@ -238,9 +243,13 @@ func CreateGrpcPayload(msg proto.Message) ([]byte, error) {
 		return nil, err
 	}
 
+	if len(b) > math.MaxUint32 {
+		return nil, fmt.Errorf("marshaled message too large for gRPC length-prefixed framing: %d bytes", len(b))
+	}
+
 	payload := make([]byte, 5+len(b))
-	payload[0] = 0 // 0 = uncompressed
-	binary.BigEndian.PutUint32(payload[1:5], uint32(len(b)))
+	payload[0] = 0                                           // 0 = uncompressed
+	binary.BigEndian.PutUint32(payload[1:5], uint32(len(b))) //#nosec G115 -- bounds-checked above
 	copy(payload[5:], b)
 	return payload, nil
 }
@@ -362,7 +371,8 @@ func NewRequestBufferedResponse(
 				Response: &extProcPb.CommonResponse{
 					ClearRouteCache: true,
 					HeaderMutation: &extProcPb.HeaderMutation{
-						SetHeaders: setHeaders,
+						SetHeaders:    setHeaders,
+						RemoveHeaders: unsetRoutingHeaders,
 					},
 				},
 			},
@@ -441,16 +451,20 @@ func NewResponseStreamChunk(body string, endOfStream bool) *extProcPb.Processing
 	}
 }
 
-// NewImmediateErrorResponse creates a response that immediately terminates the request with a specific HTTP status code
-// and body.
+// NewImmediateErrorResponse creates a response that immediately terminates the request with a specific HTTP status code,
+// body, and optional response headers.
 // Use this for testing Load Shedding (503), Rate Limiting (429), or Bad Request (400) logic.
-func NewImmediateErrorResponse(code envoyTypePb.StatusCode, body string) []*extProcPb.ProcessingResponse {
+func NewImmediateErrorResponse(code envoyTypePb.StatusCode, body string, headers ...*envoyCorev3.HeaderValueOption) []*extProcPb.ProcessingResponse {
+	immediateResponse := &extProcPb.ImmediateResponse{
+		Status: &envoyTypePb.HttpStatus{Code: code},
+		Body:   []byte(body),
+	}
+	if len(headers) > 0 {
+		immediateResponse.Headers = &extProcPb.HeaderMutation{SetHeaders: headers}
+	}
 	return []*extProcPb.ProcessingResponse{{
 		Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: &extProcPb.ImmediateResponse{
-				Status: &envoyTypePb.HttpStatus{Code: code},
-				Body:   []byte(body),
-			},
+			ImmediateResponse: immediateResponse,
 		},
 	}}
 }
@@ -570,7 +584,8 @@ func StartExtProcServer(
 ) (extProcPb.ExternalProcessor_ProcessClient, *grpc.ClientConn) {
 	t.Helper()
 
-	// Force IPv4 to match GetFreePort's binding and avoid IPv6 race conditions in CI.
+	// Force IPv4: the server binds on IPv4 localhost, and a dual-stack target would let
+	// the client reach for an IPv6 address nothing is listening on.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	// Start server in background.
@@ -581,37 +596,32 @@ func StartExtProcServer(
 		}
 	}()
 
-	return ExtProcServerClient(ctx, t, port, logger)
+	return ExtProcServerClient(ctx, t, port, logger, nil)
 }
 
 // ExtProcServerClient returns a ExternalProcessor_ProcessClient listen to localhost on given port.
+// mgrErr, when non-nil, carries the early exit of the manager hosting the server so a start
+// failure fails the test immediately instead of waiting out extprocConnSetupTimeout.
 func ExtProcServerClient(
 	ctx context.Context,
 	t *testing.T,
 	port int,
 	logger logr.Logger,
+	mgrErr <-chan error,
 ) (extProcPb.ExternalProcessor_ProcessClient, *grpc.ClientConn) {
 	t.Helper()
 
-	// Force IPv4 to match GetFreePort's binding and avoid IPv6 race conditions in CI.
+	// Force IPv4: the server binds on IPv4 localhost, and a dual-stack target would let
+	// the client reach for an IPv6 address nothing is listening on.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	// Wait for TCP readiness.
-	// We must poll the port until the server successfully binds and listens.
-	require.Eventually(t, func() bool {
-		// Check if the port is open.
-		conn, err := net.DialTimeout("tcp", serverAddr, 50*time.Millisecond)
-		if err != nil {
-			return false
-		}
-		conn.Close()
-		return true
-	}, extprocConnSetupTimeout, extPorcConnSetupPollInterval, "Server failed to bind port %s", serverAddr)
-
-	// Connect client.
-	// Blocking dial is safe because we know the port is open.
 	conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "failed to create grpc connection")
+	// Registered before any require below can call FailNow, so the conn and its
+	// goroutines do not leak on the failure path.
+	t.Cleanup(func() { _ = conn.Close() })
+
+	require.NoError(t, WaitExtProcReady(ctx, conn, mgrErr), "ext-proc server did not become ready")
 
 	extProcClient, err := extProcPb.NewExternalProcessorClient(conn).Process(ctx)
 	require.NoError(t, err, "failed to initialize ext_proc stream client")
@@ -619,32 +629,65 @@ func ExtProcServerClient(
 	return extProcClient, conn
 }
 
-// GetFreePort finds an available IPv4 TCP port on localhost.
-// It works by asking the OS to allocate a port by listening on port 0, capturing the assigned address, and then
-// immediately closing the listener.
+// WaitExtProcReady blocks until conn reaches connectivity.Ready (nil), the manager
+// reports an early exit via mgrErr, ctx is done, or extprocConnSetupTimeout elapses.
 //
-// Note: There is a theoretical race condition where another process grabs the port between the Close() call and the
-// subsequent usage, but this is generally acceptable in hermetic test environments.
-func GetFreePort() (int, error) {
-	// Force IPv4 to prevent flakes on dual-stack CI environments
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, fmt.Errorf("failed to listen on a free port: %w", err)
-	}
+// The server serves on a listener bound before it starts, so the kernel completes the
+// TCP handshake out of the listen backlog and a dial succeeds even while grpc.Serve has
+// not run yet. Only Ready, which requires the HTTP/2 handshake, proves it is serving.
+// The state wait is bounded by the poll interval so an early mgrErr is still observed
+// promptly rather than after the full timeout.
+func WaitExtProcReady(ctx context.Context, conn *grpc.ClientConn, mgrErr <-chan error) error {
+	deadline := time.Now().Add(extprocConnSetupTimeout)
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return nil
+		}
+		if state == connectivity.Idle {
+			// A ClientConn only leaves Idle on Connect or a started RPC, so a
+			// Ready to Idle flap would otherwise stall until the deadline.
+			conn.Connect()
+		}
 
-	// Critical: Close the listener immediately so the caller can bind to it.
-	defer listener.Close()
+		select {
+		case err := <-mgrErr:
+			if err == nil {
+				return errors.New("manager exited before ext-proc server became ready")
+			}
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		return 0, errors.New("failed to cast listener address to TCPAddr")
+		if time.Now().After(deadline) {
+			return fmt.Errorf("ext-proc server at %s not ready within %s (state %s)",
+				conn.Target(), extprocConnSetupTimeout, state)
+		}
+
+		waitCtx, cancel := context.WithTimeout(ctx, extPorcConnSetupPollInterval)
+		conn.WaitForStateChange(waitCtx, state)
+		cancel()
 	}
-	return addr.Port, nil
 }
 
 // --- Internal Helpers ---
 
 // makeDestinationMetadata helper to construct the Envoy dynamic metadata for routing.
+// unsetRoutingHeaders lists every spelling of the internal routing headers Envoy
+// is told to strip when no plugin set them, deprecated aliases included, plus
+// the screening headers it always strips and the attribution handoff EPP only
+// sends on sampled traces.
+var unsetRoutingHeaders = slices.Concat(
+	routing.HeaderNames(routing.PrefillEndpointHeader),
+	routing.HeaderNames(routing.EncoderEndpointsHeader),
+	routing.HeaderNames(routing.DataParallelEndpointHeader),
+	routing.HeaderNames(routing.KVCacheSourceHeader),
+	[]string{routing.EndpointPinHeader},
+	[]string{tracing.FairnessIDHandoffHeader, tracing.FairnessSourceHandoffHeader},
+)
+
 func makeDestinationMetadata(endpoint string) *structpb.Struct {
 	return &structpb.Struct{
 		Fields: map[string]*structpb.Value{
